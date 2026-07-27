@@ -5,7 +5,8 @@ import type {
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
 } from "react";
-import { BlockNoteSchema, defaultBlockSpecs, type BlockNoteEditor, type PartialBlock } from "@blocknote/core";
+import { createPortal } from "react-dom";
+import { BlockNoteSchema, createCodeBlockSpec, defaultBlockSpecs, type BlockNoteEditor, type PartialBlock } from "@blocknote/core";
 import { filterSuggestionItems, insertOrUpdateBlockForSlashMenu } from "@blocknote/core/extensions";
 import { ko } from "@blocknote/core/locales";
 import { BlockNoteView } from "@blocknote/mantine";
@@ -30,7 +31,6 @@ import {
   type StoredPage,
   type StoredPages,
 } from "./page-store";
-import "@blocknote/core/fonts/inter.css";
 import "@blocknote/mantine/style.css";
 import {
   Archive,
@@ -39,6 +39,8 @@ import {
   ArrowUpRight,
   Bell,
   BookOpen,
+  Check,
+  Code2,
   Copy,
   ChevronDown,
   ChevronLeft,
@@ -55,17 +57,26 @@ import {
   Globe2,
   GripVertical,
   Hash,
+  Heading1,
+  Heading2,
+  Heading3,
   Home,
   Inbox,
   LayoutGrid,
   Link,
+  List,
+  ListChecks,
+  ListOrdered,
   Lock,
   Menu,
   Moon,
   MoreHorizontal,
+  Palette,
   PanelLeftClose,
   Pencil,
   Plus,
+  Quote,
+  Repeat2,
   Search,
   Settings,
   Settings2,
@@ -74,6 +85,7 @@ import {
   Star,
   Sun,
   Trash2,
+  Type,
   X,
 } from "lucide-react";
 
@@ -84,9 +96,42 @@ const PAGE_ARCHIVED_STORAGE_KEY = "nodi:quick-note:archived";
 const PAGE_TRASH_STORAGE_KEY = "nodi:quick-note:trash";
 const PAGE_DRAWER_WIDTH_STORAGE_KEY = "nodi:page-drawer-width";
 const APP_THEME_STORAGE_KEY = "nodi:app-theme";
-const DATABASE_NOTICE_EVENT = "nodi:database-notice";
+const APP_NOTICE_EVENT = "nodi:notice";
 
 type AppTheme = "light" | "dark";
+type BlockSelectionActionMenu = {
+  kind: "transform" | "color";
+  x: number;
+  y: number;
+};
+type BlockColorName = "default" | "gray" | "brown" | "red" | "orange" | "yellow" | "green" | "blue" | "purple" | "pink";
+
+const BLOCK_TRANSFORM_OPTIONS = [
+  { key: "paragraph", label: "텍스트", type: "paragraph", icon: Type },
+  { key: "heading-1", label: "제목 1", type: "heading", props: { level: 1, isToggleable: false }, icon: Heading1 },
+  { key: "heading-2", label: "제목 2", type: "heading", props: { level: 2, isToggleable: false }, icon: Heading2 },
+  { key: "heading-3", label: "제목 3", type: "heading", props: { level: 3, isToggleable: false }, icon: Heading3 },
+  { key: "bulletListItem", label: "글머리 기호 목록", type: "bulletListItem", icon: List },
+  { key: "numberedListItem", label: "번호 매기기 목록", type: "numberedListItem", icon: ListOrdered },
+  { key: "checkListItem", label: "할 일 목록", type: "checkListItem", icon: ListChecks },
+  { key: "quote", label: "인용", type: "quote", icon: Quote },
+  { key: "codeBlock", label: "코드", type: "codeBlock", icon: Code2 },
+] as const;
+
+const BLOCK_COLOR_OPTIONS: readonly { value: BlockColorName; label: string }[] = [
+  { value: "default", label: "기본" },
+  { value: "gray", label: "회색" },
+  { value: "brown", label: "갈색" },
+  { value: "red", label: "빨강" },
+  { value: "orange", label: "주황" },
+  { value: "yellow", label: "노랑" },
+  { value: "green", label: "초록" },
+  { value: "blue", label: "파랑" },
+  { value: "purple", label: "보라" },
+  { value: "pink", label: "분홍" },
+];
+
+const CONVERTIBLE_BLOCK_TYPES = new Set(BLOCK_TRANSFORM_OPTIONS.map((option) => option.type));
 
 function getInitialAppTheme(): AppTheme {
   try {
@@ -149,7 +194,7 @@ const databaseBlockSpec = createReactBlockSpec(
     render: ({ block, editor }) => <InlineDatabase
       databaseId={block.props.databaseId || `database-${block.id}`}
       locked={!editor.isEditable}
-      onNotice={(message) => window.dispatchEvent(new CustomEvent(DATABASE_NOTICE_EVENT, { detail: message }))}
+      onNotice={(message) => window.dispatchEvent(new CustomEvent(APP_NOTICE_EVENT, { detail: message }))}
       onRemove={() => editor.removeBlocks([block.id])}
     />,
   },
@@ -174,9 +219,134 @@ const childPageBlockSpec = createReactBlockSpec(
   },
 );
 
+const CODE_BLOCK_LANGUAGES: Record<string, { name: string; aliases?: string[] }> = {
+  text: { name: "일반 텍스트", aliases: ["plain", "plaintext", "txt"] },
+  javascript: { name: "JavaScript", aliases: ["js"] },
+  typescript: { name: "TypeScript", aliases: ["ts"] },
+  jsx: { name: "JSX" },
+  tsx: { name: "TSX" },
+  html: { name: "HTML" },
+  css: { name: "CSS" },
+  json: { name: "JSON" },
+  markdown: { name: "Markdown", aliases: ["md"] },
+  python: { name: "Python", aliases: ["py"] },
+  java: { name: "Java" },
+  c: { name: "C" },
+  cpp: { name: "C++", aliases: ["c++"] },
+  csharp: { name: "C#", aliases: ["cs", "c#"] },
+  go: { name: "Go", aliases: ["golang"] },
+  rust: { name: "Rust", aliases: ["rs"] },
+  php: { name: "PHP" },
+  ruby: { name: "Ruby", aliases: ["rb"] },
+  swift: { name: "Swift" },
+  kotlin: { name: "Kotlin", aliases: ["kt"] },
+  sql: { name: "SQL" },
+  bash: { name: "Shell", aliases: ["sh", "shell", "zsh"] },
+  yaml: { name: "YAML", aliases: ["yml"] },
+};
+
+async function writeClipboardText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    let timeoutId: number | undefined;
+    try {
+      await Promise.race([
+        navigator.clipboard.writeText(value),
+        new Promise<never>((_, reject) => {
+          timeoutId = window.setTimeout(() => reject(new Error("Clipboard permission timed out")), 700);
+        }),
+      ]);
+      return;
+    } catch {
+      // Fall through to the legacy copy path when permission is denied or delayed.
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("Clipboard copy failed");
+}
+
+const baseCodeBlockSpec = createCodeBlockSpec({
+  defaultLanguage: "text",
+  supportedLanguages: CODE_BLOCK_LANGUAGES,
+});
+const baseCodeBlockRender = baseCodeBlockSpec.implementation.render;
+const nodiCodeBlockRender: typeof baseCodeBlockRender = function (block, editor) {
+  const rendered = baseCodeBlockRender.call(this, block, editor);
+  const fragment = rendered.dom as DocumentFragment;
+  const toolbar = fragment.firstElementChild as HTMLDivElement | null;
+  const code = rendered.contentDOM as HTMLElement | undefined;
+
+  if (!toolbar || !code) return rendered;
+
+  toolbar.className = "nodi-code-block-toolbar";
+  const languageSelect = toolbar.querySelector("select");
+  languageSelect?.setAttribute("aria-label", "코드 언어");
+  languageSelect?.setAttribute("title", "코드 언어 선택");
+
+  const copyButton = document.createElement("button");
+  copyButton.type = "button";
+  copyButton.className = "nodi-code-copy-button";
+  copyButton.contentEditable = "false";
+  copyButton.setAttribute("aria-label", "코드 복사");
+  copyButton.setAttribute("title", "코드 복사");
+
+  const copyIcon = document.createElement("span");
+  copyIcon.className = "nodi-code-copy-icon";
+  copyIcon.setAttribute("aria-hidden", "true");
+  const copyLabel = document.createElement("span");
+  copyLabel.textContent = "복사";
+  copyButton.append(copyIcon, copyLabel);
+  toolbar.appendChild(copyButton);
+
+  const handleCopyPointerDown = (event: PointerEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+  };
+  const handleCopy = async (event: MouseEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      await writeClipboardText(code.textContent ?? "");
+      window.dispatchEvent(new CustomEvent(APP_NOTICE_EVENT, { detail: "코드를 클립보드에 복사했어요" }));
+    } catch {
+      window.dispatchEvent(new CustomEvent(APP_NOTICE_EVENT, { detail: "이 환경에서는 코드 복사를 지원하지 않아요" }));
+    }
+  };
+  copyButton.addEventListener("pointerdown", handleCopyPointerDown);
+  copyButton.addEventListener("click", handleCopy);
+
+  const originalDestroy = rendered.destroy;
+  return {
+    ...rendered,
+    destroy: () => {
+      copyButton.removeEventListener("pointerdown", handleCopyPointerDown);
+      copyButton.removeEventListener("click", handleCopy);
+      originalDestroy?.();
+    },
+  };
+};
+const nodiCodeBlockSpec = {
+  ...baseCodeBlockSpec,
+  implementation: {
+    ...baseCodeBlockSpec.implementation,
+    render: nodiCodeBlockRender,
+  },
+};
+
 const editorSchema = BlockNoteSchema.create({
   blockSpecs: {
     ...defaultBlockSpecs,
+    codeBlock: nodiCodeBlockSpec,
     database: databaseBlockSpec(),
     childPage: childPageBlockSpec(),
   },
@@ -321,6 +491,7 @@ function App() {
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
   const [selectedBlockIds, setSelectedBlockIds] = useState<string[]>([]);
   const [isBlockSelectionMode, setIsBlockSelectionMode] = useState(false);
+  const [blockSelectionActionMenu, setBlockSelectionActionMenu] = useState<BlockSelectionActionMenu | null>(null);
   const [isBlockDragging, setIsBlockDragging] = useState(false);
   const [blockDropIndicator, setBlockDropIndicator] = useState<BlockDropIndicator | null>(null);
   const [blockSelectionMarquee, setBlockSelectionMarquee] = useState<BlockSelectionMarquee | null>(null);
@@ -546,9 +717,9 @@ function App() {
   }, [notice]);
 
   useEffect(() => {
-    const showDatabaseNotice = (event: Event) => setNotice((event as CustomEvent<string>).detail);
-    window.addEventListener(DATABASE_NOTICE_EVENT, showDatabaseNotice);
-    return () => window.removeEventListener(DATABASE_NOTICE_EVENT, showDatabaseNotice);
+    const showAppNotice = (event: Event) => setNotice((event as CustomEvent<string>).detail);
+    window.addEventListener(APP_NOTICE_EVENT, showAppNotice);
+    return () => window.removeEventListener(APP_NOTICE_EVENT, showAppNotice);
   }, []);
 
   useEffect(() => {
@@ -890,6 +1061,7 @@ function App() {
     blockSelectionAnchorRef.current = null;
     setIsBlockSelectionMode(false);
     setSelectedBlockIds([]);
+    setBlockSelectionActionMenu(null);
   };
 
   const selectBlockRange = (anchorId: string, targetId: string) => {
@@ -1608,6 +1780,29 @@ function App() {
   }, [isBlockDragging]);
 
   useEffect(() => {
+    if (!blockSelectionActionMenu) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target?.closest(".block-selection-action-menu, .block-selection-menu-button")) return;
+      setBlockSelectionActionMenu(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setBlockSelectionActionMenu(null);
+    };
+    const closeOnViewportChange = () => setBlockSelectionActionMenu(null);
+    document.addEventListener("pointerdown", closeOnOutsidePointer, true);
+    window.addEventListener("keydown", closeOnEscape);
+    window.addEventListener("resize", closeOnViewportChange);
+    window.addEventListener("scroll", closeOnViewportChange, true);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+      window.removeEventListener("keydown", closeOnEscape);
+      window.removeEventListener("resize", closeOnViewportChange);
+      window.removeEventListener("scroll", closeOnViewportChange, true);
+    };
+  }, [blockSelectionActionMenu]);
+
+  useEffect(() => {
     clearBlockSelection();
     setFocusedBlockId(null);
   }, [currentPageId]);
@@ -1713,9 +1908,9 @@ function App() {
     event: ReactMouseEvent<HTMLButtonElement>,
     action: () => void,
   ) => {
-    if (event.detail !== 0) return;
     event.preventDefault();
     event.stopPropagation();
+    if (event.detail !== 0) return;
     action();
   };
 
@@ -1731,20 +1926,77 @@ function App() {
     .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
   const personalPageCount = Object.keys(pages).length - 1;
   const liveSelectedBlockIds = getLiveSelectedBlockIds();
-  const openSelectedBlocksMenu = () => {
-    const targetId = liveSelectedBlockIds[0];
-    if (!targetId) return;
-    const target = editorContextRef.current?.querySelector<HTMLElement>(
-      `[data-node-type='blockContainer'][data-id="${CSS.escape(targetId)}"]`,
-    );
-    const rect = target?.getBoundingClientRect();
-    if (!rect) return;
-    setContextMenu({
-      kind: "block",
-      blockId: targetId,
-      x: Math.min(Math.max(12, rect.right - 216), window.innerWidth - 228),
-      y: Math.min(Math.max(12, rect.top + 28), window.innerHeight - 260),
+  type LiveEditorBlock = NonNullable<ReturnType<typeof editor.getBlock>>;
+  const liveSelectedBlocks = liveSelectedBlockIds
+    .map((blockId) => editor.getBlock(blockId))
+    .filter((block): block is LiveEditorBlock => block !== undefined);
+  const canTransformSelectedBlocks = liveSelectedBlocks.length > 0
+    && liveSelectedBlocks.every((block) => CONVERTIBLE_BLOCK_TYPES.has(block.type as typeof BLOCK_TRANSFORM_OPTIONS[number]["type"]));
+  const canColorSelectedBlocks = liveSelectedBlocks.length > 0
+    && liveSelectedBlocks.every((block) => "textColor" in block.props && "backgroundColor" in block.props);
+  const selectedTransformKeys = liveSelectedBlocks.map((block) => (
+    block.type === "heading"
+      ? `heading-${String((block.props as { level?: number }).level ?? 1)}`
+      : block.type
+  ));
+  const selectedTransformKey = selectedTransformKeys.length > 0
+    && selectedTransformKeys.every((key) => key === selectedTransformKeys[0])
+    ? selectedTransformKeys[0]
+    : null;
+  const getSharedSelectedColor = (property: "textColor" | "backgroundColor"): BlockColorName | null => {
+    const values = liveSelectedBlocks.map((block) => String((block.props as Record<string, unknown>)[property] ?? "default"));
+    const value = values[0];
+    if (!value || !values.every((candidate) => candidate === value)) return null;
+    return BLOCK_COLOR_OPTIONS.some((option) => option.value === value) ? value as BlockColorName : null;
+  };
+  const selectedTextColor = getSharedSelectedColor("textColor");
+  const selectedBackgroundColor = getSharedSelectedColor("backgroundColor");
+  const toggleBlockSelectionActionMenu = (
+    kind: BlockSelectionActionMenu["kind"],
+    trigger: HTMLButtonElement,
+  ) => {
+    const canOpen = kind === "transform" ? canTransformSelectedBlocks : canColorSelectedBlocks;
+    if (!canOpen || pageSettings.lockPage) {
+      setNotice("텍스트 블록을 선택했을 때 사용할 수 있어요");
+      return;
+    }
+    const rect = trigger.getBoundingClientRect();
+    const menuWidth = kind === "transform" ? 232 : 288;
+    const estimatedHeight = kind === "transform" ? 326 : 224;
+    const x = Math.min(Math.max(12, rect.right - menuWidth), window.innerWidth - menuWidth - 12);
+    const y = rect.bottom + estimatedHeight + 8 <= window.innerHeight
+      ? rect.bottom + 6
+      : Math.max(12, rect.top - estimatedHeight - 6);
+    setBlockSelectionActionMenu((current) => current?.kind === kind ? null : { kind, x, y });
+  };
+  const transformSelectedBlocks = (option: typeof BLOCK_TRANSFORM_OPTIONS[number]) => {
+    if (!canTransformSelectedBlocks || pageSettings.lockPage) return;
+    editor.transact(() => {
+      liveSelectedBlocks.forEach((block) => {
+        const update = "props" in option
+          ? { type: option.type, props: { ...option.props } }
+          : { type: option.type };
+        editor.updateBlock(block, update as never);
+      });
     });
+    setBlockSelectionState(liveSelectedBlockIds, liveSelectedBlockIds[0]);
+    setBlockSelectionActionMenu(null);
+    setNotice(`${liveSelectedBlockIds.length}개 블록을 ${option.label}(으)로 전환했어요`);
+  };
+  const colorSelectedBlocks = (
+    property: "textColor" | "backgroundColor",
+    color: BlockColorName,
+    label: string,
+  ) => {
+    if (!canColorSelectedBlocks || pageSettings.lockPage) return;
+    editor.transact(() => {
+      liveSelectedBlocks.forEach((block) => {
+        editor.updateBlock(block, { props: { [property]: color } } as never);
+      });
+    });
+    setBlockSelectionState(liveSelectedBlockIds, liveSelectedBlockIds[0]);
+    setBlockSelectionActionMenu(null);
+    setNotice(`${liveSelectedBlockIds.length}개 블록의 ${label}을 변경했어요`);
   };
 
   return (
@@ -2066,13 +2318,32 @@ function App() {
                     <Trash2 size={15} />
                   </button>
                   <button
+                    className="block-selection-menu-button"
                     type="button"
-                    aria-label="선택한 블록 메뉴"
-                    title="더 보기 (⌘/Ctrl+/)"
-                    onPointerDown={(event) => runSelectionToolbarPointerAction(event, openSelectedBlocksMenu)}
-                    onClick={(event) => runSelectionToolbarKeyboardAction(event, openSelectedBlocksMenu)}
+                    aria-label="선택한 블록 전환"
+                    aria-expanded={blockSelectionActionMenu?.kind === "transform"}
+                    title={canTransformSelectedBlocks ? "블록 전환" : "텍스트 블록에서 사용할 수 있어요"}
+                    disabled={pageSettings.lockPage || !canTransformSelectedBlocks}
+                    onPointerDown={(event) => runSelectionToolbarPointerAction(event, () => toggleBlockSelectionActionMenu("transform", event.currentTarget))}
+                    onClick={(event) => runSelectionToolbarKeyboardAction(event, () => toggleBlockSelectionActionMenu("transform", event.currentTarget))}
                   >
-                    <MoreHorizontal size={15} />
+                    <Repeat2 size={15} />
+                    <span>전환</span>
+                    <ChevronDown size={12} />
+                  </button>
+                  <button
+                    className="block-selection-menu-button"
+                    type="button"
+                    aria-label="선택한 블록 색상 변경"
+                    aria-expanded={blockSelectionActionMenu?.kind === "color"}
+                    title={canColorSelectedBlocks ? "글자 및 배경 색상" : "색상을 지원하는 블록에서 사용할 수 있어요"}
+                    disabled={pageSettings.lockPage || !canColorSelectedBlocks}
+                    onPointerDown={(event) => runSelectionToolbarPointerAction(event, () => toggleBlockSelectionActionMenu("color", event.currentTarget))}
+                    onClick={(event) => runSelectionToolbarKeyboardAction(event, () => toggleBlockSelectionActionMenu("color", event.currentTarget))}
+                  >
+                    <Palette size={15} />
+                    <span>색상</span>
+                    <ChevronDown size={12} />
                   </button>
                   <button
                     type="button"
@@ -2184,6 +2455,89 @@ function App() {
         onDeletePage={() => { setContextMenu(null); setPendingPageDeletion(currentPageId); }}
       />}
 
+      {blockSelectionActionMenu && (
+        <div
+          className={`block-selection-action-menu is-${blockSelectionActionMenu.kind}`}
+          role="menu"
+          aria-label={blockSelectionActionMenu.kind === "transform" ? "블록 전환" : "블록 색상"}
+          style={{ left: blockSelectionActionMenu.x, top: blockSelectionActionMenu.y }}
+          onPointerDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          {blockSelectionActionMenu.kind === "transform" ? <>
+            <header>
+              <strong>블록 전환</strong>
+              <small>{liveSelectedBlockIds.length}개 블록에 적용</small>
+            </header>
+            <div className="block-transform-options">
+              {BLOCK_TRANSFORM_OPTIONS.map((option) => {
+                const Icon = option.icon;
+                const isSelected = selectedTransformKey === option.key;
+                return <button
+                  key={option.key}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={isSelected}
+                  onClick={() => transformSelectedBlocks(option)}
+                >
+                  <Icon size={16} />
+                  <span>{option.label}</span>
+                  {isSelected && <Check size={14} />}
+                </button>;
+              })}
+            </div>
+          </> : <>
+            <header>
+              <strong>색상</strong>
+              <small>글자와 배경을 각각 설정</small>
+            </header>
+            <section className="block-color-section" aria-label="글자 색">
+              <span>글자 색</span>
+              <div>
+                {BLOCK_COLOR_OPTIONS.map((option) => (
+                  <button
+                    key={`text-${option.value}`}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={selectedTextColor === option.value}
+                    aria-label={`글자 색 ${option.label}`}
+                    title={`글자 색 ${option.label}`}
+                    onClick={() => colorSelectedBlocks("textColor", option.value, "글자 색")}
+                  >
+                    <span className="block-color-swatch is-text" data-block-color={option.value}>A</span>
+                    <span>{option.label}</span>
+                    {selectedTextColor === option.value && <Check size={13} />}
+                  </button>
+                ))}
+              </div>
+            </section>
+            <section className="block-color-section" aria-label="배경 색">
+              <span>배경 색</span>
+              <div>
+                {BLOCK_COLOR_OPTIONS.map((option) => (
+                  <button
+                    key={`background-${option.value}`}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={selectedBackgroundColor === option.value}
+                    aria-label={`배경 색 ${option.label}`}
+                    title={`배경 색 ${option.label}`}
+                    onClick={() => colorSelectedBlocks("backgroundColor", option.value, "배경 색")}
+                  >
+                    <span className="block-color-swatch is-background" data-block-color={option.value}>A</span>
+                    <span>{option.label}</span>
+                    {selectedBackgroundColor === option.value && <Check size={13} />}
+                  </button>
+                ))}
+              </div>
+            </section>
+          </>}
+        </div>
+      )}
+
       <div className="template-dock">
         <span className="dock-label">시작하기</span>
         <button type="button" onClick={() => applyTemplate("daily")}><span>☀️</span> 데일리 노트</button>
@@ -2191,6 +2545,7 @@ function App() {
         <button type="button" onClick={() => { editor.focus(); setNotice("새 블록을 작성해보세요"); }}><FileText size={15} /> 빈 페이지</button>
       </div>
 
+      <NodiTooltipLayer />
       {notice && <div className="toast"><Bell size={16} />{notice}<button type="button" onClick={() => setNotice(null)} aria-label="알림 닫기"><X size={14} /></button></div>}
       {pageSettingsOpen && <PageSettingsPanel settings={pageSettings} onChange={setPageSettings} onClose={() => setPageSettingsOpen(false)} />}
       {pendingPageDeletion && pages[pendingPageDeletion] && (
@@ -2202,6 +2557,210 @@ function App() {
       )}
       {pendingBlockDeletion && <BlockDeleteConfirm count={pendingBlockDeletion.length} onCancel={() => setPendingBlockDeletion(null)} onConfirm={deleteBlock} />}
     </div>
+  );
+}
+
+type NodiTooltipState = {
+  text: string;
+  left: number;
+  top: number;
+  placement: "top" | "bottom";
+};
+
+const NODI_TOOLTIP_ID = "nodi-global-tooltip";
+const NODI_TOOLTIP_TRIGGER_SELECTOR = [
+  "[data-nodi-tooltip]",
+  "button[aria-label]",
+  "[role='button'][aria-label]",
+  "[role='separator'][aria-label]",
+].join(", ");
+
+function NodiTooltipLayer() {
+  const [tooltip, setTooltip] = useState<NodiTooltipState | null>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const tooltipElement = tooltipRef.current;
+    if (!tooltipElement) return;
+
+    tooltipElement.style.setProperty("--nodi-tooltip-shift-x", "0px");
+    const rect = tooltipElement.getBoundingClientRect();
+    const viewportPadding = 9;
+    const shift = rect.left < viewportPadding
+      ? viewportPadding - rect.left
+      : rect.right > window.innerWidth - viewportPadding
+        ? window.innerWidth - viewportPadding - rect.right
+        : 0;
+    tooltipElement.style.setProperty("--nodi-tooltip-shift-x", `${shift}px`);
+  }, [tooltip]);
+
+  useEffect(() => {
+    let activeTarget: HTMLElement | null = null;
+    let describedTarget: HTMLElement | null = null;
+    let previousDescribedBy: string | null = null;
+    let showTimer: number | undefined;
+    let hideTimer: number | undefined;
+
+    const prepareElement = (element: Element) => {
+      const nativeTitle = element.getAttribute("title")?.trim();
+      if (!nativeTitle) return;
+      element.setAttribute("data-nodi-tooltip", nativeTitle);
+      element.removeAttribute("title");
+    };
+    const prepareTree = (root: ParentNode) => {
+      if (root instanceof Element) prepareElement(root);
+      root.querySelectorAll?.("[title]").forEach(prepareElement);
+    };
+    prepareTree(document);
+
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        if (mutation.type === "attributes" && mutation.target instanceof Element) {
+          prepareElement(mutation.target);
+          continue;
+        }
+        mutation.addedNodes.forEach((node) => {
+          if (node instanceof Element) prepareTree(node);
+        });
+      }
+    });
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["title"],
+    });
+
+    const resolveTrigger = (target: EventTarget | null) => (
+      target instanceof Element
+        ? target.closest<HTMLElement>(NODI_TOOLTIP_TRIGGER_SELECTOR)
+        : null
+    );
+    const getTooltipText = (target: HTMLElement) => {
+      const explicitText = target.dataset.nodiTooltip?.trim();
+      if (explicitText) return explicitText;
+      if (target.textContent?.trim()) return "";
+      return target.getAttribute("aria-label")?.trim() ?? "";
+    };
+    const restoreDescription = () => {
+      if (!describedTarget) return;
+      if (previousDescribedBy) describedTarget.setAttribute("aria-describedby", previousDescribedBy);
+      else describedTarget.removeAttribute("aria-describedby");
+      describedTarget = null;
+      previousDescribedBy = null;
+    };
+    const describeTarget = (target: HTMLElement) => {
+      restoreDescription();
+      describedTarget = target;
+      previousDescribedBy = target.getAttribute("aria-describedby");
+      const ids = new Set((previousDescribedBy ?? "").split(/\s+/).filter(Boolean));
+      ids.add(NODI_TOOLTIP_ID);
+      target.setAttribute("aria-describedby", [...ids].join(" "));
+    };
+    const hideNow = () => {
+      window.clearTimeout(showTimer);
+      window.clearTimeout(hideTimer);
+      activeTarget = null;
+      restoreDescription();
+      setTooltip(null);
+    };
+    const scheduleHide = () => {
+      window.clearTimeout(showTimer);
+      window.clearTimeout(hideTimer);
+      hideTimer = window.setTimeout(hideNow, 70);
+    };
+    const scheduleShow = (target: HTMLElement, delay: number) => {
+      const text = getTooltipText(target);
+      if (!text) return;
+      window.clearTimeout(showTimer);
+      window.clearTimeout(hideTimer);
+      activeTarget = target;
+      showTimer = window.setTimeout(() => {
+        if (!target.isConnected || activeTarget !== target) return;
+        const rect = target.getBoundingClientRect();
+        const placement = rect.top >= 54 ? "top" : "bottom";
+        describeTarget(target);
+        setTooltip({
+          text,
+          left: rect.left + rect.width / 2,
+          top: placement === "top" ? rect.top - 8 : rect.bottom + 8,
+          placement,
+        });
+      }, delay);
+    };
+    const handleMouseOver = (event: MouseEvent) => {
+      const target = resolveTrigger(event.target);
+      if (!target || target === activeTarget) return;
+      scheduleShow(target, 320);
+    };
+    const handleMouseMove = (event: MouseEvent) => {
+      const target = resolveTrigger(event.target);
+      if (target) {
+        if (target !== activeTarget) scheduleShow(target, 320);
+        return;
+      }
+      if (activeTarget && document.activeElement !== activeTarget) scheduleHide();
+    };
+    const handleMouseOut = (event: MouseEvent) => {
+      const target = resolveTrigger(event.target);
+      if (!target || target !== activeTarget) return;
+      if (event.relatedTarget instanceof Node && target.contains(event.relatedTarget)) return;
+      scheduleHide();
+    };
+    const handleFocusIn = (event: FocusEvent) => {
+      const target = resolveTrigger(event.target);
+      if (target) scheduleShow(target, 80);
+    };
+    const handleFocusOut = (event: FocusEvent) => {
+      const target = resolveTrigger(event.target);
+      if (!target || target !== activeTarget) return;
+      if (event.relatedTarget instanceof Node && target.contains(event.relatedTarget)) return;
+      scheduleHide();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") hideNow();
+    };
+
+    document.addEventListener("mouseover", handleMouseOver, true);
+    document.addEventListener("mousemove", handleMouseMove, true);
+    document.addEventListener("mouseout", handleMouseOut, true);
+    document.addEventListener("pointerdown", hideNow, true);
+    document.addEventListener("focusin", handleFocusIn, true);
+    document.addEventListener("focusout", handleFocusOut, true);
+    document.addEventListener("keydown", handleKeyDown, true);
+    window.addEventListener("resize", hideNow);
+    window.addEventListener("scroll", hideNow, true);
+
+    return () => {
+      observer.disconnect();
+      window.clearTimeout(showTimer);
+      window.clearTimeout(hideTimer);
+      restoreDescription();
+      document.removeEventListener("mouseover", handleMouseOver, true);
+      document.removeEventListener("mousemove", handleMouseMove, true);
+      document.removeEventListener("mouseout", handleMouseOut, true);
+      document.removeEventListener("pointerdown", hideNow, true);
+      document.removeEventListener("focusin", handleFocusIn, true);
+      document.removeEventListener("focusout", handleFocusOut, true);
+      document.removeEventListener("keydown", handleKeyDown, true);
+      window.removeEventListener("resize", hideNow);
+      window.removeEventListener("scroll", hideNow, true);
+    };
+  }, []);
+
+  if (!tooltip) return null;
+  return createPortal(
+    <div
+      ref={tooltipRef}
+      id={NODI_TOOLTIP_ID}
+      className="nodi-tooltip"
+      data-placement={tooltip.placement}
+      role="tooltip"
+      style={{ left: tooltip.left, top: tooltip.top }}
+    >
+      {tooltip.text}
+    </div>,
+    document.body,
   );
 }
 
