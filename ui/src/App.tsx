@@ -15,6 +15,7 @@ import { createReactBlockSpec, getDefaultReactSlashMenuItems, SuggestionMenuCont
 import { createHighlighter } from "shiki";
 import { InlineDatabase } from "./InlineDatabase";
 import { PageSettingsPanel, type PageSettings } from "./PageSettings";
+import { SidebarScrollOverlay } from "./SidebarScrollOverlay";
 import { TagPicker } from "./TagPicker";
 import { DEFAULT_TAG_OPTIONS, toDateInput } from "./types";
 import { makeId } from "./types";
@@ -42,7 +43,6 @@ import {
   ArrowUp,
   ArrowUpRight,
   Bell,
-  BookOpen,
   Check,
   Code2,
   Copy,
@@ -781,8 +781,14 @@ function getInitialPages(): StoredPages {
             settings: { ...defaultPageSettings, ...page.settings },
             folderId: typeof page.folderId === "string" ? page.folderId : null,
             order: typeof page.order === "number" ? page.order : index,
+            favoritedAt: typeof page.favoritedAt === "string" ? page.favoritedAt : null,
           };
-          if (page.folderId === undefined || page.order === undefined || page.settings.publicAccess === undefined) changed = true;
+          if (
+            page.folderId === undefined
+            || page.order === undefined
+            || page.favoritedAt === undefined
+            || page.settings.publicAccess === undefined
+          ) changed = true;
           return [page.id, normalizedPage];
         }),
     );
@@ -800,6 +806,7 @@ function getInitialPages(): StoredPages {
     settings: getSavedPageSettings(),
     blocks: getSavedBlocks(),
     archived: window.localStorage.getItem(PAGE_ARCHIVED_STORAGE_KEY) === "true",
+    favoritedAt: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -823,7 +830,6 @@ function App() {
   const [title, setTitle] = useState(rootPage.title);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [appTheme, setAppTheme] = useState<AppTheme>(getInitialAppTheme);
-  const [isFavorite, setIsFavorite] = useState(false);
   const [savedAt, setSavedAt] = useState("방금 저장됨");
   const [notice, setNotice] = useState<string | null>(null);
   const [pageSettings, setPageSettings] = useState<PageSettings>(rootPage.settings);
@@ -850,6 +856,8 @@ function App() {
   const [blockSelectionMarquee, setBlockSelectionMarquee] = useState<BlockSelectionMarquee | null>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
   const editorStageRef = useRef<HTMLElement>(null);
+  const favoritesScrollRef = useRef<HTMLDivElement>(null);
+  const pagesScrollRef = useRef<HTMLDivElement>(null);
   const editorContextRef = useRef<HTMLDivElement>(null);
   const blockSelectionToolbarRef = useRef<HTMLDivElement>(null);
   const blockSelectionOverlayRefs = useRef(new Map<string, HTMLDivElement>());
@@ -1036,6 +1044,7 @@ function App() {
       settings: { ...defaultPageSettings, tags: [] },
       blocks: [{ type: "paragraph", content: "" }],
       archived: false,
+      favoritedAt: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -1050,7 +1059,11 @@ function App() {
     });
     setRightPanel(null);
     setSidebarCreateMenuOpen(false);
-    setDrawerPageId(pageId);
+    if (source === "sidebar") {
+      openPage(pageId);
+    } else {
+      setDrawerPageId(pageId);
+    }
   };
 
   useEffect(() => {
@@ -1200,6 +1213,21 @@ function App() {
   const toggleArchive = () => {
     setIsArchived((archived) => !archived);
     setNotice(isArchived ? "페이지를 보관함에서 복원했어요" : "페이지를 보관함으로 옮겼어요");
+  };
+
+  const toggleFavorite = () => {
+    const pageId = currentPageIdRef.current;
+    const page = pagesRef.current[pageId];
+    if (!page) return;
+    const favoritedAt = page.favoritedAt ? null : new Date().toISOString();
+    commitPages({
+      ...pagesRef.current,
+      [pageId]: {
+        ...page,
+        favoritedAt,
+      },
+    });
+    setNotice(favoritedAt ? "즐겨찾기에 추가했어요" : "즐겨찾기에서 제거했어요");
   };
 
   const createFolder = (parentId: string | null = null) => {
@@ -2811,6 +2839,10 @@ function App() {
   };
 
   const currentPage = pages[currentPageId] ?? rootPage;
+  const isFavorite = Boolean(currentPage.favoritedAt);
+  const favoritePages = Object.values(pages)
+    .filter((page) => Boolean(page.favoritedAt))
+    .sort((first, second) => (second.favoritedAt ?? "").localeCompare(first.favoritedAt ?? ""));
   const parentPage = currentPage.parentId ? pages[currentPage.parentId] : null;
   const folderChildren = (parentId: string | null) => Object.values(folders)
     .filter((folder) => folder.parentId === parentId)
@@ -3033,61 +3065,73 @@ function App() {
           <NavItem icon={<LayoutGrid size={17} />} label="모든 페이지" />
         </nav>
 
-        <div className="nav-section">
-          <div className="section-label"><span>즐겨찾기</span><button type="button" aria-label="즐겨찾기 추가"><Plus size={15} /></button></div>
-          <NavItem
-            icon={<Star size={16} fill="currentColor" />}
-            label={pages[ROOT_PAGE_ID]?.title || "빠른 메모"}
-            active={currentPageId === ROOT_PAGE_ID}
-            onClick={() => openPage(ROOT_PAGE_ID)}
-          />
-          <NavItem icon={<BookOpen size={16} />} label="독서 노트" />
-        </div>
-
-        <div className={`nav-section pages-section ${sidebarFolderDropTarget?.kind === "root" ? "is-folder-root-drop-target" : ""}`}>
-          <div className="section-label">
-            <span>개인 페이지</span>
-            <div className="sidebar-create-wrap">
-              <button
-                type="button"
-                aria-label="페이지 및 폴더 추가"
-                aria-expanded={sidebarCreateMenuOpen}
-                onClick={() => {
-                  setSidebarContextMenu(null);
-                  setSidebarCreateMenuOpen((open) => !open);
-                }}
-              >
-                <Plus size={15} />
-              </button>
-              {sidebarCreateMenuOpen && (
-                <div className="sidebar-create-menu sidebar-floating-menu" role="menu">
-                  <span>새로 만들기</span>
-                  <button type="button" role="menuitem" onClick={() => createChildPage("sidebar", null)}>
-                    <FileText size={15} />
-                    <span><strong>페이지</strong><small>현재 페이지 아래에 추가</small></span>
-                  </button>
-                  <button type="button" role="menuitem" onClick={() => createFolder(null)}>
-                    <FolderPlus size={15} />
-                    <span><strong>폴더</strong><small>페이지를 묶어 정리</small></span>
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-
-          {personalPageCount === 0 && Object.keys(folders).length === 0
-            ? <span className="empty-page-nav">+ 버튼이나 /페이지로 시작해보세요</span>
-            : <>
-              <div
-                className={`sidebar-unfiled-pages ${sidebarDraggedPageId ? "is-drag-active" : ""} ${sidebarPageDropTarget?.kind === "unfiled" ? "is-drop-target" : ""}`}
-              >
-                {rootSidebarItems.map((item) => (
-                  item.kind === "folder"
-                    ? renderSidebarFolder(item.folder)
-                    : renderSidebarPage(item.page)
+        <div className="nav-section favorites-section">
+          <div className="section-label"><span>즐겨찾기</span></div>
+          {favoritePages.length > 0 && (
+            <div className="sidebar-scroll-shell favorites-scroll-shell">
+              <div ref={favoritesScrollRef} className="favorites-list sidebar-native-scroll" aria-label="즐겨찾기 페이지">
+                {favoritePages.map((page) => (
+                  <NavItem
+                    key={page.id}
+                    icon={<span className="nav-emoji">{page.settings.icon || "📄"}</span>}
+                    label={page.title || "제목 없음"}
+                    active={currentPageId === page.id}
+                    onClick={() => openPage(page.id)}
+                  />
                 ))}
               </div>
-            </>}
+              <SidebarScrollOverlay targetRef={favoritesScrollRef} />
+            </div>
+          )}
+        </div>
+
+        <div className="sidebar-scroll-shell pages-section-scroll-shell">
+          <div ref={pagesScrollRef} className={`nav-section pages-section sidebar-native-scroll ${sidebarFolderDropTarget?.kind === "root" ? "is-folder-root-drop-target" : ""}`}>
+            <div className="section-label">
+              <span>개인 페이지</span>
+              <div className="sidebar-create-wrap">
+                <button
+                  type="button"
+                  aria-label="페이지 및 폴더 추가"
+                  aria-expanded={sidebarCreateMenuOpen}
+                  onClick={() => {
+                    setSidebarContextMenu(null);
+                    setSidebarCreateMenuOpen((open) => !open);
+                  }}
+                >
+                  <Plus size={15} />
+                </button>
+                {sidebarCreateMenuOpen && (
+                  <div className="sidebar-create-menu sidebar-floating-menu" role="menu">
+                    <span>새로 만들기</span>
+                    <button type="button" role="menuitem" onClick={() => createChildPage("sidebar", null)}>
+                      <FileText size={15} />
+                      <span><strong>페이지</strong><small>현재 페이지 아래에 추가</small></span>
+                    </button>
+                    <button type="button" role="menuitem" onClick={() => createFolder(null)}>
+                      <FolderPlus size={15} />
+                      <span><strong>폴더</strong><small>페이지를 묶어 정리</small></span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {personalPageCount === 0 && Object.keys(folders).length === 0
+              ? <span className="empty-page-nav">+ 버튼이나 /페이지로 시작해보세요</span>
+              : <>
+                <div
+                  className={`sidebar-unfiled-pages ${sidebarDraggedPageId ? "is-drag-active" : ""} ${sidebarPageDropTarget?.kind === "unfiled" ? "is-drop-target" : ""}`}
+                >
+                  {rootSidebarItems.map((item) => (
+                    item.kind === "folder"
+                      ? renderSidebarFolder(item.folder)
+                      : renderSidebarPage(item.page)
+                  ))}
+                </div>
+              </>}
+          </div>
+          <SidebarScrollOverlay targetRef={pagesScrollRef} />
         </div>
 
         <div className="sidebar-footer">
@@ -3131,7 +3175,16 @@ function App() {
           </div>
           <div className="topbar-actions">
             <span className="save-state"><Cloud size={15} /> {savedAt}</span>
-            <button className={`icon-button ${isFavorite ? "is-favorite" : ""}`} type="button" aria-label="즐겨찾기" onClick={() => setIsFavorite((value) => !value)}><Star size={18} fill={isFavorite ? "currentColor" : "none"} /></button>
+            <button
+              className={`icon-button ${isFavorite ? "is-favorite" : ""}`}
+              type="button"
+              aria-label={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
+              aria-pressed={isFavorite}
+              data-nodi-tooltip={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
+              onClick={toggleFavorite}
+            >
+              <Star size={18} fill={isFavorite ? "currentColor" : "none"} />
+            </button>
             <button className="icon-button" type="button" aria-label="공유" onClick={() => setRightPanel("share")}><Share2 size={18} /></button>
             <button className="page-settings-trigger" type="button" aria-label="페이지 설정" onClick={() => setPageSettingsOpen(true)}><Settings2 size={16} /> 설정</button>
             <button className="more-button" type="button" aria-label="더 보기" onClick={exportJson}><Download size={16} /> 내보내기</button>

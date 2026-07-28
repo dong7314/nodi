@@ -17,6 +17,7 @@ export type StoredPage = {
   settings: PageSettings;
   blocks: PartialBlock[];
   archived: boolean;
+  favoritedAt: string | null;
   createdAt: string;
   updatedAt: string;
 };
