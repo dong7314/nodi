@@ -3993,6 +3993,8 @@ function SidebarItemContextMenu({
   onDeleteFolder: (folderId: string) => void;
   onDeletePage: (pageId: string) => void;
 }) {
+  const menuRef = useRef<HTMLDivElement>(null);
+  const folderTargetsScrollRef = useRef<HTMLDivElement>(null);
   const flattenFolders = (parentId: string | null, depth = 0, visited = new Set<string>()): Array<{ folder: StoredFolder; depth: number }> => (
     Object.values(folders)
       .filter((candidate) => candidate.parentId === parentId && !visited.has(candidate.id))
@@ -4006,16 +4008,35 @@ function SidebarItemContextMenu({
       })
   );
   const orderedFolderEntries = flattenFolders(null);
+  const [menuPosition, setMenuPosition] = useState({ left: menu.x, top: menu.y });
+
+  useLayoutEffect(() => {
+    const constrainToViewport = () => {
+      const menuElement = menuRef.current;
+      if (!menuElement) return;
+      const viewportMargin = 10;
+      const maxLeft = Math.max(viewportMargin, window.innerWidth - menuElement.offsetWidth - viewportMargin);
+      const maxTop = Math.max(viewportMargin, window.innerHeight - menuElement.offsetHeight - viewportMargin);
+      const left = Math.round(Math.min(Math.max(menu.x, viewportMargin), maxLeft));
+      const top = Math.round(Math.min(Math.max(menu.y, viewportMargin), maxTop));
+      setMenuPosition((current) => current.left === left && current.top === top ? current : { left, top });
+    };
+
+    constrainToViewport();
+    window.addEventListener("resize", constrainToViewport);
+    return () => window.removeEventListener("resize", constrainToViewport);
+  }, [menu.kind, menu.x, menu.y, orderedFolderEntries.length]);
 
   if (menu.kind === "page" && page) {
     const siblings = getSidebarOrderedItems(pages, folders, getPageSidebarParentId(page, folders));
     const pageIndex = siblings.findIndex((candidate) => candidate.kind === "page" && candidate.id === page.id);
     return (
       <div
+        ref={menuRef}
         className="sidebar-item-context sidebar-floating-menu"
         role="menu"
         aria-label={`${page.title} 페이지 메뉴`}
-        style={{ left: menu.x, top: menu.y }}
+        style={{ left: menuPosition.left, top: menuPosition.top }}
         onMouseDown={(event) => event.stopPropagation()}
         onContextMenu={(event) => event.preventDefault()}
       >
@@ -4031,20 +4052,23 @@ function SidebarItemContextMenu({
         </div>
         <div className="sidebar-context-divider" />
         <span className="sidebar-context-label">폴더로 이동</span>
-        <div className="sidebar-folder-targets">
-          <button type="button" className={page.folderId === null ? "is-selected" : ""} onClick={() => onMovePage(page.id, null)}><LayoutGrid size={14} /> 폴더 없음{page.folderId === null && <span>✓</span>}</button>
-          {orderedFolderEntries.map(({ folder: targetFolder, depth }) => (
-            <button
-              type="button"
-              key={targetFolder.id}
-              className={page.folderId === targetFolder.id ? "is-selected" : ""}
-              onClick={() => onMovePage(page.id, targetFolder.id)}
-              style={{ paddingLeft: `${8 + depth * 14}px` }}
-            >
-              <SidebarFolderIcon /> {targetFolder.title}
-              {page.folderId === targetFolder.id && <span>✓</span>}
-            </button>
-          ))}
+        <div className="sidebar-scroll-shell sidebar-folder-targets-shell">
+          <div ref={folderTargetsScrollRef} className="sidebar-folder-targets sidebar-native-scroll">
+            <button type="button" className={page.folderId === null ? "is-selected" : ""} onClick={() => onMovePage(page.id, null)}><LayoutGrid size={14} /> 폴더 없음{page.folderId === null && <span>✓</span>}</button>
+            {orderedFolderEntries.map(({ folder: targetFolder, depth }) => (
+              <button
+                type="button"
+                key={targetFolder.id}
+                className={page.folderId === targetFolder.id ? "is-selected" : ""}
+                onClick={() => onMovePage(page.id, targetFolder.id)}
+                style={{ paddingLeft: `${8 + depth * 14}px` }}
+              >
+                <SidebarFolderIcon /> {targetFolder.title}
+                {page.folderId === targetFolder.id && <span>✓</span>}
+              </button>
+            ))}
+          </div>
+          <SidebarScrollOverlay targetRef={folderTargetsScrollRef} compact />
         </div>
         <div className="sidebar-context-divider" />
         <button type="button" role="menuitem" className="sidebar-context-danger" onClick={() => onDeletePage(page.id)}><Trash2 size={15} /> 페이지 삭제</button>
@@ -4059,10 +4083,11 @@ function SidebarItemContextMenu({
     const reachedFolderDepthLimit = folderDepth >= MAX_FOLDER_DEPTH;
     return (
       <div
+        ref={menuRef}
         className="sidebar-item-context sidebar-floating-menu"
         role="menu"
         aria-label={`${folder.title} 폴더 메뉴`}
-        style={{ left: menu.x, top: menu.y }}
+        style={{ left: menuPosition.left, top: menuPosition.top }}
         onMouseDown={(event) => event.stopPropagation()}
         onContextMenu={(event) => event.preventDefault()}
       >

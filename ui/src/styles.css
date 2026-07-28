@@ -2107,7 +2107,13 @@ input.sidebar-inline-rename:focus-visible {
 }
 .sidebar-folder-targets {
   max-height: 150px;
+  padding-right: 10px;
   overflow-y: auto;
+}
+.sidebar-folder-targets-shell .sidebar-scrollbar {
+  top: 3px;
+  right: 2px;
+  bottom: 3px;
 }
 .sidebar-folder-targets button span {
   margin-left: auto;
