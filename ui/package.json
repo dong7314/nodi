@@ -22,7 +22,8 @@
     "lucide-react": "latest",
     "react": "latest",
     "react-day-picker": "^10.0.1",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "shiki": "4.3.1"
   },
   "devDependencies": {
     "@types/react": "latest",

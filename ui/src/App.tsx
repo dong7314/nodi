@@ -11,6 +11,7 @@ import { filterSuggestionItems, insertOrUpdateBlockForSlashMenu } from "@blockno
 import { ko } from "@blocknote/core/locales";
 import { BlockNoteView } from "@blocknote/mantine";
 import { createReactBlockSpec, getDefaultReactSlashMenuItems, SuggestionMenuController, useCreateBlockNote, type DefaultReactSuggestionItem } from "@blocknote/react";
+import { createHighlighter } from "shiki";
 import { InlineDatabase } from "./InlineDatabase";
 import { PageSettingsPanel, type PageSettings } from "./PageSettings";
 import { TagPicker } from "./TagPicker";
@@ -244,6 +245,11 @@ const CODE_BLOCK_LANGUAGES: Record<string, { name: string; aliases?: string[] }>
   bash: { name: "Shell", aliases: ["sh", "shell", "zsh"] },
   yaml: { name: "YAML", aliases: ["yml"] },
 };
+const CODE_BLOCK_LANGUAGE_OPTIONS = Object.entries(CODE_BLOCK_LANGUAGES).map(([value, language]) => ({
+  value,
+  label: language.name,
+}));
+let closeActiveCodeLanguageMenu: (() => void) | null = null;
 
 async function writeClipboardText(value: string) {
   if (navigator.clipboard?.writeText) {
@@ -275,9 +281,35 @@ async function writeClipboardText(value: string) {
   if (!copied) throw new Error("Clipboard copy failed");
 }
 
+async function createNodiCodeHighlighter() {
+  const highlighter = await createHighlighter({
+    themes: ["github-light", "github-dark"],
+    langs: [],
+  });
+  const codeToTokens = highlighter.codeToTokens.bind(highlighter) as typeof highlighter.codeToTokens;
+  highlighter.codeToTokens = ((code, options) => {
+    const {
+      theme: _theme,
+      themes: _themes,
+      defaultColor: _defaultColor,
+      ...tokenOptions
+    } = options as unknown as Record<string, unknown>;
+    return codeToTokens(code, {
+      ...tokenOptions,
+      themes: {
+        light: "github-light",
+        dark: "github-dark",
+      },
+      defaultColor: false,
+    } as never);
+  }) as typeof highlighter.codeToTokens;
+  return highlighter;
+}
+
 const baseCodeBlockSpec = createCodeBlockSpec({
   defaultLanguage: "text",
   supportedLanguages: CODE_BLOCK_LANGUAGES,
+  createHighlighter: createNodiCodeHighlighter,
 });
 const baseCodeBlockRender = baseCodeBlockSpec.implementation.render;
 const nodiCodeBlockRender: typeof baseCodeBlockRender = function (block, editor) {
@@ -290,15 +322,180 @@ const nodiCodeBlockRender: typeof baseCodeBlockRender = function (block, editor)
 
   toolbar.className = "nodi-code-block-toolbar";
   const languageSelect = toolbar.querySelector("select");
-  languageSelect?.setAttribute("aria-label", "코드 언어");
-  languageSelect?.setAttribute("title", "코드 언어 선택");
+  let languageTrigger: HTMLButtonElement | null = null;
+  let languageMenu: HTMLDivElement | null = null;
+  let closeLanguageMenu: (() => void) | null = null;
+  const stopLanguagePickerEvent = (event: Event) => event.stopPropagation();
+
+  if (languageSelect) {
+    const selectedLanguage = CODE_BLOCK_LANGUAGES[block.props.language] ? block.props.language : "text";
+    const languagePicker = document.createElement("div");
+    languagePicker.className = "nodi-code-language-picker";
+    languagePicker.contentEditable = "false";
+    languageTrigger = document.createElement("button");
+    languageTrigger.type = "button";
+    languageTrigger.className = "shadcn-select-trigger nodi-code-language-trigger";
+    languageTrigger.disabled = !editor.isEditable;
+    languageTrigger.setAttribute("role", "combobox");
+    languageTrigger.setAttribute("aria-label", "코드 언어");
+    languageTrigger.setAttribute("aria-haspopup", "listbox");
+    languageTrigger.setAttribute("aria-controls", `nodi-code-language-menu-${block.id}`);
+
+    const languageLabel = document.createElement("span");
+    languageLabel.textContent = CODE_BLOCK_LANGUAGES[selectedLanguage].name;
+    const languageChevron = document.createElement("span");
+    languageChevron.className = "nodi-code-language-chevron";
+    languageChevron.setAttribute("aria-hidden", "true");
+    languageTrigger.append(languageLabel, languageChevron);
+    languagePicker.appendChild(languageTrigger);
+    languageSelect.replaceWith(languagePicker);
+
+    const removeLanguageMenu = () => {
+      const menu = languageMenu;
+      if (!menu) return;
+      languageMenu = null;
+      if (closeActiveCodeLanguageMenu === closeLanguageMenu) closeActiveCodeLanguageMenu = null;
+      document.removeEventListener("pointerdown", handleLanguageMenuOutsidePointer, true);
+      document.removeEventListener("keydown", handleLanguageMenuKeyDown, true);
+      window.removeEventListener("resize", removeLanguageMenu);
+      window.removeEventListener("scroll", handleLanguageMenuScroll, true);
+      menu.dataset.state = "closed";
+      window.setTimeout(() => menu.remove(), 120);
+    };
+    const handleLanguageMenuOutsidePointer = (event: PointerEvent) => {
+      const target = event.target instanceof Node ? event.target : null;
+      if (target && (languageMenu?.contains(target) || languageTrigger?.contains(target))) return;
+      removeLanguageMenu();
+    };
+    const handleLanguageMenuKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        removeLanguageMenu();
+        languageTrigger?.focus();
+        return;
+      }
+      if (event.key === "Tab") {
+        removeLanguageMenu();
+        return;
+      }
+      if (!languageMenu || !["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+      const items = Array.from(languageMenu.querySelectorAll<HTMLButtonElement>('[role="option"]'));
+      if (items.length === 0) return;
+      const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+      const nextIndex = event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? items.length - 1
+          : event.key === "ArrowUp"
+            ? (currentIndex <= 0 ? items.length - 1 : currentIndex - 1)
+            : (currentIndex + 1) % items.length;
+      event.preventDefault();
+      event.stopPropagation();
+      items[nextIndex]?.focus();
+    };
+    const handleLanguageMenuScroll = (event: Event) => {
+      if (event.target instanceof Node && languageMenu?.contains(event.target)) return;
+      removeLanguageMenu();
+    };
+    const positionLanguageMenu = (menu: HTMLDivElement) => {
+      if (!languageTrigger) return;
+      const triggerRect = languageTrigger.getBoundingClientRect();
+      const viewportPadding = 10;
+      const menuWidth = 188;
+      menu.style.left = `${Math.min(
+        window.innerWidth - menuWidth - viewportPadding,
+        Math.max(viewportPadding, triggerRect.left),
+      )}px`;
+      menu.style.top = `${triggerRect.bottom + 5}px`;
+      const menuRect = menu.getBoundingClientRect();
+      if (menuRect.bottom > window.innerHeight - viewportPadding && triggerRect.top > menuRect.height + viewportPadding) {
+        menu.style.top = `${triggerRect.top - menuRect.height - 5}px`;
+        menu.dataset.side = "top";
+      } else {
+        menu.dataset.side = "bottom";
+      }
+    };
+    const openLanguageMenu = () => {
+      if (!languageTrigger || languageTrigger.disabled || languageMenu) return;
+      closeActiveCodeLanguageMenu?.();
+
+      const menu = document.createElement("div");
+      menu.id = `nodi-code-language-menu-${block.id}`;
+      menu.className = "shadcn-select-content nodi-code-language-menu";
+      menu.contentEditable = "false";
+      menu.dataset.state = "open";
+      menu.setAttribute("role", "listbox");
+      menu.setAttribute("aria-label", "코드 언어 선택");
+      const viewport = document.createElement("div");
+      viewport.className = "shadcn-select-viewport";
+      let selectedItem: HTMLButtonElement | null = null;
+
+      CODE_BLOCK_LANGUAGE_OPTIONS.forEach((option) => {
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = "shadcn-select-item";
+        item.setAttribute("role", "option");
+        item.setAttribute("aria-selected", String(option.value === selectedLanguage));
+        const itemLabel = document.createElement("span");
+        itemLabel.className = "shadcn-select-item-label";
+        itemLabel.textContent = option.label;
+        const itemCheck = document.createElement("span");
+        itemCheck.className = "nodi-code-language-check";
+        itemCheck.setAttribute("aria-hidden", "true");
+        itemCheck.textContent = "✓";
+        item.append(itemLabel, itemCheck);
+        if (option.value === selectedLanguage) selectedItem = item;
+        item.addEventListener("pointerdown", stopLanguagePickerEvent);
+        item.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          removeLanguageMenu();
+          if (option.value !== selectedLanguage) {
+            editor.updateBlock(block.id, { props: { language: option.value } });
+          }
+        });
+        viewport.appendChild(item);
+      });
+
+      menu.appendChild(viewport);
+      document.body.appendChild(menu);
+      languageMenu = menu;
+      closeLanguageMenu = removeLanguageMenu;
+      closeActiveCodeLanguageMenu = removeLanguageMenu;
+      document.addEventListener("pointerdown", handleLanguageMenuOutsidePointer, true);
+      document.addEventListener("keydown", handleLanguageMenuKeyDown, true);
+      window.addEventListener("resize", removeLanguageMenu);
+      window.addEventListener("scroll", handleLanguageMenuScroll, true);
+      positionLanguageMenu(menu);
+      window.requestAnimationFrame(() => selectedItem?.focus());
+    };
+    const handleLanguageTriggerClick = (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (languageMenu) removeLanguageMenu();
+      else openLanguageMenu();
+    };
+    const handleLanguageTriggerKeyDown = (event: KeyboardEvent) => {
+      event.stopPropagation();
+      if (event.key === "Enter" || event.key === " " || event.key === "ArrowDown") {
+        event.preventDefault();
+        openLanguageMenu();
+      } else if (event.key === "Escape") {
+        removeLanguageMenu();
+      }
+    };
+    languageTrigger.addEventListener("pointerdown", stopLanguagePickerEvent);
+    languageTrigger.addEventListener("mousedown", stopLanguagePickerEvent);
+    languageTrigger.addEventListener("click", handleLanguageTriggerClick);
+    languageTrigger.addEventListener("keydown", handleLanguageTriggerKeyDown);
+  }
 
   const copyButton = document.createElement("button");
   copyButton.type = "button";
   copyButton.className = "nodi-code-copy-button";
   copyButton.contentEditable = "false";
   copyButton.setAttribute("aria-label", "코드 복사");
-  copyButton.setAttribute("title", "코드 복사");
+  copyButton.setAttribute("data-nodi-tooltip", "코드 복사");
 
   const copyIcon = document.createElement("span");
   copyIcon.className = "nodi-code-copy-icon";
@@ -329,6 +526,9 @@ const nodiCodeBlockRender: typeof baseCodeBlockRender = function (block, editor)
   return {
     ...rendered,
     destroy: () => {
+      closeLanguageMenu?.();
+      languageTrigger?.removeEventListener("pointerdown", stopLanguagePickerEvent);
+      languageTrigger?.removeEventListener("mousedown", stopLanguagePickerEvent);
       copyButton.removeEventListener("pointerdown", handleCopyPointerDown);
       copyButton.removeEventListener("click", handleCopy);
       originalDestroy?.();
