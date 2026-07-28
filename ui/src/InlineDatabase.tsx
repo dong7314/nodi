@@ -1,9 +1,9 @@
 import { createContext, useContext, useEffect, useRef, useState, type Dispatch, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction } from "react";
-import { createPortal } from "react-dom";
 import * as Popover from "@radix-ui/react-popover";
 import { ArrowDownAZ, ArrowUpAZ, CalendarDays, Check, ChevronLeft, ChevronRight, Columns3, Copy, Eye, EyeOff, Filter, Link2, Mail, MoreHorizontal, Phone, Plus, RotateCcw, Search, SlidersHorizontal, Table2, Tags, Timeline, Trash2, X } from "lucide-react";
 import { DatePicker } from "./components/ui/date-picker";
 import { Select } from "./components/ui/select";
+import { ConfirmDialog } from "./components/ui/confirm-dialog";
 import { makeId, TAG_COLORS, toDateInput, type TagColor } from "./types";
 
 type PropertyType = "text" | "select" | "multi_select" | "status" | "date" | "number" | "checkbox" | "url" | "email" | "phone";
@@ -424,7 +424,7 @@ export function InlineDatabase({ databaseId, locked, onNotice, onRemove }: { dat
     {!activeView ? <BlankDatabase disabled={locked} onAddView={addView} /> : <>
       {activeView.type === "table" ? <DatabaseTable records={visibleRecords} properties={visibleProperties} disabled={locked} hasHiddenProperties={(activeView.hiddenPropertyIds?.length ?? 0) > 0} isFiltered={Boolean(activeSearchQuery || activeView.filter)} columnWidths={activeView.columnWidths ?? {}} onColumnWidthsChange={(columnWidths) => updateView(activeView.id, { columnWidths })} onAddRecord={addRecord} onAddProperty={addProperty} onUpdateProperty={updateProperty} onRemoveProperty={removeProperty} onAddSelectOption={addSelectOption} onRemoveSelectOption={removeSelectOption} onUpdate={updateRecord} onDuplicate={duplicateRecord} onDelete={setPendingDeletion} /> : <DatabaseTimeline view={activeView} records={visibleRecords} properties={database.properties} disabled={locked} start={timelineStart} onAddDateProperty={addDateProperty} onChangeView={(patch) => updateView(activeView.id, patch)} onUpdateRecord={updateRecord} onPrevious={(days) => setTimelineStart((date) => new Date(date.getFullYear(), date.getMonth(), date.getDate() - days))} onNext={(days) => setTimelineStart((date) => new Date(date.getFullYear(), date.getMonth(), date.getDate() + days))} onToday={() => setTimelineStart(beginningOfWeek(new Date()))} />}
     </>}
-    {pendingDeletion && <RecordDeleteConfirm onCancel={() => setPendingDeletion(null)} onConfirm={moveToTrash} />}
+    {pendingDeletion && <RecordDeleteConfirm recordName={recordLabel(pendingDeletion, database.properties, Math.max(0, database.records.findIndex((record) => record.id === pendingDeletion.id)))} onCancel={() => setPendingDeletion(null)} onConfirm={moveToTrash} />}
     {pendingDatabaseRemoval && <DatabaseDeleteConfirm databaseName={database.name} onCancel={() => setPendingDatabaseRemoval(false)} onConfirm={() => { onNotice("데이터베이스를 삭제했어요"); onRemove(); }} />}
   </section></DatabasePopoverContext.Provider>;
 }
@@ -756,27 +756,10 @@ function DatabaseTrash({ records, properties, disabled, onRestore }: { records: 
   return <div className="database-trash"><div><Trash2 size={15} /><strong>휴지통</strong><span>삭제한 항목</span></div><ul>{records.map((record, index) => <li key={record.id}><span>{recordLabel(record, properties, index)}</span><button type="button" disabled={disabled} onClick={() => onRestore(record.id)}><RotateCcw size={14} /> 복원</button></li>)}</ul></div>;
 }
 
-function RecordDeleteConfirm({ onCancel, onConfirm }: { onCancel: () => void; onConfirm: () => void }) {
-  return <DeleteConfirmDialog ariaLabel="데이터베이스 항목 삭제" title="이 항목을 휴지통으로 옮길까요?" description="나중에 이 데이터베이스의 휴지통에서 다시 복원할 수 있어요." confirmLabel="휴지통으로 이동" onCancel={onCancel} onConfirm={onConfirm} />;
+function RecordDeleteConfirm({ recordName, onCancel, onConfirm }: { recordName: string; onCancel: () => void; onConfirm: () => void }) {
+  return <ConfirmDialog ariaLabel="데이터베이스 항목 삭제" title="이 항목을 휴지통으로 옮길까요?" description={`“${recordName}” 항목은 나중에 이 데이터베이스의 휴지통에서 다시 복원할 수 있어요.`} confirmLabel="휴지통으로 이동" onCancel={onCancel} onConfirm={onConfirm} />;
 }
 
 function DatabaseDeleteConfirm({ databaseName, onCancel, onConfirm }: { databaseName: string; onCancel: () => void; onConfirm: () => void }) {
-  return <DeleteConfirmDialog ariaLabel="데이터베이스 삭제" title={`“${databaseName || "새 데이터베이스"}”를 삭제할까요?`} description="데이터베이스 블록과 안에 작성한 모든 항목이 현재 메모에서 제거됩니다." confirmLabel="데이터베이스 삭제" onCancel={onCancel} onConfirm={onConfirm} />;
-}
-
-function DeleteConfirmDialog({ ariaLabel, title, description, confirmLabel, onCancel, onConfirm }: { ariaLabel: string; title: string; description: string; confirmLabel: string; onCancel: () => void; onConfirm: () => void }) {
-  const [isClosing, setIsClosing] = useState(false);
-  const closeTimerRef = useRef<number | null>(null);
-  useEffect(() => () => {
-    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-  }, []);
-  const closeWithAnimation = (afterClose: () => void) => {
-    if (isClosing) return;
-    setIsClosing(true);
-    closeTimerRef.current = window.setTimeout(() => {
-      closeTimerRef.current = null;
-      afterClose();
-    }, 140);
-  };
-  return createPortal(<div className={`record-confirm-layer ${isClosing ? "is-closing" : ""}`} role="presentation" onPointerDown={(event) => { if (event.target === event.currentTarget) closeWithAnimation(onCancel); }}><div className="record-confirm database-delete-confirm" role="dialog" aria-modal="true" aria-label={ariaLabel} onPointerDown={(event) => event.stopPropagation()}><button type="button" className="record-confirm-close" aria-label="삭제 취소" disabled={isClosing} onClick={() => closeWithAnimation(onCancel)}><X size={16} /></button><strong>{title}</strong><p>{description}</p><div><button type="button" disabled={isClosing} onClick={() => closeWithAnimation(onCancel)}>취소</button><button className="confirm-delete" type="button" disabled={isClosing} onClick={() => closeWithAnimation(onConfirm)}>{confirmLabel}</button></div></div></div>, document.body);
+  return <ConfirmDialog ariaLabel="데이터베이스 삭제" title="데이터베이스를 삭제할까요?" description={`“${databaseName || "새 데이터베이스"}” 데이터베이스 블록과 안에 작성한 모든 항목이 현재 메모에서 제거됩니다.`} confirmLabel="데이터베이스 삭제" onCancel={onCancel} onConfirm={onConfirm} />;
 }

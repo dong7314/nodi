@@ -19,6 +19,7 @@ import { DEFAULT_TAG_OPTIONS, toDateInput } from "./types";
 import { makeId } from "./types";
 import { DatePicker } from "./components/ui/date-picker";
 import { Select } from "./components/ui/select";
+import { ConfirmDialog } from "./components/ui/confirm-dialog";
 import { ChildPageBlock } from "./ChildPageBlock";
 import {
   OPEN_PAGE_EVENT,
@@ -3463,11 +3464,11 @@ function NodiContextMenu({ menu, archived, locked, selectedBlockCount, onAddBloc
 }
 
 function PageDeleteConfirm({ title, onCancel, onConfirm }: { title: string; onCancel: () => void; onConfirm: () => void }) {
-  return <div className="page-delete-layer" role="presentation" onMouseDown={onCancel}><div className="page-delete-confirm" role="dialog" aria-modal="true" aria-label="페이지 삭제" onMouseDown={(event) => event.stopPropagation()}><span><Trash2 size={19} /></span><strong>“{title || "제목 없음"}” 페이지를 휴지통으로 옮길까요?</strong><p>본문과 페이지 속성의 스냅샷이 로컬 휴지통에 보관됩니다.</p><div><button type="button" onClick={onCancel}>취소</button><button type="button" className="confirm-delete" onClick={onConfirm}>휴지통으로 이동</button></div></div></div>;
+  return <ConfirmDialog ariaLabel="페이지 삭제" title="페이지를 휴지통으로 옮길까요?" description={`“${title || "제목 없음"}” 페이지의 본문과 속성의 스냅샷이 로컬 휴지통에 보관됩니다.`} confirmLabel="휴지통으로 이동" onCancel={onCancel} onConfirm={onConfirm} />;
 }
 
 function BlockDeleteConfirm({ count, onCancel, onConfirm }: { count: number; onCancel: () => void; onConfirm: () => void }) {
-  return <div className="page-delete-layer" role="presentation" onMouseDown={onCancel}><div className="page-delete-confirm" role="dialog" aria-modal="true" aria-label="블록 삭제" onMouseDown={(event) => event.stopPropagation()}><span><Trash2 size={19} /></span><strong>{count > 1 ? `선택한 ${count}개 블록을 삭제할까요?` : "이 블록을 삭제할까요?"}</strong><p>삭제 후에도 ⌘/Ctrl+Z로 되돌릴 수 있습니다.</p><div><button type="button" onClick={onCancel}>취소</button><button type="button" className="confirm-delete" onClick={onConfirm}>{count > 1 ? `${count}개 블록 삭제` : "블록 삭제"}</button></div></div></div>;
+  return <ConfirmDialog ariaLabel="블록 삭제" title="블록을 삭제할까요?" description={`${count > 1 ? `선택한 ${count}개 블록이` : "선택한 블록이"} 현재 페이지에서 삭제됩니다. 삭제 후에도 ⌘/Ctrl+Z로 되돌릴 수 있습니다.`} confirmLabel={count > 1 ? `${count}개 블록 삭제` : "블록 삭제"} onCancel={onCancel} onConfirm={onConfirm} />;
 }
 
 export default App;
