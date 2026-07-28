@@ -4,6 +4,7 @@ import type {
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
+  ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { BlockNoteSchema, createCodeBlockSpec, defaultBlockSpecs, type BlockNoteEditor, type PartialBlock } from "@blocknote/core";
@@ -23,6 +24,7 @@ import { ConfirmDialog } from "./components/ui/confirm-dialog";
 import { ChildPageBlock } from "./ChildPageBlock";
 import {
   OPEN_PAGE_EVENT,
+  MAX_FOLDER_DEPTH,
   ROOT_PAGE_ID,
   persistStoredFolders,
   persistStoredPages,
@@ -55,7 +57,6 @@ import {
   Database,
   FileText,
   FolderPlus,
-  FolderOpen,
   Globe2,
   GripVertical,
   Hash,
@@ -161,6 +162,41 @@ const pageStatusOptions = [
   { value: "완료", label: "완료", className: "status-done" },
 ];
 
+function getFolderDepth(folders: StoredFolders, folderId: string | null) {
+  let depth = 0;
+  let currentFolderId = folderId;
+  const visited = new Set<string>();
+  while (currentFolderId && !visited.has(currentFolderId)) {
+    const folder = folders[currentFolderId];
+    if (!folder) break;
+    visited.add(currentFolderId);
+    depth += 1;
+    currentFolderId = folder.parentId;
+  }
+  return depth;
+}
+
+function getFolderSubtreeHeight(
+  folders: StoredFolders,
+  folderId: string,
+  visited = new Set<string>(),
+): number {
+  if (visited.has(folderId)) return 0;
+  const nextVisited = new Set(visited).add(folderId);
+  const childHeights = Object.values(folders)
+    .filter((folder) => folder.parentId === folderId)
+    .map((folder) => getFolderSubtreeHeight(folders, folder.id, nextVisited));
+  return 1 + Math.max(0, ...childHeights);
+}
+
+function canPlaceFolderAtParent(
+  folders: StoredFolders,
+  folderId: string,
+  parentId: string | null,
+) {
+  return getFolderDepth(folders, parentId) + getFolderSubtreeHeight(folders, folderId) <= MAX_FOLDER_DEPTH;
+}
+
 type ContextMenuState =
   | { kind: "page"; x: number; y: number }
   | { kind: "block"; x: number; y: number; blockId: string };
@@ -172,6 +208,118 @@ type SidebarContextMenuState =
 type SidebarRenameState =
   | { kind: "page"; id: string }
   | { kind: "folder"; id: string };
+
+type SidebarPageDropTarget =
+  | { kind: "page"; pageId: string; placement: "before" | "after" }
+  | { kind: "folder"; folderId: string; placement: "before" | "inside" | "after" }
+  | { kind: "unfiled" };
+
+type SidebarFolderDropTarget =
+  | { kind: "folder"; folderId: string; placement: "before" | "inside" | "after" }
+  | { kind: "page"; pageId: string; placement: "before" | "after" }
+  | { kind: "root" };
+
+type SidebarOrderedItem =
+  | { kind: "page"; id: string; order: number; createdAt: string; page: StoredPage }
+  | { kind: "folder"; id: string; order: number; createdAt: string; folder: StoredFolder };
+
+function getPageSidebarParentId(page: StoredPage, folders: StoredFolders) {
+  return page.folderId && folders[page.folderId] ? page.folderId : null;
+}
+
+function getSidebarOrderedItems(
+  pages: StoredPages,
+  folders: StoredFolders,
+  parentId: string | null,
+): SidebarOrderedItem[] {
+  const pageItems: SidebarOrderedItem[] = Object.values(pages)
+    .filter((page) => page.id !== ROOT_PAGE_ID && getPageSidebarParentId(page, folders) === parentId)
+    .sort((first, second) => first.order - second.order || first.createdAt.localeCompare(second.createdAt))
+    .map((page) => ({ kind: "page", id: page.id, order: page.order, createdAt: page.createdAt, page }));
+  const folderItems: SidebarOrderedItem[] = Object.values(folders)
+    .filter((folder) => folder.parentId === parentId)
+    .sort((first, second) => first.order - second.order || first.createdAt.localeCompare(second.createdAt))
+    .map((folder) => ({ kind: "folder", id: folder.id, order: folder.order, createdAt: folder.createdAt, folder }));
+
+  const pageOrders = new Set(pageItems.map((item) => item.order));
+  const usesLegacySeparateOrder = folderItems.some((item) => pageOrders.has(item.order));
+  if (usesLegacySeparateOrder) {
+    return parentId === null ? [...pageItems, ...folderItems] : [...folderItems, ...pageItems];
+  }
+
+  return [...pageItems, ...folderItems].sort((first, second) => (
+    first.order - second.order
+    || first.createdAt.localeCompare(second.createdAt)
+    || first.kind.localeCompare(second.kind)
+  ));
+}
+
+function assignSidebarItemOrder(
+  nextPages: StoredPages,
+  nextFolders: StoredFolders,
+  parentId: string | null,
+  items: SidebarOrderedItem[],
+) {
+  items.forEach((item, order) => {
+    if (item.kind === "page") {
+      const page = nextPages[item.id];
+      if (page) nextPages[item.id] = { ...page, folderId: parentId, order };
+      return;
+    }
+    const folder = nextFolders[item.id];
+    if (folder) nextFolders[item.id] = { ...folder, parentId, order };
+  });
+}
+
+function getNextSidebarOrder(
+  pages: StoredPages,
+  folders: StoredFolders,
+  parentId: string | null,
+) {
+  return Math.max(-1, ...getSidebarOrderedItems(pages, folders, parentId).map((item) => item.order)) + 1;
+}
+
+type SidebarSiblingDropTarget =
+  | { kind: "page"; pageId: string; placement: "before" | "after" }
+  | { kind: "folder"; folderId: string; placement: "before" | "after" };
+type SidebarSiblingItemTarget =
+  | { kind: "page"; pageId: string }
+  | { kind: "folder"; folderId: string };
+
+function getSidebarSiblingDropTargetFromGap(
+  hitElement: HTMLElement | null,
+  clientY: number,
+  excludedItem: { kind: "page" | "folder"; id: string },
+): SidebarSiblingDropTarget | null {
+  const itemContainer = hitElement?.closest<HTMLElement>(".sidebar-unfiled-pages, .sidebar-folder-pages");
+  if (!itemContainer) return null;
+
+  const siblingRows: Array<{ target: SidebarSiblingItemTarget; top: number }> = [];
+  Array.from(itemContainer.children).forEach((child) => {
+    const element = child as HTMLElement;
+    const pageId = element.dataset.sidebarPageId;
+    if (pageId) {
+      if (excludedItem.kind === "page" && excludedItem.id === pageId) return;
+      const rect = element.getBoundingClientRect();
+      if (rect.height > 0) siblingRows.push({ target: { kind: "page", pageId }, top: rect.top });
+      return;
+    }
+
+    const folderId = element.dataset.sidebarFolderId;
+    if (!folderId || (excludedItem.kind === "folder" && excludedItem.id === folderId)) return;
+    const folderRow = element.querySelector<HTMLElement>(":scope > [data-sidebar-folder-row-id]");
+    if (!folderRow) return;
+    const rect = folderRow.getBoundingClientRect();
+    if (rect.height > 0) siblingRows.push({ target: { kind: "folder", folderId }, top: rect.top });
+  });
+  siblingRows.sort((first, second) => first.top - second.top);
+
+  if (siblingRows.length === 0) return null;
+  const nextRow = siblingRows.find((row) => clientY < row.top);
+  if (nextRow) return { ...nextRow.target, placement: "before" };
+  const lastRow = siblingRows[siblingRows.length - 1];
+  return { ...lastRow.target, placement: "after" };
+}
 
 type BlockSelectionMarquee = {
   left: number;
@@ -688,6 +836,10 @@ function App() {
   const [sidebarContextMenu, setSidebarContextMenu] = useState<SidebarContextMenuState | null>(null);
   const [sidebarCreateMenuOpen, setSidebarCreateMenuOpen] = useState(false);
   const [sidebarRename, setSidebarRename] = useState<SidebarRenameState | null>(null);
+  const [sidebarDraggedPageId, setSidebarDraggedPageId] = useState<string | null>(null);
+  const [sidebarPageDropTarget, setSidebarPageDropTarget] = useState<SidebarPageDropTarget | null>(null);
+  const [sidebarDraggedFolderId, setSidebarDraggedFolderId] = useState<string | null>(null);
+  const [sidebarFolderDropTarget, setSidebarFolderDropTarget] = useState<SidebarFolderDropTarget | null>(null);
   const [pendingBlockDeletion, setPendingBlockDeletion] = useState<string[] | null>(null);
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
   const [selectedBlockIds, setSelectedBlockIds] = useState<string[]>([]);
@@ -703,6 +855,25 @@ function App() {
   const blockSelectionOverlayRefs = useRef(new Map<string, HTMLDivElement>());
   const pagesRef = useRef(initialPages);
   const foldersRef = useRef(initialFolders);
+  const sidebarDraggedPageIdRef = useRef<string | null>(null);
+  const sidebarPageDropTargetRef = useRef<SidebarPageDropTarget | null>(null);
+  const sidebarDraggedFolderIdRef = useRef<string | null>(null);
+  const sidebarFolderDropTargetRef = useRef<SidebarFolderDropTarget | null>(null);
+  const sidebarPagePointerDragRef = useRef<{
+    pointerId: number;
+    pageId: string;
+    startX: number;
+    startY: number;
+    dragging: boolean;
+  } | null>(null);
+  const sidebarFolderPointerDragRef = useRef<{
+    pointerId: number;
+    folderId: string;
+    startX: number;
+    startY: number;
+    dragging: boolean;
+  } | null>(null);
+  const sidebarSuppressClickRef = useRef(false);
   const currentPageIdRef = useRef(ROOT_PAGE_ID);
   const loadingPageRef = useRef(false);
   const blockSelectionModeRef = useRef(false);
@@ -855,12 +1026,7 @@ function App() {
       : source === "slash"
         ? parent.folderId
         : null;
-    const nextOrder = Math.max(
-      -1,
-      ...Object.values(pagesRef.current)
-        .filter((page) => page.id !== ROOT_PAGE_ID && page.folderId === folderId)
-        .map((page) => page.order),
-    ) + 1;
+    const nextOrder = getNextSidebarOrder(pagesRef.current, foldersRef.current, folderId);
     const nextPage: StoredPage = {
       id: pageId,
       parentId,
@@ -1036,18 +1202,31 @@ function App() {
     setNotice(isArchived ? "페이지를 보관함에서 복원했어요" : "페이지를 보관함으로 옮겼어요");
   };
 
-  const createFolder = () => {
+  const createFolder = (parentId: string | null = null) => {
     const folderId = makeId("folder");
-    const nextOrder = Math.max(-1, ...Object.values(foldersRef.current).map((folder) => folder.order)) + 1;
+    const safeParentId = parentId && foldersRef.current[parentId] ? parentId : null;
+    if (safeParentId && getFolderDepth(foldersRef.current, safeParentId) >= MAX_FOLDER_DEPTH) {
+      setSidebarCreateMenuOpen(false);
+      setSidebarContextMenu(null);
+      setNotice(`폴더는 최대 ${MAX_FOLDER_DEPTH}단계까지만 만들 수 있어요`);
+      return;
+    }
+    const nextOrder = getNextSidebarOrder(pagesRef.current, foldersRef.current, safeParentId);
     const folder: StoredFolder = {
       id: folderId,
+      parentId: safeParentId,
       title: "새 폴더",
       order: nextOrder,
       collapsed: false,
       createdAt: new Date().toISOString(),
     };
-    commitFolders({ ...foldersRef.current, [folderId]: folder });
+    const nextFolders = { ...foldersRef.current, [folderId]: folder };
+    if (safeParentId && nextFolders[safeParentId]?.collapsed) {
+      nextFolders[safeParentId] = { ...nextFolders[safeParentId], collapsed: false };
+    }
+    commitFolders(nextFolders);
     setSidebarCreateMenuOpen(false);
+    setSidebarContextMenu(null);
     setSidebarRename({ kind: "folder", id: folderId });
   };
 
@@ -1069,41 +1248,114 @@ function App() {
     commitFolders({ ...foldersRef.current, [folderId]: { ...folder, collapsed: !folder.collapsed } });
   };
 
-  const reorderPage = (pageId: string, direction: -1 | 1) => {
-    const page = pagesRef.current[pageId];
-    if (!page) return;
-    const siblings = Object.values(pagesRef.current)
-      .filter((candidate) => candidate.id !== ROOT_PAGE_ID && candidate.folderId === page.folderId)
-      .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
-    const currentIndex = siblings.findIndex((candidate) => candidate.id === pageId);
+  const reorderSidebarItem = (kind: "page" | "folder", id: string, direction: -1 | 1) => {
+    const parentId = kind === "page"
+      ? pagesRef.current[id] ? getPageSidebarParentId(pagesRef.current[id], foldersRef.current) : null
+      : foldersRef.current[id]?.parentId ?? null;
+    const siblings = getSidebarOrderedItems(pagesRef.current, foldersRef.current, parentId);
+    const currentIndex = siblings.findIndex((candidate) => candidate.kind === kind && candidate.id === id);
     const targetIndex = currentIndex + direction;
     if (currentIndex < 0 || targetIndex < 0 || targetIndex >= siblings.length) return;
+    const reorderedItems = [...siblings];
+    [reorderedItems[currentIndex], reorderedItems[targetIndex]] = [
+      reorderedItems[targetIndex],
+      reorderedItems[currentIndex],
+    ];
     const nextPages = { ...pagesRef.current };
-    siblings.forEach((candidate, index) => {
-      let nextIndex = index;
-      if (index === currentIndex) nextIndex = targetIndex;
-      if (index === targetIndex) nextIndex = currentIndex;
-      nextPages[candidate.id] = { ...candidate, order: nextIndex, updatedAt: new Date().toISOString() };
-    });
+    const nextFolders = { ...foldersRef.current };
+    assignSidebarItemOrder(nextPages, nextFolders, parentId, reorderedItems);
     commitPages(nextPages);
+    commitFolders(nextFolders);
     setSidebarContextMenu(null);
   };
 
+  const reorderPage = (pageId: string, direction: -1 | 1) => {
+    reorderSidebarItem("page", pageId, direction);
+  };
+
   const reorderFolder = (folderId: string, direction: -1 | 1) => {
-    const orderedFolders = Object.values(foldersRef.current)
-      .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
-    const currentIndex = orderedFolders.findIndex((folder) => folder.id === folderId);
-    const targetIndex = currentIndex + direction;
-    if (currentIndex < 0 || targetIndex < 0 || targetIndex >= orderedFolders.length) return;
-    const nextFolders = { ...foldersRef.current };
-    orderedFolders.forEach((folder, index) => {
-      let nextIndex = index;
-      if (index === currentIndex) nextIndex = targetIndex;
-      if (index === targetIndex) nextIndex = currentIndex;
-      nextFolders[folder.id] = { ...folder, order: nextIndex };
+    reorderSidebarItem("folder", folderId, direction);
+  };
+
+  const folderContainsFolder = (ancestorFolderId: string, candidateFolderId: string | null) => {
+    let currentFolderId = candidateFolderId;
+    const visited = new Set<string>();
+    while (currentFolderId && !visited.has(currentFolderId)) {
+      if (currentFolderId === ancestorFolderId) return true;
+      visited.add(currentFolderId);
+      currentFolderId = foldersRef.current[currentFolderId]?.parentId ?? null;
+    }
+    return false;
+  };
+
+  const moveSidebarFolder = (folderId: string, target: SidebarFolderDropTarget) => {
+    const draggedFolder = foldersRef.current[folderId];
+    if (!draggedFolder) return;
+
+    const targetFolder = target.kind === "folder" ? foldersRef.current[target.folderId] : null;
+    const targetPage = target.kind === "page" ? pagesRef.current[target.pageId] : null;
+    if (target.kind === "folder" && (!targetFolder || folderId === target.folderId)) return;
+    if (target.kind === "page" && !targetPage) return;
+    const destinationParentId = target.kind === "root"
+      ? null
+      : target.kind === "page"
+        ? getPageSidebarParentId(targetPage!, foldersRef.current)
+        : target.placement === "inside"
+          ? target.folderId
+          : targetFolder?.parentId ?? null;
+    if (folderContainsFolder(folderId, destinationParentId)) return;
+    if (
+      draggedFolder.parentId !== destinationParentId
+      && !canPlaceFolderAtParent(foldersRef.current, folderId, destinationParentId)
+    ) {
+      setNotice(`폴더는 최대 ${MAX_FOLDER_DEPTH}단계까지만 이동할 수 있어요`);
+      return;
+    }
+
+    const sourceParentId = draggedFolder.parentId;
+    const destinationItems = getSidebarOrderedItems(
+      pagesRef.current,
+      foldersRef.current,
+      destinationParentId,
+    ).filter((item) => !(item.kind === "folder" && item.id === folderId));
+    let insertionIndex = destinationItems.length;
+    if (target.kind === "page") {
+      const targetIndex = destinationItems.findIndex((item) => item.kind === "page" && item.id === target.pageId);
+      if (targetIndex < 0) return;
+      insertionIndex = targetIndex + (target.placement === "after" ? 1 : 0);
+    } else if (target.kind === "folder" && target.placement !== "inside") {
+      const targetIndex = destinationItems.findIndex((item) => item.kind === "folder" && item.id === target.folderId);
+      if (targetIndex < 0) return;
+      insertionIndex = targetIndex + (target.placement === "after" ? 1 : 0);
+    }
+    destinationItems.splice(insertionIndex, 0, {
+      kind: "folder",
+      id: draggedFolder.id,
+      order: draggedFolder.order,
+      createdAt: draggedFolder.createdAt,
+      folder: draggedFolder,
     });
+
+    const nextPages = { ...pagesRef.current };
+    const nextFolders = { ...foldersRef.current };
+    if (sourceParentId !== destinationParentId) {
+      const sourceItems = getSidebarOrderedItems(
+        pagesRef.current,
+        foldersRef.current,
+        sourceParentId,
+      ).filter((item) => !(item.kind === "folder" && item.id === folderId));
+      assignSidebarItemOrder(nextPages, nextFolders, sourceParentId, sourceItems);
+    }
+    assignSidebarItemOrder(nextPages, nextFolders, destinationParentId, destinationItems);
+    if (destinationParentId && nextFolders[destinationParentId]?.collapsed) {
+      nextFolders[destinationParentId] = { ...nextFolders[destinationParentId], collapsed: false };
+    }
+    commitPages(nextPages);
     commitFolders(nextFolders);
-    setSidebarContextMenu(null);
+    const destinationLabel = destinationParentId
+      ? `“${foldersRef.current[destinationParentId]?.title ?? "폴더"}” 안으로`
+      : "개인 페이지로";
+    setNotice(`“${draggedFolder.title}” 폴더를 ${destinationLabel} 이동했어요`);
   };
 
   const movePageToFolder = (pageId: string, folderId: string | null) => {
@@ -1112,39 +1364,482 @@ function App() {
       setSidebarContextMenu(null);
       return;
     }
-    const nextOrder = Math.max(
-      -1,
-      ...Object.values(pagesRef.current)
-        .filter((candidate) => candidate.id !== ROOT_PAGE_ID && candidate.folderId === folderId)
-        .map((candidate) => candidate.order),
-    ) + 1;
-    updatePage(pageId, { folderId, order: nextOrder });
+    const sourceParentId = getPageSidebarParentId(page, foldersRef.current);
+    const destinationItems = getSidebarOrderedItems(
+      pagesRef.current,
+      foldersRef.current,
+      folderId,
+    ).filter((item) => !(item.kind === "page" && item.id === pageId));
+    destinationItems.push({
+      kind: "page",
+      id: page.id,
+      order: page.order,
+      createdAt: page.createdAt,
+      page,
+    });
+    const nextPages = { ...pagesRef.current };
+    const nextFolders = { ...foldersRef.current };
+    const sourceItems = getSidebarOrderedItems(
+      pagesRef.current,
+      foldersRef.current,
+      sourceParentId,
+    ).filter((item) => !(item.kind === "page" && item.id === pageId));
+    assignSidebarItemOrder(nextPages, nextFolders, sourceParentId, sourceItems);
+    assignSidebarItemOrder(nextPages, nextFolders, folderId, destinationItems);
+    nextPages[pageId] = { ...nextPages[pageId], updatedAt: new Date().toISOString() };
+    if (folderId && nextFolders[folderId]?.collapsed) {
+      nextFolders[folderId] = { ...nextFolders[folderId], collapsed: false };
+    }
+    commitPages(nextPages);
+    commitFolders(nextFolders);
     setSidebarContextMenu(null);
     setNotice(folderId ? "페이지를 폴더로 이동했어요" : "페이지를 폴더 밖으로 이동했어요");
   };
 
+  const moveSidebarPage = (pageId: string, target: SidebarPageDropTarget) => {
+    const page = pagesRef.current[pageId];
+    if (!page) return;
+    const targetPage = target.kind === "page" ? pagesRef.current[target.pageId] : null;
+    if (target.kind === "page" && (!targetPage || targetPage.id === pageId)) return;
+    const targetFolder = target.kind === "folder" ? foldersRef.current[target.folderId] : null;
+    if (target.kind === "folder" && !targetFolder) return;
+    const targetFolderId = target.kind === "page"
+      ? getPageSidebarParentId(targetPage!, foldersRef.current)
+      : target.kind === "folder" && target.placement === "inside"
+        ? target.folderId
+        : target.kind === "folder"
+          ? targetFolder?.parentId ?? null
+          : null;
+    const sourceFolderId = getPageSidebarParentId(page, foldersRef.current);
+    const destinationItems = getSidebarOrderedItems(
+      pagesRef.current,
+      foldersRef.current,
+      targetFolderId,
+    ).filter((item) => !(item.kind === "page" && item.id === pageId));
+    let insertionIndex = destinationItems.length;
+    if (target.kind === "page") {
+      const targetIndex = destinationItems.findIndex((item) => item.kind === "page" && item.id === target.pageId);
+      if (targetIndex < 0) return;
+      insertionIndex = targetIndex + (target.placement === "after" ? 1 : 0);
+    } else if (target.kind === "folder" && target.placement !== "inside") {
+      const targetIndex = destinationItems.findIndex((item) => item.kind === "folder" && item.id === target.folderId);
+      if (targetIndex < 0) return;
+      insertionIndex = targetIndex + (target.placement === "after" ? 1 : 0);
+    }
+    destinationItems.splice(insertionIndex, 0, {
+      kind: "page",
+      id: page.id,
+      order: page.order,
+      createdAt: page.createdAt,
+      page,
+    });
+
+    const nextPages = { ...pagesRef.current };
+    const nextFolders = { ...foldersRef.current };
+    if (sourceFolderId !== targetFolderId) {
+      const sourceItems = getSidebarOrderedItems(
+        pagesRef.current,
+        foldersRef.current,
+        sourceFolderId,
+      ).filter((item) => !(item.kind === "page" && item.id === pageId));
+      assignSidebarItemOrder(nextPages, nextFolders, sourceFolderId, sourceItems);
+    }
+    assignSidebarItemOrder(nextPages, nextFolders, targetFolderId, destinationItems);
+    nextPages[pageId] = { ...nextPages[pageId], updatedAt: new Date().toISOString() };
+    commitPages(nextPages);
+
+    if (targetFolderId && foldersRef.current[targetFolderId]?.collapsed) {
+      nextFolders[targetFolderId] = { ...nextFolders[targetFolderId], collapsed: false };
+    }
+    commitFolders(nextFolders);
+    const destinationLabel = targetFolderId ? `“${foldersRef.current[targetFolderId]?.title ?? "폴더"}”` : "개인 페이지";
+    setNotice(`${destinationLabel}에서 페이지 위치를 변경했어요`);
+  };
+
+  const setSidebarDropTarget = (target: SidebarPageDropTarget | null) => {
+    const current = sidebarPageDropTargetRef.current;
+    if (JSON.stringify(current) === JSON.stringify(target)) return;
+    sidebarPageDropTargetRef.current = target;
+    setSidebarPageDropTarget(target);
+  };
+
+  const beginSidebarPagePointerDrag = (event: ReactPointerEvent<HTMLButtonElement>, pageId: string) => {
+    if (event.button !== 0) return;
+    if (sidebarDraggedFolderIdRef.current) return;
+    if (sidebarRename) {
+      event.preventDefault();
+      return;
+    }
+    sidebarPagePointerDragRef.current = {
+      pointerId: event.pointerId,
+      pageId,
+      startX: event.clientX,
+      startY: event.clientY,
+      dragging: false,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const finishSidebarPageDrag = () => {
+    sidebarPagePointerDragRef.current = null;
+    sidebarDraggedPageIdRef.current = null;
+    sidebarPageDropTargetRef.current = null;
+    setSidebarDraggedPageId(null);
+    setSidebarPageDropTarget(null);
+  };
+
+  const updateSidebarPageDropTargetFromPoint = (
+    clientX: number,
+    clientY: number,
+    draggedPageId: string,
+  ) => {
+    const hitElement = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+    const targetPageElement = hitElement?.closest<HTMLElement>("[data-sidebar-page-id]");
+    const targetPageId = targetPageElement?.dataset.sidebarPageId;
+    if (targetPageId && targetPageId !== draggedPageId) {
+      const targetRect = targetPageElement.getBoundingClientRect();
+      setSidebarDropTarget({
+        kind: "page",
+        pageId: targetPageId,
+        placement: clientY < targetRect.top + targetRect.height / 2 ? "before" : "after",
+      });
+      return;
+    }
+    const targetFolderRow = hitElement?.closest<HTMLElement>("[data-sidebar-folder-row-id]");
+    const targetFolderId = targetFolderRow?.dataset.sidebarFolderRowId;
+    if (targetFolderId) {
+      const targetRect = targetFolderRow.getBoundingClientRect();
+      const pointerRatio = Math.max(0, Math.min(1, (clientY - targetRect.top) / Math.max(1, targetRect.height)));
+      setSidebarDropTarget({
+        kind: "folder",
+        folderId: targetFolderId,
+        placement: pointerRatio < .3 ? "before" : pointerRatio > .7 ? "after" : "inside",
+      });
+      return;
+    }
+    const siblingTarget = getSidebarSiblingDropTargetFromGap(
+      hitElement,
+      clientY,
+      { kind: "page", id: draggedPageId },
+    );
+    if (siblingTarget) {
+      setSidebarDropTarget(siblingTarget);
+      return;
+    }
+    if (hitElement?.closest(".sidebar-unfiled-pages, .pages-section > .section-label")) {
+      setSidebarDropTarget({ kind: "unfiled" });
+      return;
+    }
+    setSidebarDropTarget(null);
+  };
+
+  const updateSidebarPagePointerDrag = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const dragState = sidebarPagePointerDragRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) return;
+    const distance = Math.hypot(event.clientX - dragState.startX, event.clientY - dragState.startY);
+    if (!dragState.dragging && distance < 5) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!dragState.dragging) {
+      dragState.dragging = true;
+      sidebarDraggedPageIdRef.current = dragState.pageId;
+      setSidebarDraggedPageId(dragState.pageId);
+      setSidebarContextMenu(null);
+      setSidebarCreateMenuOpen(false);
+    }
+    updateSidebarPageDropTargetFromPoint(event.clientX, event.clientY, dragState.pageId);
+  };
+
+  const completeSidebarPagePointerDrop = () => {
+    const dragState = sidebarPagePointerDragRef.current;
+    if (!dragState) return false;
+    const dropTarget = sidebarPageDropTargetRef.current;
+    if (dragState.dragging) {
+      sidebarSuppressClickRef.current = true;
+      if (dropTarget) moveSidebarPage(dragState.pageId, dropTarget);
+      window.setTimeout(() => {
+        sidebarSuppressClickRef.current = false;
+      }, 0);
+    }
+    const wasDragging = dragState.dragging;
+    finishSidebarPageDrag();
+    return wasDragging;
+  };
+
+  const finishSidebarPagePointerDrag = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const dragState = sidebarPagePointerDragRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    if (dragState.dragging) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    completeSidebarPagePointerDrop();
+  };
+
+  const finishSidebarPageMouseDrag = (event: ReactMouseEvent<HTMLButtonElement>) => {
+    const dragState = sidebarPagePointerDragRef.current;
+    if (!dragState?.dragging) return;
+    event.preventDefault();
+    event.stopPropagation();
+    completeSidebarPagePointerDrop();
+  };
+
+  const openSidebarPage = (pageId: string) => {
+    if (sidebarSuppressClickRef.current) {
+      sidebarSuppressClickRef.current = false;
+      return;
+    }
+    openPage(pageId);
+  };
+
+  useEffect(() => {
+    if (!sidebarDraggedPageId) return;
+    const updateFromWindow = (event: PointerEvent | MouseEvent) => {
+      const dragState = sidebarPagePointerDragRef.current;
+      if (!dragState?.dragging) return;
+      updateSidebarPageDropTargetFromPoint(event.clientX, event.clientY, dragState.pageId);
+    };
+    const finishFromWindow = (event: PointerEvent | MouseEvent) => {
+      const dragState = sidebarPagePointerDragRef.current;
+      if (!dragState?.dragging) return;
+      event.preventDefault();
+      event.stopPropagation();
+      completeSidebarPagePointerDrop();
+    };
+    window.addEventListener("pointermove", updateFromWindow, true);
+    window.addEventListener("mousemove", updateFromWindow, true);
+    window.addEventListener("pointerup", finishFromWindow, true);
+    window.addEventListener("mouseup", finishFromWindow, true);
+    return () => {
+      window.removeEventListener("pointermove", updateFromWindow, true);
+      window.removeEventListener("mousemove", updateFromWindow, true);
+      window.removeEventListener("pointerup", finishFromWindow, true);
+      window.removeEventListener("mouseup", finishFromWindow, true);
+    };
+  }, [sidebarDraggedPageId]);
+
+  const setSidebarFolderTarget = (target: SidebarFolderDropTarget | null) => {
+    const current = sidebarFolderDropTargetRef.current;
+    if (JSON.stringify(current) === JSON.stringify(target)) return;
+    sidebarFolderDropTargetRef.current = target;
+    setSidebarFolderDropTarget(target);
+  };
+
+  const beginSidebarFolderPointerDrag = (event: ReactPointerEvent<HTMLDivElement>, folderId: string) => {
+    if (event.button !== 0 || sidebarDraggedPageIdRef.current || sidebarRename) return;
+    sidebarFolderPointerDragRef.current = {
+      pointerId: event.pointerId,
+      folderId,
+      startX: event.clientX,
+      startY: event.clientY,
+      dragging: false,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const finishSidebarFolderDrag = () => {
+    sidebarFolderPointerDragRef.current = null;
+    sidebarDraggedFolderIdRef.current = null;
+    sidebarFolderDropTargetRef.current = null;
+    setSidebarDraggedFolderId(null);
+    setSidebarFolderDropTarget(null);
+  };
+
+  const updateSidebarFolderDropTargetFromPoint = (
+    clientX: number,
+    clientY: number,
+    draggedFolderId: string,
+  ) => {
+    const hitElement = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+    const targetPageElement = hitElement?.closest<HTMLElement>("[data-sidebar-page-id]");
+    const targetPageId = targetPageElement?.dataset.sidebarPageId;
+    if (targetPageId) {
+      const targetPage = pagesRef.current[targetPageId];
+      const destinationParentId = targetPage
+        ? getPageSidebarParentId(targetPage, foldersRef.current)
+        : null;
+      const draggedFolder = foldersRef.current[draggedFolderId];
+      if (
+        !targetPage
+        || folderContainsFolder(draggedFolderId, destinationParentId)
+        || (
+          draggedFolder?.parentId !== destinationParentId
+          && !canPlaceFolderAtParent(foldersRef.current, draggedFolderId, destinationParentId)
+        )
+      ) {
+        setSidebarFolderTarget(null);
+        return;
+      }
+      const targetRect = targetPageElement.getBoundingClientRect();
+      setSidebarFolderTarget({
+        kind: "page",
+        pageId: targetPageId,
+        placement: clientY < targetRect.top + targetRect.height / 2 ? "before" : "after",
+      });
+      return;
+    }
+    const targetFolderRow = hitElement?.closest<HTMLElement>("[data-sidebar-folder-row-id]");
+    const targetFolderId = targetFolderRow?.dataset.sidebarFolderRowId;
+    if (targetFolderId && targetFolderId !== draggedFolderId) {
+      const targetFolder = foldersRef.current[targetFolderId];
+      const targetRect = targetFolderRow.getBoundingClientRect();
+      const pointerRatio = Math.max(0, Math.min(1, (clientY - targetRect.top) / Math.max(1, targetRect.height)));
+      const placement = pointerRatio < .27 ? "before" : pointerRatio > .73 ? "after" : "inside";
+      const destinationParentId = placement === "inside" ? targetFolderId : targetFolder?.parentId ?? null;
+      const draggedFolder = foldersRef.current[draggedFolderId];
+      if (
+        folderContainsFolder(draggedFolderId, destinationParentId)
+        || (
+          draggedFolder?.parentId !== destinationParentId
+          && !canPlaceFolderAtParent(foldersRef.current, draggedFolderId, destinationParentId)
+        )
+      ) {
+        setSidebarFolderTarget(null);
+        return;
+      }
+      setSidebarFolderTarget({
+        kind: "folder",
+        folderId: targetFolderId,
+        placement,
+      });
+      return;
+    }
+
+    const siblingTarget = getSidebarSiblingDropTargetFromGap(
+      hitElement,
+      clientY,
+      { kind: "folder", id: draggedFolderId },
+    );
+    if (siblingTarget) {
+      const destinationParentId = siblingTarget.kind === "folder"
+        ? foldersRef.current[siblingTarget.folderId]?.parentId ?? null
+        : pagesRef.current[siblingTarget.pageId]
+          ? getPageSidebarParentId(pagesRef.current[siblingTarget.pageId], foldersRef.current)
+          : null;
+      const draggedFolder = foldersRef.current[draggedFolderId];
+      if (
+        !folderContainsFolder(draggedFolderId, destinationParentId)
+        && (
+          draggedFolder?.parentId === destinationParentId
+          || canPlaceFolderAtParent(foldersRef.current, draggedFolderId, destinationParentId)
+        )
+      ) {
+        setSidebarFolderTarget(siblingTarget);
+      } else {
+        setSidebarFolderTarget(null);
+      }
+      return;
+    }
+
+    if (hitElement?.closest(".pages-section")) {
+      setSidebarFolderTarget({ kind: "root" });
+      return;
+    }
+    setSidebarFolderTarget(null);
+  };
+
+  const updateSidebarFolderPointerDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const dragState = sidebarFolderPointerDragRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) return;
+    const distance = Math.hypot(event.clientX - dragState.startX, event.clientY - dragState.startY);
+    if (!dragState.dragging && distance < 5) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!dragState.dragging) {
+      dragState.dragging = true;
+      sidebarDraggedFolderIdRef.current = dragState.folderId;
+      setSidebarDraggedFolderId(dragState.folderId);
+      setSidebarContextMenu(null);
+      setSidebarCreateMenuOpen(false);
+    }
+    updateSidebarFolderDropTargetFromPoint(event.clientX, event.clientY, dragState.folderId);
+  };
+
+  const completeSidebarFolderPointerDrop = () => {
+    const dragState = sidebarFolderPointerDragRef.current;
+    if (!dragState) return false;
+    const dropTarget = sidebarFolderDropTargetRef.current;
+    if (dragState.dragging) {
+      sidebarSuppressClickRef.current = true;
+      if (dropTarget) moveSidebarFolder(dragState.folderId, dropTarget);
+      window.setTimeout(() => {
+        sidebarSuppressClickRef.current = false;
+      }, 0);
+    }
+    const wasDragging = dragState.dragging;
+    finishSidebarFolderDrag();
+    return wasDragging;
+  };
+
+  const finishSidebarFolderPointerDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const dragState = sidebarFolderPointerDragRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    if (dragState.dragging) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    completeSidebarFolderPointerDrop();
+  };
+
+  const finishSidebarFolderMouseDrag = (event: ReactMouseEvent<HTMLDivElement>) => {
+    const dragState = sidebarFolderPointerDragRef.current;
+    if (!dragState?.dragging) return;
+    event.preventDefault();
+    event.stopPropagation();
+    completeSidebarFolderPointerDrop();
+  };
+
+  useEffect(() => {
+    if (!sidebarDraggedFolderId) return;
+    const updateFromWindow = (event: PointerEvent | MouseEvent) => {
+      const dragState = sidebarFolderPointerDragRef.current;
+      if (!dragState?.dragging) return;
+      updateSidebarFolderDropTargetFromPoint(event.clientX, event.clientY, dragState.folderId);
+    };
+    const finishFromWindow = (event: PointerEvent | MouseEvent) => {
+      const dragState = sidebarFolderPointerDragRef.current;
+      if (!dragState?.dragging) return;
+      event.preventDefault();
+      event.stopPropagation();
+      completeSidebarFolderPointerDrop();
+    };
+    window.addEventListener("pointermove", updateFromWindow, true);
+    window.addEventListener("mousemove", updateFromWindow, true);
+    window.addEventListener("pointerup", finishFromWindow, true);
+    window.addEventListener("mouseup", finishFromWindow, true);
+    return () => {
+      window.removeEventListener("pointermove", updateFromWindow, true);
+      window.removeEventListener("mousemove", updateFromWindow, true);
+      window.removeEventListener("pointerup", finishFromWindow, true);
+      window.removeEventListener("mouseup", finishFromWindow, true);
+    };
+  }, [sidebarDraggedFolderId]);
+
   const removeFolder = (folderId: string) => {
     const folder = foldersRef.current[folderId];
     if (!folder) return;
-    let nextOrder = Math.max(
-      -1,
-      ...Object.values(pagesRef.current)
-        .filter((page) => page.id !== ROOT_PAGE_ID && page.folderId === null)
-        .map((page) => page.order),
-    ) + 1;
     const nextPages = { ...pagesRef.current };
-    Object.values(nextPages)
-      .filter((page) => page.folderId === folderId)
-      .sort((a, b) => a.order - b.order)
-      .forEach((page) => {
-        nextPages[page.id] = { ...page, folderId: null, order: nextOrder++, updatedAt: new Date().toISOString() };
-      });
     const nextFolders = { ...foldersRef.current };
+    const parentItems = getSidebarOrderedItems(pagesRef.current, foldersRef.current, folder.parentId)
+      .filter((item) => !(item.kind === "folder" && item.id === folderId));
+    const promotedItems = getSidebarOrderedItems(pagesRef.current, foldersRef.current, folderId);
     delete nextFolders[folderId];
+    assignSidebarItemOrder(nextPages, nextFolders, folder.parentId, [...parentItems, ...promotedItems]);
+    promotedItems.forEach((item) => {
+      if (item.kind === "page" && nextPages[item.id]) {
+        nextPages[item.id] = { ...nextPages[item.id], updatedAt: new Date().toISOString() };
+      }
+    });
     commitPages(nextPages);
     commitFolders(nextFolders);
     setSidebarContextMenu(null);
-    setNotice(`“${folder.title}” 폴더를 삭제하고 페이지는 밖으로 이동했어요`);
+    setNotice(`“${folder.title}” 폴더를 삭제하고 내부 항목은 상위 위치로 이동했어요`);
   };
 
   const deletePage = (pageId: string) => {
@@ -2117,14 +2812,23 @@ function App() {
 
   const currentPage = pages[currentPageId] ?? rootPage;
   const parentPage = currentPage.parentId ? pages[currentPage.parentId] : null;
-  const orderedFolders = Object.values(folders)
-    .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
-  const unfiledPages = Object.values(pages)
-    .filter((page) => page.id !== ROOT_PAGE_ID && (!page.folderId || !folders[page.folderId]))
+  const folderChildren = (parentId: string | null) => Object.values(folders)
+    .filter((folder) => folder.parentId === parentId)
     .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
   const folderPages = (folderId: string) => Object.values(pages)
     .filter((page) => page.id !== ROOT_PAGE_ID && page.folderId === folderId)
     .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
+  const sidebarItems = (parentId: string | null) => getSidebarOrderedItems(pages, folders, parentId);
+  const rootSidebarItems = sidebarItems(null);
+  const folderContentCount = (folderId: string, visited = new Set<string>()): number => {
+    if (visited.has(folderId)) return 0;
+    const nextVisited = new Set(visited).add(folderId);
+    return folderPages(folderId).length
+      + folderChildren(folderId).reduce(
+        (count, childFolder) => count + 1 + folderContentCount(childFolder.id, nextVisited),
+        0,
+      );
+  };
   const personalPageCount = Object.keys(pages).length - 1;
   const liveSelectedBlockIds = getLiveSelectedBlockIds();
   type LiveEditorBlock = NonNullable<ReturnType<typeof editor.getBlock>>;
@@ -2200,6 +2904,109 @@ function App() {
     setNotice(`${liveSelectedBlockIds.length}개 블록의 ${label}을 변경했어요`);
   };
 
+  const renderSidebarPage = (page: StoredPage, nested = false): ReactNode => {
+    const pageMoveDropTarget = sidebarPageDropTarget?.kind === "page" && sidebarPageDropTarget.pageId === page.id
+      ? sidebarPageDropTarget.placement
+      : null;
+    const folderMoveDropTarget = sidebarFolderDropTarget?.kind === "page" && sidebarFolderDropTarget.pageId === page.id
+      ? sidebarFolderDropTarget.placement
+      : null;
+    return (
+      <NavItem
+        key={page.id}
+        icon={<span className="nav-emoji">{page.settings.icon || "📄"}</span>}
+        label={page.title || "제목 없음"}
+        active={currentPageId === page.id}
+        nested={nested}
+        editing={sidebarRename?.kind === "page" && sidebarRename.id === page.id}
+        draggable
+        dragging={sidebarDraggedPageId === page.id}
+        dropPlacement={pageMoveDropTarget ?? folderMoveDropTarget}
+        pageId={page.id}
+        onClick={() => openSidebarPage(page.id)}
+        onContextMenu={(event) => openSidebarContextMenu(event, { kind: "page", pageId: page.id })}
+        onRename={(nextTitle) => renameSidebarItem({ kind: "page", id: page.id }, nextTitle)}
+        onPointerDown={(event) => beginSidebarPagePointerDrag(event, page.id)}
+        onPointerMove={updateSidebarPagePointerDrag}
+        onPointerUp={finishSidebarPagePointerDrag}
+        onPointerCancel={finishSidebarPagePointerDrag}
+        onMouseUp={finishSidebarPageMouseDrag}
+      />
+    );
+  };
+
+  const renderSidebarFolder = (folder: StoredFolder, depth = 0): ReactNode => {
+    const childItems = sidebarItems(folder.id);
+    const folderDropPlacement = sidebarFolderDropTarget?.kind === "folder"
+      && sidebarFolderDropTarget.folderId === folder.id
+      ? sidebarFolderDropTarget.placement
+      : null;
+    const pageDropPlacement = sidebarPageDropTarget?.kind === "folder"
+      && sidebarPageDropTarget.folderId === folder.id
+      ? sidebarPageDropTarget.placement
+      : null;
+    const folderIsEditing = sidebarRename?.kind === "folder" && sidebarRename.id === folder.id;
+    const hasChildren = childItems.length > 0;
+    return (
+      <div
+        className={`sidebar-folder ${depth > 0 ? "is-nested-folder" : ""} ${pageDropPlacement ? `is-page-drop-${pageDropPlacement}` : ""} ${folderDropPlacement ? `is-folder-drop-${folderDropPlacement}` : ""} ${sidebarDraggedFolderId === folder.id ? "is-folder-dragging" : ""}`}
+        key={folder.id}
+        data-sidebar-folder-id={folder.id}
+        data-sidebar-folder-depth={depth}
+      >
+        <div
+          role="button"
+          tabIndex={0}
+          aria-expanded={!folder.collapsed}
+          data-sidebar-folder-row-id={folder.id}
+          className={`sidebar-folder-row is-folder-draggable ${folder.collapsed ? "is-collapsed" : ""} ${folderIsEditing ? "is-editing" : ""}`}
+          onClick={() => {
+            if (sidebarSuppressClickRef.current) {
+              sidebarSuppressClickRef.current = false;
+              return;
+            }
+            toggleFolder(folder.id);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") toggleFolder(folder.id);
+          }}
+          onContextMenu={(event) => openSidebarContextMenu(event, { kind: "folder", folderId: folder.id })}
+          onPointerDown={folderIsEditing ? undefined : (event) => beginSidebarFolderPointerDrag(event, folder.id)}
+          onPointerMove={folderIsEditing ? undefined : updateSidebarFolderPointerDrag}
+          onPointerUp={folderIsEditing ? undefined : finishSidebarFolderPointerDrag}
+          onPointerCancel={folderIsEditing ? undefined : finishSidebarFolderPointerDrag}
+          onMouseUp={folderIsEditing ? undefined : finishSidebarFolderMouseDrag}
+        >
+          <ChevronRight size={14} />
+          <SidebarFolderIcon open={!folder.collapsed} />
+          {folderIsEditing
+            ? <InlineNavRename
+                value={folder.title}
+                ariaLabel="폴더 이름"
+                onCancel={() => setSidebarRename(null)}
+                onSubmit={(nextTitle) => renameSidebarItem({ kind: "folder", id: folder.id }, nextTitle)}
+              />
+            : <span>{folder.title}</span>}
+          <em>{folderContentCount(folder.id)}</em>
+        </div>
+        {!folder.collapsed && (
+          <div className="sidebar-folder-pages">
+            {childItems.map((item) => (
+              item.kind === "folder"
+                ? renderSidebarFolder(item.folder, depth + 1)
+                : renderSidebarPage(item.page, true)
+            ))}
+            {!hasChildren && (
+              <button className="empty-folder-action" type="button" onClick={() => createChildPage("sidebar", folder.id)}>
+                <Plus size={13} /> 페이지 추가
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="app-shell" data-theme={appTheme}>
       <aside className={`sidebar ${sidebarOpen ? "is-open" : ""}`} aria-label="워크스페이스 메뉴">
@@ -2237,7 +3044,7 @@ function App() {
           <NavItem icon={<BookOpen size={16} />} label="독서 노트" />
         </div>
 
-        <div className="nav-section pages-section">
+        <div className={`nav-section pages-section ${sidebarFolderDropTarget?.kind === "root" ? "is-folder-root-drop-target" : ""}`}>
           <div className="section-label">
             <span>개인 페이지</span>
             <div className="sidebar-create-wrap">
@@ -2259,7 +3066,7 @@ function App() {
                     <FileText size={15} />
                     <span><strong>페이지</strong><small>현재 페이지 아래에 추가</small></span>
                   </button>
-                  <button type="button" role="menuitem" onClick={createFolder}>
+                  <button type="button" role="menuitem" onClick={() => createFolder(null)}>
                     <FolderPlus size={15} />
                     <span><strong>폴더</strong><small>페이지를 묶어 정리</small></span>
                   </button>
@@ -2268,69 +3075,18 @@ function App() {
             </div>
           </div>
 
-          {personalPageCount === 0 && orderedFolders.length === 0
+          {personalPageCount === 0 && Object.keys(folders).length === 0
             ? <span className="empty-page-nav">+ 버튼이나 /페이지로 시작해보세요</span>
             : <>
-              {unfiledPages.map((page) => (
-              <NavItem
-                key={page.id}
-                icon={<span className="nav-emoji">{page.settings.icon || "📄"}</span>}
-                label={page.title || "제목 없음"}
-                active={currentPageId === page.id}
-                editing={sidebarRename?.kind === "page" && sidebarRename.id === page.id}
-                onClick={() => openPage(page.id)}
-                onContextMenu={(event) => openSidebarContextMenu(event, { kind: "page", pageId: page.id })}
-                onRename={(nextTitle) => renameSidebarItem({ kind: "page", id: page.id }, nextTitle)}
-              />
-              ))}
-              {orderedFolders.map((folder) => {
-                const pagesInFolder = folderPages(folder.id);
-                return (
-                  <div className="sidebar-folder" key={folder.id}>
-                    <div
-                      role="button"
-                      tabIndex={0}
-                      className={`sidebar-folder-row ${folder.collapsed ? "is-collapsed" : ""}`}
-                      onClick={() => toggleFolder(folder.id)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") toggleFolder(folder.id);
-                      }}
-                      onContextMenu={(event) => openSidebarContextMenu(event, { kind: "folder", folderId: folder.id })}
-                    >
-                      <ChevronRight size={14} />
-                      <FolderOpen size={15} />
-                      {sidebarRename?.kind === "folder" && sidebarRename.id === folder.id
-                        ? <InlineNavRename
-                            value={folder.title}
-                            ariaLabel="폴더 이름"
-                            onCancel={() => setSidebarRename(null)}
-                            onSubmit={(nextTitle) => renameSidebarItem({ kind: "folder", id: folder.id }, nextTitle)}
-                          />
-                        : <span>{folder.title}</span>}
-                      <em>{pagesInFolder.length}</em>
-                    </div>
-                    {!folder.collapsed && (
-                      <div className="sidebar-folder-pages">
-                        {pagesInFolder.length === 0
-                          ? <button className="empty-folder-action" type="button" onClick={() => createChildPage("sidebar", folder.id)}><Plus size={13} /> 페이지 추가</button>
-                          : pagesInFolder.map((page) => (
-                            <NavItem
-                              key={page.id}
-                              icon={<span className="nav-emoji">{page.settings.icon || "📄"}</span>}
-                              label={page.title || "제목 없음"}
-                              active={currentPageId === page.id}
-                              nested
-                              editing={sidebarRename?.kind === "page" && sidebarRename.id === page.id}
-                              onClick={() => openPage(page.id)}
-                              onContextMenu={(event) => openSidebarContextMenu(event, { kind: "page", pageId: page.id })}
-                              onRename={(nextTitle) => renameSidebarItem({ kind: "page", id: page.id }, nextTitle)}
-                            />
-                          ))}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
+              <div
+                className={`sidebar-unfiled-pages ${sidebarDraggedPageId ? "is-drag-active" : ""} ${sidebarPageDropTarget?.kind === "unfiled" ? "is-drop-target" : ""}`}
+              >
+                {rootSidebarItems.map((item) => (
+                  item.kind === "folder"
+                    ? renderSidebarFolder(item.folder)
+                    : renderSidebarPage(item.page)
+                ))}
+              </div>
             </>}
         </div>
 
@@ -2619,6 +3375,7 @@ function App() {
             setSidebarContextMenu(null);
             createChildPage("sidebar", folderId);
           }}
+          onCreateFolder={(parentId) => createFolder(parentId)}
           onDeleteFolder={removeFolder}
           onDeletePage={(pageId) => {
             setSidebarContextMenu(null);
@@ -3074,9 +3831,18 @@ function NavItem({
   active = false,
   nested = false,
   editing = false,
+  draggable = false,
+  dragging = false,
+  dropPlacement = null,
+  pageId,
   onClick,
   onContextMenu,
   onRename,
+  onPointerDown,
+  onPointerMove,
+  onPointerUp,
+  onPointerCancel,
+  onMouseUp,
 }: {
   icon: React.ReactNode;
   label: string;
@@ -3084,18 +3850,33 @@ function NavItem({
   active?: boolean;
   nested?: boolean;
   editing?: boolean;
+  draggable?: boolean;
+  dragging?: boolean;
+  dropPlacement?: "before" | "after" | null;
+  pageId?: string;
   onClick?: () => void;
   onContextMenu?: (event: ReactMouseEvent<HTMLButtonElement>) => void;
   onRename?: (value: string) => void;
+  onPointerDown?: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+  onPointerMove?: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+  onPointerUp?: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+  onPointerCancel?: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+  onMouseUp?: (event: ReactMouseEvent<HTMLButtonElement>) => void;
 }) {
   return (
     <button
       type="button"
-      className={`nav-item ${active ? "active" : ""} ${nested ? "is-nested" : ""} ${editing ? "is-editing" : ""}`}
+      className={`nav-item ${active ? "active" : ""} ${nested ? "is-nested" : ""} ${editing ? "is-editing" : ""} ${draggable ? "is-page-draggable" : ""} ${dragging ? "is-dragging" : ""} ${dropPlacement ? `is-drop-${dropPlacement}` : ""}`}
+      data-sidebar-page-id={pageId}
       onClick={() => {
         if (!editing) onClick?.();
       }}
       onContextMenu={onContextMenu}
+      onPointerDown={editing ? undefined : onPointerDown}
+      onPointerMove={editing ? undefined : onPointerMove}
+      onPointerUp={editing ? undefined : onPointerUp}
+      onPointerCancel={editing ? undefined : onPointerCancel}
+      onMouseUp={editing ? undefined : onMouseUp}
     >
       <span className="nav-icon">{icon}</span>
       {editing && onRename
@@ -3103,6 +3884,23 @@ function NavItem({
         : <span>{label}</span>}
       {count && <em>{count}</em>}
     </button>
+  );
+}
+
+function SidebarFolderIcon({ open = false }: { open?: boolean }) {
+  return (
+    <svg
+      className={`sidebar-folder-icon ${open ? "is-open" : ""}`}
+      viewBox="0 0 20 18"
+      width="17"
+      height="16"
+      aria-hidden="true"
+    >
+      <path className="sidebar-folder-icon-back" d="M2.2 4.1c0-1 .8-1.8 1.8-1.8h3.2c.6 0 1.1.2 1.5.7l1 1.1h6.2c1 0 1.9.8 1.9 1.9v1.1H2.2v-3Z" />
+      <path className="sidebar-folder-icon-paper" d="M4.1 5.1h11.8v7.7H4.1z" />
+      <path className="sidebar-folder-icon-front" d="M2.1 6.3c0-.7.6-1.3 1.3-1.3h13.4c.8 0 1.3.7 1.1 1.4l-1.6 7.8c-.2.9-1 1.5-1.9 1.5H4c-.9 0-1.7-.7-1.8-1.6L2.1 6.3Z" />
+      <path className="sidebar-folder-icon-shine" d="M4.2 7.3h11.2" />
+    </svg>
   );
 }
 
@@ -3120,6 +3918,7 @@ function SidebarItemContextMenu({
   onMovePage,
   onToggleFolder,
   onCreatePage,
+  onCreateFolder,
   onDeleteFolder,
   onDeletePage,
 }: {
@@ -3137,16 +3936,27 @@ function SidebarItemContextMenu({
   onMovePage: (pageId: string, folderId: string | null) => void;
   onToggleFolder: (folderId: string) => void;
   onCreatePage: (folderId: string) => void;
+  onCreateFolder: (parentId: string) => void;
   onDeleteFolder: (folderId: string) => void;
   onDeletePage: (pageId: string) => void;
 }) {
-  const orderedFolders = Object.values(folders).sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
+  const flattenFolders = (parentId: string | null, depth = 0, visited = new Set<string>()): Array<{ folder: StoredFolder; depth: number }> => (
+    Object.values(folders)
+      .filter((candidate) => candidate.parentId === parentId && !visited.has(candidate.id))
+      .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt))
+      .flatMap((candidate) => {
+        const nextVisited = new Set(visited).add(candidate.id);
+        return [
+          { folder: candidate, depth },
+          ...flattenFolders(candidate.id, depth + 1, nextVisited),
+        ];
+      })
+  );
+  const orderedFolderEntries = flattenFolders(null);
 
   if (menu.kind === "page" && page) {
-    const siblings = Object.values(pages)
-      .filter((candidate) => candidate.id !== ROOT_PAGE_ID && candidate.folderId === page.folderId)
-      .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
-    const pageIndex = siblings.findIndex((candidate) => candidate.id === page.id);
+    const siblings = getSidebarOrderedItems(pages, folders, getPageSidebarParentId(page, folders));
+    const pageIndex = siblings.findIndex((candidate) => candidate.kind === "page" && candidate.id === page.id);
     return (
       <div
         className="sidebar-item-context sidebar-floating-menu"
@@ -3170,14 +3980,15 @@ function SidebarItemContextMenu({
         <span className="sidebar-context-label">폴더로 이동</span>
         <div className="sidebar-folder-targets">
           <button type="button" className={page.folderId === null ? "is-selected" : ""} onClick={() => onMovePage(page.id, null)}><LayoutGrid size={14} /> 폴더 없음{page.folderId === null && <span>✓</span>}</button>
-          {orderedFolders.map((targetFolder) => (
+          {orderedFolderEntries.map(({ folder: targetFolder, depth }) => (
             <button
               type="button"
               key={targetFolder.id}
               className={page.folderId === targetFolder.id ? "is-selected" : ""}
               onClick={() => onMovePage(page.id, targetFolder.id)}
+              style={{ paddingLeft: `${8 + depth * 14}px` }}
             >
-              <FolderOpen size={14} /> {targetFolder.title}
+              <SidebarFolderIcon /> {targetFolder.title}
               {page.folderId === targetFolder.id && <span>✓</span>}
             </button>
           ))}
@@ -3189,7 +4000,10 @@ function SidebarItemContextMenu({
   }
 
   if (menu.kind === "folder" && folder) {
-    const folderIndex = orderedFolders.findIndex((candidate) => candidate.id === folder.id);
+    const siblings = getSidebarOrderedItems(pages, folders, folder.parentId);
+    const folderIndex = siblings.findIndex((candidate) => candidate.kind === "folder" && candidate.id === folder.id);
+    const folderDepth = getFolderDepth(folders, folder.id);
+    const reachedFolderDepthLimit = folderDepth >= MAX_FOLDER_DEPTH;
     return (
       <div
         className="sidebar-item-context sidebar-floating-menu"
@@ -3199,19 +4013,30 @@ function SidebarItemContextMenu({
         onMouseDown={(event) => event.stopPropagation()}
         onContextMenu={(event) => event.preventDefault()}
       >
-        <div className="sidebar-context-heading"><FolderOpen size={16} /><strong>{folder.title}</strong></div>
+        <div className="sidebar-context-heading"><SidebarFolderIcon open={!folder.collapsed} /><strong>{folder.title}</strong></div>
         <button type="button" role="menuitem" onClick={() => onCreatePage(folder.id)}><Plus size={15} /> 이 폴더에 페이지 추가</button>
+        <button
+          type="button"
+          role="menuitem"
+          disabled={reachedFolderDepthLimit}
+          title={reachedFolderDepthLimit ? `폴더는 최대 ${MAX_FOLDER_DEPTH}단계까지 만들 수 있어요` : undefined}
+          onClick={() => onCreateFolder(folder.id)}
+        >
+          <FolderPlus size={15} />
+          하위 폴더 추가
+          {reachedFolderDepthLimit && <small className="sidebar-depth-limit">최대 {MAX_FOLDER_DEPTH}단계</small>}
+        </button>
         <button type="button" role="menuitem" onClick={() => onRename({ kind: "folder", id: folder.id })}><Pencil size={15} /> 이름 바꾸기</button>
         <button type="button" role="menuitem" onClick={() => onToggleFolder(folder.id)}><ChevronRight size={15} /> {folder.collapsed ? "폴더 펼치기" : "폴더 접기"}</button>
         <div className="sidebar-context-divider" />
         <span className="sidebar-context-label">순서</span>
         <div className="sidebar-context-row">
           <button type="button" role="menuitem" disabled={folderIndex <= 0} onClick={() => onReorderFolder(folder.id, -1)}><ArrowUp size={14} /> 위로</button>
-          <button type="button" role="menuitem" disabled={folderIndex < 0 || folderIndex >= orderedFolders.length - 1} onClick={() => onReorderFolder(folder.id, 1)}><ArrowDown size={14} /> 아래로</button>
+          <button type="button" role="menuitem" disabled={folderIndex < 0 || folderIndex >= siblings.length - 1} onClick={() => onReorderFolder(folder.id, 1)}><ArrowDown size={14} /> 아래로</button>
         </div>
         <div className="sidebar-context-divider" />
         <button type="button" role="menuitem" className="sidebar-context-danger" onClick={() => onDeleteFolder(folder.id)}><Trash2 size={15} /> 폴더 삭제</button>
-        <small className="sidebar-context-note">폴더 안의 페이지는 삭제되지 않고 밖으로 이동합니다.</small>
+        <small className="sidebar-context-note">내부 페이지와 폴더는 한 단계 위로 이동합니다.</small>
       </div>
     );
   }

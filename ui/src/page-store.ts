@@ -6,6 +6,7 @@ export const PAGES_STORAGE_KEY = "nodi:pages";
 export const FOLDERS_STORAGE_KEY = "nodi:page-folders";
 export const PAGES_CHANGED_EVENT = "nodi:pages-changed";
 export const OPEN_PAGE_EVENT = "nodi:open-page";
+export const MAX_FOLDER_DEPTH = 3;
 
 export type StoredPage = {
   id: string;
@@ -24,6 +25,7 @@ export type StoredPages = Record<string, StoredPage>;
 
 export type StoredFolder = {
   id: string;
+  parentId: string | null;
   title: string;
   order: number;
   collapsed: boolean;
@@ -51,7 +53,32 @@ export function readStoredFolders(): StoredFolders {
   try {
     const saved = window.localStorage.getItem(FOLDERS_STORAGE_KEY);
     if (!saved) return {};
-    return JSON.parse(saved) as StoredFolders;
+    const parsed = JSON.parse(saved) as Record<string, Omit<StoredFolder, "parentId"> & { parentId?: unknown }>;
+    const folders = Object.fromEntries(
+      Object.entries(parsed).map(([folderId, folder]) => [
+        folderId,
+        {
+          ...folder,
+          id: folder.id || folderId,
+          parentId: typeof folder.parentId === "string" ? folder.parentId : null,
+        } satisfies StoredFolder,
+      ]),
+    );
+
+    Object.values(folders).forEach((folder) => {
+      const seen = new Set([folder.id]);
+      let parentId = folder.parentId;
+      while (parentId) {
+        const parent = folders[parentId];
+        if (!parent || seen.has(parentId)) {
+          folder.parentId = null;
+          break;
+        }
+        seen.add(parentId);
+        parentId = parent.parentId;
+      }
+    });
+    return folders;
   } catch {
     return {};
   }
