@@ -847,7 +847,7 @@ html, body, #root { height: 100%; overflow: hidden; }
 .database-rule-popover > header strong { color: #4f4a43; font-size: 12px; font-weight: 650; }
 .database-rule-popover > header button { width: 27px; height: 27px; display: grid; place-items: center; border: 0; border-radius: 5px; color: #aaa49c; background: transparent; }
 .database-rule-popover > header button:hover { color: #ae5555; background: #fff0ef; }
-.database-rule-popover > p { margin: 12px 5px; color: #979189; font-size: 12px; }
+.database-rule-popover > p { margin: 12px 5px 5px; color: #979189; font-size: 12px; }
 .database-rule-add { width: 100%; min-height: 34px; margin-top: 7px; padding: 0 7px; display: flex; align-items: center; gap: 5px; border: 0; border-radius: 6px; color: #5c54b7; background: transparent; font-size: 12px; text-align: left; }
 .database-rule-add:hover { background: #f0effc; }
 .database-rule-fields { padding-top: 8px; display: grid; grid-template-columns: minmax(0, 1fr) 104px; gap: 6px; }
@@ -1427,7 +1427,7 @@ html, body, #root { height: 100%; overflow: hidden; }
   box-shadow: none;
 }
 .database-search-popover small {
-  padding: 6px 4px 1px;
+  padding: 9px 4px 2px;
 }
 
 .database-rule-popover > header {
