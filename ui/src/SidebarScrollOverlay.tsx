@@ -4,12 +4,20 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 export function SidebarScrollOverlay({
   targetRef,
   compact = false,
+  edgeFades = false,
 }: {
   targetRef: { current: HTMLElement | null };
   compact?: boolean;
+  edgeFades?: boolean;
 }) {
   const railRef = useRef<HTMLDivElement>(null);
-  const [metrics, setMetrics] = useState({ canScroll: false, height: 0, top: 0 });
+  const [metrics, setMetrics] = useState({
+    canScroll: false,
+    height: 0,
+    top: 0,
+    atStart: true,
+    atEnd: true,
+  });
   const [isScrolling, setIsScrolling] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const visibilityTimerRef = useRef<number | null>(null);
@@ -36,12 +44,16 @@ export function SidebarScrollOverlay({
       const top = canScroll
         ? target.scrollTop / maxScroll * Math.max(railHeight - height, 0)
         : 0;
+      const atStart = !canScroll || target.scrollTop <= 1;
+      const atEnd = !canScroll || maxScroll - target.scrollTop <= 1;
       setMetrics((current) => (
         current.canScroll === canScroll
         && Math.abs(current.height - height) < .5
         && Math.abs(current.top - top) < .5
+        && current.atStart === atStart
+        && current.atEnd === atEnd
           ? current
-          : { canScroll, height, top }
+          : { canScroll, height, top, atStart, atEnd }
       ));
     };
     const scheduleRefresh = () => {
@@ -97,22 +109,36 @@ export function SidebarScrollOverlay({
   };
 
   return (
-    <div
-      ref={railRef}
-      className={`sidebar-scrollbar ${compact ? "is-compact" : ""} ${metrics.canScroll ? "has-overflow" : ""} ${isScrolling ? "is-scrolling" : ""} ${isDragging ? "is-dragging" : ""}`}
-      aria-hidden="true"
-    >
-      {metrics.canScroll && (
-        <div
-          className="sidebar-scrollbar-thumb"
-          style={{ height: metrics.height, transform: `translateY(${metrics.top}px)` }}
-          onPointerDown={beginDrag}
-          onPointerMove={drag}
-          onPointerUp={endDrag}
-          onPointerCancel={endDrag}
-          onLostPointerCapture={endDrag}
-        />
+    <>
+      {edgeFades && (
+        <>
+          <div
+            className={`sidebar-scroll-fade sidebar-scroll-fade-top ${metrics.canScroll && !metrics.atStart ? "is-visible" : ""}`}
+            aria-hidden="true"
+          />
+          <div
+            className={`sidebar-scroll-fade sidebar-scroll-fade-bottom ${metrics.canScroll && !metrics.atEnd ? "is-visible" : ""}`}
+            aria-hidden="true"
+          />
+        </>
       )}
-    </div>
+      <div
+        ref={railRef}
+        className={`sidebar-scrollbar ${compact ? "is-compact" : ""} ${metrics.canScroll ? "has-overflow" : ""} ${isScrolling ? "is-scrolling" : ""} ${isDragging ? "is-dragging" : ""}`}
+        aria-hidden="true"
+      >
+        {metrics.canScroll && (
+          <div
+            className="sidebar-scrollbar-thumb"
+            style={{ height: metrics.height, transform: `translateY(${metrics.top}px)` }}
+            onPointerDown={beginDrag}
+            onPointerMove={drag}
+            onPointerUp={endDrag}
+            onPointerCancel={endDrag}
+            onLostPointerCapture={endDrag}
+          />
+        )}
+      </div>
+    </>
   );
 }
