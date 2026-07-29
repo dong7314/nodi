@@ -17,6 +17,7 @@ import { InlineDatabase } from "./InlineDatabase";
 import { PageSettingsPanel, type PageSettings } from "./PageSettings";
 import { SidebarScrollOverlay } from "./SidebarScrollOverlay";
 import { TagPicker } from "./TagPicker";
+import { WorkspaceSearchDialog } from "./WorkspaceSearchDialog";
 import { DEFAULT_TAG_OPTIONS, toDateInput } from "./types";
 import { makeId } from "./types";
 import { DatePicker } from "./components/ui/date-picker";
@@ -71,11 +72,12 @@ import {
   ListChecks,
   ListOrdered,
   Lock,
-  Menu,
+  MessageCircle,
   Moon,
   MoreHorizontal,
   Palette,
   PanelLeftClose,
+  PanelLeftOpen,
   Pencil,
   Plus,
   Quote,
@@ -89,6 +91,7 @@ import {
   Sun,
   Trash2,
   Type,
+  UserPlus,
   X,
 } from "lucide-react";
 
@@ -99,9 +102,115 @@ const PAGE_ARCHIVED_STORAGE_KEY = "nodi:quick-note:archived";
 const PAGE_TRASH_STORAGE_KEY = "nodi:quick-note:trash";
 const PAGE_DRAWER_WIDTH_STORAGE_KEY = "nodi:page-drawer-width";
 const APP_THEME_STORAGE_KEY = "nodi:app-theme";
+const INBOX_READ_STORAGE_KEY = "nodi:inbox-read";
+const HOME_PAGE_TITLE_STORAGE_KEY = "nodi:home-title-v2";
+const USER_NAME_STORAGE_KEY = "nodi:user:name";
+const USER_PROFILE_STORAGE_KEYS = ["nodi:user:profile", "nodi:auth:user"];
+const DEFAULT_USER_NAME = "Lee";
+const USER_PROFILE_CHANGED_EVENT = "nodi:user-profile-changed";
 const APP_NOTICE_EVENT = "nodi:notice";
 
 type AppTheme = "light" | "dark";
+type InboxNotification = {
+  id: string;
+  kind: "share" | "comment" | "mention";
+  title: string;
+  description: string;
+  time: string;
+  unread: boolean;
+};
+
+const INITIAL_INBOX_NOTIFICATIONS: InboxNotification[] = [
+  {
+    id: "shared-project-notes",
+    kind: "share",
+    title: "민지님이 ‘프로젝트 회의록’을 공유했어요",
+    description: "공유 페이지에 편집 권한으로 초대했습니다.",
+    time: "방금 전",
+    unread: true,
+  },
+  {
+    id: "comment-next-schedule",
+    kind: "comment",
+    title: "서준님이 댓글을 남겼어요",
+    description: "“다음 일정은 금요일로 정리할까요?”",
+    time: "12분 전",
+    unread: true,
+  },
+  {
+    id: "mention-planning-draft",
+    kind: "mention",
+    title: "지우님이 회원님을 언급했어요",
+    description: "‘기획 초안’의 할 일 블록에서 언급했습니다.",
+    time: "1시간 전",
+    unread: true,
+  },
+];
+
+function getInitialInboxNotifications() {
+  try {
+    const readIds = new Set(JSON.parse(window.localStorage.getItem(INBOX_READ_STORAGE_KEY) ?? "[]") as string[]);
+    return INITIAL_INBOX_NOTIFICATIONS.map((notification) => ({
+      ...notification,
+      unread: !readIds.has(notification.id),
+    }));
+  } catch {
+    return INITIAL_INBOX_NOTIFICATIONS;
+  }
+}
+
+function getPrimaryShortcutLabel() {
+  if (typeof navigator === "undefined") return "Ctrl";
+  const platform = navigator.platform || navigator.userAgent;
+  return /Mac|iPhone|iPad|iPod/i.test(platform) ? "⌘" : "Ctrl";
+}
+
+function getStoredUserName() {
+  try {
+    const directName = window.localStorage.getItem(USER_NAME_STORAGE_KEY)?.trim();
+    if (directName) return directName;
+
+    for (const storageKey of USER_PROFILE_STORAGE_KEYS) {
+      const storedProfile = window.localStorage.getItem(storageKey);
+      if (!storedProfile) continue;
+      const profile = JSON.parse(storedProfile) as {
+        name?: unknown;
+        displayName?: unknown;
+        username?: unknown;
+      };
+      const profileName = [profile.name, profile.displayName, profile.username]
+        .find((value): value is string => typeof value === "string" && Boolean(value.trim()));
+      if (profileName) return profileName.trim();
+    }
+  } catch {
+    // A future authentication provider can replace the local profile source.
+  }
+  return DEFAULT_USER_NAME;
+}
+
+function getHomePageTitle(userName = getStoredUserName()) {
+  return `${userName}의 홈 공간입니다.`;
+}
+
+function formatHomePageUpdatedAt(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "최근 수정";
+  const today = new Date();
+  const isToday = date.getFullYear() === today.getFullYear()
+    && date.getMonth() === today.getMonth()
+    && date.getDate() === today.getDate();
+  if (isToday) return "오늘";
+  return new Intl.DateTimeFormat("ko-KR", { month: "short", day: "numeric" }).format(date);
+}
+
+function formatHomeMemoDate() {
+  return new Intl.DateTimeFormat("ko-KR", {
+    month: "long",
+    day: "numeric",
+    weekday: "short",
+  }).format(new Date());
+}
+
 type BlockSelectionActionMenu = {
   kind: "transform" | "color";
   x: number;
@@ -769,15 +878,26 @@ function getSavedPageSettings(): PageSettings {
 }
 
 function getInitialPages(): StoredPages {
+  const homePageTitle = getHomePageTitle();
   const storedPages = readStoredPages();
   if (storedPages?.[ROOT_PAGE_ID]) {
     let changed = false;
+    const previousGeneratedHomeTitle = window.localStorage.getItem(HOME_PAGE_TITLE_STORAGE_KEY);
+    const storedHomeTitle = storedPages[ROOT_PAGE_ID].title;
+    const shouldMigrateHomeTitle = previousGeneratedHomeTitle !== homePageTitle
+      && (
+        !storedHomeTitle
+        || storedHomeTitle === previousGeneratedHomeTitle
+        || storedHomeTitle === "내이름의 홈 공간입니다."
+        || storedHomeTitle === "나의 홈"
+      );
     const normalizedPages = Object.fromEntries(
       Object.values(storedPages)
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
         .map((page, index) => {
           const normalizedPage: StoredPage = {
             ...page,
+            title: page.id === ROOT_PAGE_ID && shouldMigrateHomeTitle ? homePageTitle : page.title,
             settings: { ...defaultPageSettings, ...page.settings },
             folderId: typeof page.folderId === "string" ? page.folderId : null,
             order: typeof page.order === "number" ? page.order : index,
@@ -788,11 +908,16 @@ function getInitialPages(): StoredPages {
             || page.order === undefined
             || page.favoritedAt === undefined
             || page.settings.publicAccess === undefined
+            || (page.id === ROOT_PAGE_ID && shouldMigrateHomeTitle)
           ) changed = true;
           return [page.id, normalizedPage];
         }),
     );
-    if (changed) persistStoredPages(normalizedPages);
+    if (changed) {
+      persistStoredPages(normalizedPages);
+      window.localStorage.setItem(TITLE_STORAGE_KEY, normalizedPages[ROOT_PAGE_ID].title);
+    }
+    window.localStorage.setItem(HOME_PAGE_TITLE_STORAGE_KEY, homePageTitle);
     return normalizedPages;
   }
 
@@ -802,7 +927,7 @@ function getInitialPages(): StoredPages {
     parentId: null,
     folderId: null,
     order: 0,
-    title: window.localStorage.getItem(TITLE_STORAGE_KEY) ?? "빠른 메모",
+    title: homePageTitle,
     settings: getSavedPageSettings(),
     blocks: getSavedBlocks(),
     archived: window.localStorage.getItem(PAGE_ARCHIVED_STORAGE_KEY) === "true",
@@ -812,6 +937,8 @@ function getInitialPages(): StoredPages {
   };
   const pages = { [ROOT_PAGE_ID]: rootPage };
   persistStoredPages(pages);
+  window.localStorage.setItem(TITLE_STORAGE_KEY, homePageTitle);
+  window.localStorage.setItem(HOME_PAGE_TITLE_STORAGE_KEY, homePageTitle);
   return pages;
 }
 
@@ -828,6 +955,7 @@ function App() {
   const [folders, setFolders] = useState<StoredFolders>(initialFolders);
   const [currentPageId, setCurrentPageId] = useState(ROOT_PAGE_ID);
   const [title, setTitle] = useState(rootPage.title);
+  const [userName, setUserName] = useState(getStoredUserName);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [appTheme, setAppTheme] = useState<AppTheme>(getInitialAppTheme);
   const [savedAt, setSavedAt] = useState("방금 저장됨");
@@ -846,6 +974,9 @@ function App() {
   const [sidebarPageDropTarget, setSidebarPageDropTarget] = useState<SidebarPageDropTarget | null>(null);
   const [sidebarDraggedFolderId, setSidebarDraggedFolderId] = useState<string | null>(null);
   const [sidebarFolderDropTarget, setSidebarFolderDropTarget] = useState<SidebarFolderDropTarget | null>(null);
+  const [workspaceSearchOpen, setWorkspaceSearchOpen] = useState(false);
+  const [inboxOpen, setInboxOpen] = useState(false);
+  const [inboxNotifications, setInboxNotifications] = useState(getInitialInboxNotifications);
   const [pendingBlockDeletion, setPendingBlockDeletion] = useState<string[] | null>(null);
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
   const [selectedBlockIds, setSelectedBlockIds] = useState<string[]>([]);
@@ -907,6 +1038,7 @@ function App() {
   } | null>(null);
   const suppressEditorClickRef = useRef(false);
   const isDarkMode = appTheme === "dark";
+  const primaryShortcutLabel = useMemo(getPrimaryShortcutLabel, []);
 
   useLayoutEffect(() => {
     document.documentElement.dataset.theme = appTheme;
@@ -917,6 +1049,10 @@ function App() {
       // The selected theme still applies for the current session.
     }
   }, [appTheme]);
+
+  useEffect(() => {
+    if (!sidebarOpen) setInboxOpen(false);
+  }, [sidebarOpen]);
 
   const commitPages = (nextPages: StoredPages) => {
     pagesRef.current = nextPages;
@@ -944,6 +1080,39 @@ function App() {
     }
   };
 
+  useEffect(() => {
+    const syncUserProfile = () => {
+      const nextUserName = getStoredUserName();
+      const nextHomeTitle = getHomePageTitle(nextUserName);
+      const previousGeneratedHomeTitle = window.localStorage.getItem(HOME_PAGE_TITLE_STORAGE_KEY);
+      const homePage = pagesRef.current[ROOT_PAGE_ID];
+
+      setUserName(nextUserName);
+      window.localStorage.setItem(HOME_PAGE_TITLE_STORAGE_KEY, nextHomeTitle);
+
+      if (
+        homePage
+        && homePage.title !== nextHomeTitle
+        && (
+          !homePage.title
+          || homePage.title === previousGeneratedHomeTitle
+          || homePage.title === "내이름의 홈 공간입니다."
+          || homePage.title === "나의 홈"
+        )
+      ) {
+        updatePage(ROOT_PAGE_ID, { title: nextHomeTitle });
+        if (currentPageIdRef.current === ROOT_PAGE_ID) setTitle(nextHomeTitle);
+      }
+    };
+
+    window.addEventListener("storage", syncUserProfile);
+    window.addEventListener(USER_PROFILE_CHANGED_EVENT, syncUserProfile);
+    return () => {
+      window.removeEventListener("storage", syncUserProfile);
+      window.removeEventListener(USER_PROFILE_CHANGED_EVENT, syncUserProfile);
+    };
+  }, []);
+
   const saveDocument = () => {
     updatePage(currentPageIdRef.current, {
       blocks: editor.document as unknown as PartialBlock[],
@@ -952,6 +1121,15 @@ function App() {
       archived: isArchived,
     });
     setSavedAt("방금 저장됨");
+  };
+
+  const openWorkspaceSearch = () => {
+    saveDocument();
+    setContextMenu(null);
+    setSidebarContextMenu(null);
+    setSidebarCreateMenuOpen(false);
+    setBlockSelectionActionMenu(null);
+    setWorkspaceSearchOpen(true);
   };
 
   useEffect(() => {
@@ -1079,15 +1257,31 @@ function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+      const hasPrimaryModifier = event.metaKey || event.ctrlKey;
+      if (hasPrimaryModifier && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        event.stopPropagation();
+        openWorkspaceSearch();
+        window.requestAnimationFrame(() => {
+          document.querySelector<HTMLInputElement>(".workspace-search-input")?.focus();
+        });
+        return;
+      }
+      if (hasPrimaryModifier && !event.shiftKey && !event.altKey && event.key === "\\") {
+        event.preventDefault();
+        event.stopPropagation();
+        setSidebarOpen((open) => !open);
+        return;
+      }
+      if (hasPrimaryModifier && event.key.toLowerCase() === "s") {
         event.preventDefault();
         saveDocument();
         setNotice("메모를 저장했어요");
       }
     };
 
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
   });
 
   useEffect(() => {
@@ -1138,6 +1332,35 @@ function App() {
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [sidebarContextMenu, sidebarCreateMenuOpen]);
+
+  useEffect(() => {
+    if (!inboxOpen) return;
+    const closeInbox = (event: PointerEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target?.closest(".sidebar-inbox-wrap")) return;
+      setInboxOpen(false);
+    };
+    const closeInboxOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setInboxOpen(false);
+    };
+    document.addEventListener("pointerdown", closeInbox, true);
+    window.addEventListener("keydown", closeInboxOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeInbox, true);
+      window.removeEventListener("keydown", closeInboxOnEscape);
+    };
+  }, [inboxOpen]);
+
+  useEffect(() => {
+    try {
+      const readIds = inboxNotifications
+        .filter((notification) => !notification.unread)
+        .map((notification) => notification.id);
+      window.localStorage.setItem(INBOX_READ_STORAGE_KEY, JSON.stringify(readIds));
+    } catch {
+      // Read state remains available for the current session.
+    }
+  }, [inboxNotifications]);
 
   const applyTemplate = (template: "daily" | "brainstorm") => {
     const blocks: PartialBlock[] =
@@ -2839,11 +3062,33 @@ function App() {
   };
 
   const currentPage = pages[currentPageId] ?? rootPage;
+  const isHomePage = currentPageId === ROOT_PAGE_ID;
   const isFavorite = Boolean(currentPage.favoritedAt);
+  const unreadInboxCount = inboxNotifications.filter((notification) => notification.unread).length;
   const favoritePages = Object.values(pages)
     .filter((page) => Boolean(page.favoritedAt))
     .sort((first, second) => (second.favoritedAt ?? "").localeCompare(first.favoritedAt ?? ""));
+  const homeRecentPages = Object.values(pages)
+    .filter((page) => page.id !== ROOT_PAGE_ID && !page.archived)
+    .sort((first, second) => second.updatedAt.localeCompare(first.updatedAt))
+    .slice(0, 4);
+  const homeFavoritePages = favoritePages
+    .filter((page) => page.id !== ROOT_PAGE_ID && !page.archived)
+    .slice(0, 4);
   const parentPage = currentPage.parentId ? pages[currentPage.parentId] : null;
+  const breadcrumbPages = (() => {
+    const pageChain: StoredPage[] = [];
+    const visitedPageIds = new Set<string>();
+    let page: StoredPage | undefined = currentPage;
+
+    while (page && !visitedPageIds.has(page.id)) {
+      visitedPageIds.add(page.id);
+      pageChain.unshift(page);
+      page = page.parentId ? pages[page.parentId] : undefined;
+    }
+
+    return pageChain;
+  })();
   const folderChildren = (parentId: string | null) => Object.values(folders)
     .filter((folder) => folder.parentId === parentId)
     .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
@@ -3041,28 +3286,122 @@ function App() {
 
   return (
     <div className="app-shell" data-theme={appTheme}>
-      <aside className={`sidebar ${sidebarOpen ? "is-open" : ""}`} aria-label="워크스페이스 메뉴">
+      <aside
+        className={`sidebar ${sidebarOpen ? "is-open" : ""}`}
+        aria-label="워크스페이스 메뉴"
+        aria-hidden={!sidebarOpen}
+        inert={sidebarOpen ? undefined : true}
+      >
         <div className="workspace-head">
           <button className="workspace-switcher" type="button">
             <span className="workspace-mark">N</span>
             <span className="workspace-name">나의 공간</span>
             <ChevronsUpDown size={14} />
           </button>
-          <button className="icon-button quiet" type="button" aria-label="사이드바 닫기" onClick={() => setSidebarOpen(false)}>
+          <button
+            className="icon-button quiet"
+            type="button"
+            aria-label="사이드바 닫기"
+            aria-expanded={sidebarOpen}
+            data-nodi-tooltip={`사이드바 닫기 (${primaryShortcutLabel} + \\)`}
+            onClick={() => setSidebarOpen(false)}
+          >
             <PanelLeftClose size={18} />
           </button>
         </div>
 
-        <button className="search-trigger" type="button" onClick={() => titleInputRef.current?.focus()}>
+        <button
+          className="search-trigger"
+          type="button"
+          aria-haspopup="dialog"
+          aria-expanded={workspaceSearchOpen}
+          onClick={openWorkspaceSearch}
+        >
           <Search size={16} />
           <span>검색</span>
-          <kbd>⌘ K</kbd>
+          <kbd>{primaryShortcutLabel} K</kbd>
         </button>
 
         <nav className="main-nav">
-          <NavItem icon={<Home size={17} />} label="홈" />
-          <NavItem icon={<Inbox size={17} />} label="받은 편지함" count="3" />
-          <NavItem icon={<LayoutGrid size={17} />} label="모든 페이지" />
+          <NavItem
+            icon={<Home size={17} />}
+            label="홈"
+            active={currentPageId === ROOT_PAGE_ID}
+            onClick={() => {
+              setInboxOpen(false);
+              openPage(ROOT_PAGE_ID);
+            }}
+          />
+          <div className="sidebar-inbox-wrap">
+            <NavItem
+              icon={<Inbox size={17} />}
+              label="받은 편지함"
+              count={unreadInboxCount > 0 ? String(unreadInboxCount) : undefined}
+              active={inboxOpen}
+              ariaHasPopup="dialog"
+              ariaExpanded={inboxOpen}
+              controls="sidebar-inbox-popover"
+              onClick={() => {
+                setSidebarContextMenu(null);
+                setSidebarCreateMenuOpen(false);
+                setInboxOpen((open) => !open);
+              }}
+            />
+            {inboxOpen && (
+              <section
+                id="sidebar-inbox-popover"
+                className="sidebar-inbox-popover"
+                role="dialog"
+                aria-label="받은 편지함 알림"
+              >
+                <header>
+                  <div>
+                    <strong>받은 편지함</strong>
+                    {unreadInboxCount > 0 && <span>{unreadInboxCount}개의 새 알림</span>}
+                  </div>
+                  {unreadInboxCount > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setInboxNotifications((notifications) => (
+                        notifications.map((notification) => ({ ...notification, unread: false }))
+                      ))}
+                    >
+                      모두 읽음
+                    </button>
+                  )}
+                </header>
+                <ul className="sidebar-inbox-list">
+                  {inboxNotifications.map((notification) => (
+                    <li key={notification.id}>
+                      <button
+                        className={`sidebar-inbox-notification ${notification.unread ? "is-unread" : ""}`}
+                        type="button"
+                        onClick={() => setInboxNotifications((notifications) => (
+                          notifications.map((candidate) => (
+                            candidate.id === notification.id ? { ...candidate, unread: false } : candidate
+                          ))
+                        ))}
+                      >
+                        <span className={`sidebar-inbox-icon is-${notification.kind}`}>
+                          {notification.kind === "share" && <UserPlus size={16} />}
+                          {notification.kind === "comment" && <MessageCircle size={16} />}
+                          {notification.kind === "mention" && <Bell size={16} />}
+                        </span>
+                        <span className="sidebar-inbox-copy">
+                          <strong>{notification.title}</strong>
+                          <span>{notification.description}</span>
+                          <small>{notification.time}</small>
+                        </span>
+                        {notification.unread && <i aria-label="읽지 않음" />}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <footer>공유, 댓글, 멘션 알림이 이곳에 모입니다.</footer>
+              </section>
+            )}
+          </div>
+          <NavItem icon={<LayoutGrid size={17} />} label="공유 페이지" />
         </nav>
 
         <div className="nav-section favorites-section">
@@ -3080,7 +3419,7 @@ function App() {
                   />
                 ))}
               </div>
-              <SidebarScrollOverlay targetRef={favoritesScrollRef} />
+              <SidebarScrollOverlay targetRef={favoritesScrollRef} edgeFades />
             </div>
           )}
         </div>
@@ -3131,7 +3470,7 @@ function App() {
                 </div>
               </>}
           </div>
-          <SidebarScrollOverlay targetRef={pagesScrollRef} />
+          <SidebarScrollOverlay targetRef={pagesScrollRef} edgeFades />
         </div>
 
         <div className="sidebar-footer">
@@ -3149,8 +3488,8 @@ function App() {
             <span className="theme-toggle-track" aria-hidden="true"><span /></span>
           </button>
           <div className="profile-row">
-            <div className="avatar">L</div>
-            <div><strong>Lee</strong><span>Free plan</span></div>
+            <div className="avatar">{userName.trim().charAt(0).toUpperCase() || "U"}</div>
+            <div><strong>{userName}</strong><span>Free plan</span></div>
             <MoreHorizontal size={17} />
           </div>
         </div>
@@ -3159,18 +3498,46 @@ function App() {
       <main className="main-area">
         <header className="topbar">
           <div className="topbar-left">
-            {!sidebarOpen && <button className="icon-button" type="button" aria-label="사이드바 열기" onClick={() => setSidebarOpen(true)}><Menu size={19} /></button>}
+            {!sidebarOpen && (
+              <button
+                className="icon-button sidebar-reopen-button"
+                type="button"
+                aria-label="사이드바 열기"
+                aria-expanded={sidebarOpen}
+                data-nodi-tooltip={`사이드바 열기 (${primaryShortcutLabel} + \\)`}
+                onClick={() => setSidebarOpen(true)}
+              >
+                <PanelLeftOpen size={19} />
+              </button>
+            )}
             {parentPage && (
               <button className="crumb-back" type="button" aria-label={`${parentPage.title} 페이지로 돌아가기`} onClick={() => openPage(parentPage.id)}>
                 <ChevronLeft size={17} />
               </button>
             )}
             <div className="crumb">
-              <span className="crumb-icon">{currentPage.settings.icon || "✦"}</span>
-              <span>{parentPage?.title || "개인"}</span>
-              <ChevronDown size={14} />
-              <span className="crumb-divider">/</span>
-              <span className="muted">{currentPage.title || "제목 없음"}</span>
+              {isHomePage ? (
+                <span className="crumb-root" aria-current="page">홈</span>
+              ) : (
+                <>
+                  <span className="crumb-root">개인 페이지</span>
+                  {breadcrumbPages.map((page, index) => {
+                    const isCurrentPage = index === breadcrumbPages.length - 1;
+                    return (
+                      <span className="crumb-segment" key={page.id}>
+                        <span className="crumb-divider" aria-hidden="true">/</span>
+                        {isCurrentPage ? (
+                          <span className="crumb-current" aria-current="page">{page.title || "제목 없음"}</span>
+                        ) : (
+                          <button className="crumb-page" type="button" onClick={() => openPage(page.id)}>
+                            {page.title || "제목 없음"}
+                          </button>
+                        )}
+                      </span>
+                    );
+                  })}
+                </>
+              )}
             </div>
           </div>
           <div className="topbar-actions">
@@ -3192,29 +3559,137 @@ function App() {
         </header>
 
         <div className="editor-scroll-area">
-        <section ref={editorStageRef} className={`editor-stage ${pageSettings.fullWidth ? "is-wide" : ""} ${pageSettings.smallText ? "uses-small-text" : ""}`} onPointerDownCapture={handleEditorStagePointerDown}>
+        <section ref={editorStageRef} className={`editor-stage ${isHomePage ? "is-home" : ""} ${pageSettings.fullWidth ? "is-wide" : ""} ${pageSettings.smallText ? "uses-small-text" : ""}`} onPointerDownCapture={handleEditorStagePointerDown}>
           {isArchived && <div className="archive-banner"><Archive size={15} /> 이 페이지는 보관됨 상태입니다.<button type="button" onClick={toggleArchive}>복원</button></div>}
           <div className={`cover cover--${pageSettings.cover}`} aria-hidden="true"><div className="cover-orb orb-one" /><div className="cover-orb orb-two" /><div className="cover-grid" /></div>
-          <article className={`note-page ${pageSettings.fullWidth ? "page-wide" : ""}`} onContextMenu={(event) => openContextMenu(event, "page")}>
-            <button className="page-emoji" type="button" aria-label="페이지 아이콘 설정" onClick={() => setPageSettingsOpen(true)}>{pageSettings.icon}</button>
-            <input
-              ref={titleInputRef}
-              className="title-input"
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              aria-label="페이지 제목"
-              placeholder="제목 없음"
-              disabled={pageSettings.lockPage}
-            />
-            {pageSettings.showProperties && <div className="page-properties" aria-label="페이지 속성">
-              <div className="property property-updated"><Clock3 size={14} /><span>수정</span><strong>지금</strong></div>
-              <div className="property property-status"><Hash size={14} /><span>상태</span><Select disabled={pageSettings.lockPage} value={pageSettings.status} onValueChange={(value) => setPageSettings({ ...pageSettings, status: value as PageSettings["status"] })} options={pageStatusOptions} ariaLabel="페이지 상태" className={`status-select ${pageSettings.status === "초안" ? "status-waiting" : pageSettings.status === "진행 중" ? "status-progress" : "status-done"}`} /></div>
-              <div className="property property-tags"><Hash size={14} /><span>태그</span><TagPicker value={pageSettings.tags} options={DEFAULT_TAG_OPTIONS} disabled={pageSettings.lockPage} compact onChange={(tags) => setPageSettings({ ...pageSettings, tags })} /></div>
-              <div className="property property-date"><Clock3 size={14} /><span>날짜</span><DatePicker compact disabled={pageSettings.lockPage} value={pageSettings.date} onChange={(date) => setPageSettings({ ...pageSettings, date })} ariaLabel="페이지 날짜" /></div>
-              <span className="page-property-separator" aria-hidden="true" />
-              <button className="add-property" type="button" onClick={() => setPageSettingsOpen(true)}><Plus size={14} /> 속성 설정</button>
-            </div>}
-            <div className="divider" />
+          <article className={`note-page ${isHomePage ? "home-note-page" : ""} ${pageSettings.fullWidth ? "page-wide" : ""}`} onContextMenu={(event) => openContextMenu(event, "page")}>
+            {isHomePage ? (
+              <div className="home-dashboard">
+                <section className="home-welcome-card" aria-labelledby="home-title">
+                  <div className="home-welcome-main">
+                    <span className="home-kicker"><Sparkles size={14} /> 나만의 홈</span>
+                    <input
+                      id="home-title"
+                      ref={titleInputRef}
+                      className="home-title-input"
+                      value={title}
+                      onChange={(event) => setTitle(event.target.value)}
+                      aria-label="홈 제목"
+                      disabled={pageSettings.lockPage}
+                    />
+                    <p>중요한 페이지를 한눈에 살펴보고, 오늘 필요한 생각을 바로 이어서 기록해보세요.</p>
+                    <div className="home-welcome-actions">
+                      <button type="button" className="is-primary" onClick={() => createChildPage("sidebar", null)}>
+                        <Plus size={15} /> 새 페이지
+                      </button>
+                      <button type="button" onClick={openWorkspaceSearch}>
+                        <Search size={15} /> 내 공간 검색
+                        <kbd>{primaryShortcutLabel} K</kbd>
+                      </button>
+                    </div>
+                  </div>
+                  <div className="home-summary" aria-label="홈 요약">
+                    <span><strong>{personalPageCount}</strong><small>전체 페이지</small></span>
+                    <i aria-hidden="true" />
+                    <span><strong>{homeFavoritePages.length}</strong><small>즐겨찾기</small></span>
+                  </div>
+                </section>
+
+                <div className="home-overview-grid">
+                  <section className="home-overview-panel" aria-labelledby="home-recent-title">
+                    <header>
+                      <span><Clock3 size={15} /></span>
+                      <div><strong id="home-recent-title">최근 페이지</strong><small>이어서 작성해보세요</small></div>
+                    </header>
+                    <div className="home-page-list">
+                      {homeRecentPages.length > 0 ? homeRecentPages.map((page) => (
+                        <button type="button" key={page.id} onClick={() => openPage(page.id)}>
+                          <span className="home-page-icon">{page.settings.icon || "✦"}</span>
+                          <span className="home-page-copy">
+                            <strong>{page.title || "제목 없음"}</strong>
+                            <small>{formatHomePageUpdatedAt(page.updatedAt)} 수정</small>
+                          </span>
+                          <ArrowUpRight size={14} />
+                        </button>
+                      )) : (
+                        <div className="home-empty-panel">
+                          <FileText size={18} />
+                          <span>아직 작성한 페이지가 없어요.</span>
+                          <button type="button" onClick={() => createChildPage("sidebar", null)}>첫 페이지 만들기</button>
+                        </div>
+                      )}
+                    </div>
+                  </section>
+
+                  <section className="home-overview-panel" aria-labelledby="home-favorite-title">
+                    <header>
+                      <span><Star size={15} /></span>
+                      <div><strong id="home-favorite-title">즐겨찾기</strong><small>중요한 페이지를 빠르게 열어요</small></div>
+                    </header>
+                    <div className="home-page-list">
+                      {homeFavoritePages.length > 0 ? homeFavoritePages.map((page) => (
+                        <button type="button" key={page.id} onClick={() => openPage(page.id)}>
+                          <span className="home-page-icon">{page.settings.icon || "✦"}</span>
+                          <span className="home-page-copy">
+                            <strong>{page.title || "제목 없음"}</strong>
+                            <small>{formatHomePageUpdatedAt(page.updatedAt)} 수정</small>
+                          </span>
+                          <ArrowUpRight size={14} />
+                        </button>
+                      )) : (
+                        <div className="home-empty-panel">
+                          <Star size={18} />
+                          <span>별표를 누른 페이지가 여기에 모여요.</span>
+                        </div>
+                      )}
+                    </div>
+                  </section>
+                </div>
+
+                <div className="home-note-heading">
+                  <span className="home-note-heading-icon"><FileText size={16} /></span>
+                  <div className="home-note-heading-copy">
+                    <strong>홈 메모</strong>
+                    <small>오늘 떠오른 생각을 편하게 기록해보세요.</small>
+                  </div>
+                  <div className="home-note-heading-actions">
+                    <span className="home-note-date"><Clock3 size={13} /> {formatHomeMemoDate()}</span>
+                    <button
+                      type="button"
+                      disabled={pageSettings.lockPage}
+                      onClick={() => {
+                        editorContextRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+                        window.requestAnimationFrame(() => editor.focus());
+                      }}
+                    >
+                      <Pencil size={13} /> 메모 시작
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <>
+                <button className="page-emoji" type="button" aria-label="페이지 아이콘 설정" onClick={() => setPageSettingsOpen(true)}>{pageSettings.icon}</button>
+                <input
+                  ref={titleInputRef}
+                  className="title-input"
+                  value={title}
+                  onChange={(event) => setTitle(event.target.value)}
+                  aria-label="페이지 제목"
+                  placeholder="제목 없음"
+                  disabled={pageSettings.lockPage}
+                />
+                {pageSettings.showProperties && <div className="page-properties" aria-label="페이지 속성">
+                  <div className="property property-updated"><Clock3 size={14} /><span>수정</span><strong>지금</strong></div>
+                  <div className="property property-status"><Hash size={14} /><span>상태</span><Select disabled={pageSettings.lockPage} value={pageSettings.status} onValueChange={(value) => setPageSettings({ ...pageSettings, status: value as PageSettings["status"] })} options={pageStatusOptions} ariaLabel="페이지 상태" className={`status-select ${pageSettings.status === "초안" ? "status-waiting" : pageSettings.status === "진행 중" ? "status-progress" : "status-done"}`} /></div>
+                  <div className="property property-tags"><Hash size={14} /><span>태그</span><TagPicker value={pageSettings.tags} options={DEFAULT_TAG_OPTIONS} disabled={pageSettings.lockPage} compact onChange={(tags) => setPageSettings({ ...pageSettings, tags })} /></div>
+                  <div className="property property-date"><Clock3 size={14} /><span>날짜</span><DatePicker compact disabled={pageSettings.lockPage} value={pageSettings.date} onChange={(date) => setPageSettings({ ...pageSettings, date })} ariaLabel="페이지 날짜" /></div>
+                  <span className="page-property-separator" aria-hidden="true" />
+                  <button className="add-property" type="button" onClick={() => setPageSettingsOpen(true)}><Plus size={14} /> 속성 설정</button>
+                </div>}
+              </>
+            )}
+            <div className={isHomePage ? "home-note-divider" : "divider"} />
             <div
               ref={editorContextRef}
               tabIndex={-1}
@@ -3391,7 +3866,13 @@ function App() {
               </BlockNoteView>
             </div>
 
-            <div className="editor-hint"><Command size={14} /> <span>빈 여백을 드래그해 여러 블록 선택 · <strong>Shift+↑↓</strong> 범위 확장 · <strong>⋮⋮</strong>로 함께 이동</span></div>
+            <div className="editor-hint">
+              <Command size={14} />
+              <span>
+                빈 여백을 드래그해 여러 블록 선택 • <strong>Shift+↑↓</strong> 범위 확장 •{" "}
+                <span className="editor-hint-grip" aria-label="드래그 핸들"><GripVertical size={13} /></span>로 함께 이동
+              </span>
+            </div>
           </article>
         </section>
         <EditorScrollOverlay targetRef={editorStageRef} />
@@ -3549,14 +4030,29 @@ function App() {
         </div>
       )}
 
-      <div className="template-dock">
-        <span className="dock-label">시작하기</span>
-        <button type="button" onClick={() => applyTemplate("daily")}><span>☀️</span> 데일리 노트</button>
-        <button type="button" onClick={() => applyTemplate("brainstorm")}><span>💡</span> 아이디어</button>
-        <button type="button" onClick={() => { editor.focus(); setNotice("새 블록을 작성해보세요"); }}><FileText size={15} /> 빈 페이지</button>
-      </div>
+      {!isHomePage && (
+        <div className="template-dock">
+          <span className="dock-label">시작하기</span>
+          <button type="button" onClick={() => applyTemplate("daily")}><span>☀️</span> 데일리 노트</button>
+          <button type="button" onClick={() => applyTemplate("brainstorm")}><span>💡</span> 아이디어</button>
+          <button type="button" onClick={() => { editor.focus(); setNotice("새 블록을 작성해보세요"); }}><FileText size={15} /> 빈 페이지</button>
+        </div>
+      )}
 
       <NodiTooltipLayer />
+      {workspaceSearchOpen && (
+        <WorkspaceSearchDialog
+          pages={pages}
+          folders={folders}
+          currentPageId={currentPageId}
+          primaryShortcutLabel={primaryShortcutLabel}
+          onClose={() => setWorkspaceSearchOpen(false)}
+          onOpenPage={(pageId) => {
+            setWorkspaceSearchOpen(false);
+            openPage(pageId);
+          }}
+        />
+      )}
       {notice && <div className="toast"><Bell size={16} />{notice}<button type="button" onClick={() => setNotice(null)} aria-label="알림 닫기"><X size={14} /></button></div>}
       {pageSettingsOpen && <PageSettingsPanel settings={pageSettings} onChange={setPageSettings} onClose={() => setPageSettingsOpen(false)} />}
       {pendingPageDeletion && pages[pendingPageDeletion] && (
@@ -3611,6 +4107,8 @@ function NodiTooltipLayer() {
     let previousDescribedBy: string | null = null;
     let showTimer: number | undefined;
     let hideTimer: number | undefined;
+    let suppressHoverAfterPointerDown = false;
+    let pointerDownPosition: { x: number; y: number } | null = null;
 
     const prepareElement = (element: Element) => {
       const nativeTitle = element.getAttribute("title")?.trim();
@@ -3700,11 +4198,21 @@ function NodiTooltipLayer() {
       }, delay);
     };
     const handleMouseOver = (event: MouseEvent) => {
+      if (suppressHoverAfterPointerDown) return;
       const target = resolveTrigger(event.target);
       if (!target || target === activeTarget) return;
       scheduleShow(target, 320);
     };
     const handleMouseMove = (event: MouseEvent) => {
+      if (suppressHoverAfterPointerDown && pointerDownPosition) {
+        const distance = Math.hypot(
+          event.clientX - pointerDownPosition.x,
+          event.clientY - pointerDownPosition.y,
+        );
+        if (distance <= 4) return;
+        suppressHoverAfterPointerDown = false;
+        pointerDownPosition = null;
+      }
       const target = resolveTrigger(event.target);
       if (target) {
         if (target !== activeTarget) scheduleShow(target, 320);
@@ -3719,6 +4227,7 @@ function NodiTooltipLayer() {
       scheduleHide();
     };
     const handleFocusIn = (event: FocusEvent) => {
+      if (suppressHoverAfterPointerDown) return;
       const target = resolveTrigger(event.target);
       if (target) scheduleShow(target, 80);
     };
@@ -3729,13 +4238,20 @@ function NodiTooltipLayer() {
       scheduleHide();
     };
     const handleKeyDown = (event: KeyboardEvent) => {
+      suppressHoverAfterPointerDown = false;
+      pointerDownPosition = null;
       if (event.key === "Escape") hideNow();
+    };
+    const handlePointerDown = (event: PointerEvent) => {
+      suppressHoverAfterPointerDown = true;
+      pointerDownPosition = { x: event.clientX, y: event.clientY };
+      hideNow();
     };
 
     document.addEventListener("mouseover", handleMouseOver, true);
     document.addEventListener("mousemove", handleMouseMove, true);
     document.addEventListener("mouseout", handleMouseOut, true);
-    document.addEventListener("pointerdown", hideNow, true);
+    document.addEventListener("pointerdown", handlePointerDown, true);
     document.addEventListener("focusin", handleFocusIn, true);
     document.addEventListener("focusout", handleFocusOut, true);
     document.addEventListener("keydown", handleKeyDown, true);
@@ -3750,7 +4266,7 @@ function NodiTooltipLayer() {
       document.removeEventListener("mouseover", handleMouseOver, true);
       document.removeEventListener("mousemove", handleMouseMove, true);
       document.removeEventListener("mouseout", handleMouseOut, true);
-      document.removeEventListener("pointerdown", hideNow, true);
+      document.removeEventListener("pointerdown", handlePointerDown, true);
       document.removeEventListener("focusin", handleFocusIn, true);
       document.removeEventListener("focusout", handleFocusOut, true);
       document.removeEventListener("keydown", handleKeyDown, true);
@@ -3888,6 +4404,9 @@ function NavItem({
   dragging = false,
   dropPlacement = null,
   pageId,
+  ariaHasPopup,
+  ariaExpanded,
+  controls,
   onClick,
   onContextMenu,
   onRename,
@@ -3907,6 +4426,9 @@ function NavItem({
   dragging?: boolean;
   dropPlacement?: "before" | "after" | null;
   pageId?: string;
+  ariaHasPopup?: "dialog" | "menu";
+  ariaExpanded?: boolean;
+  controls?: string;
   onClick?: () => void;
   onContextMenu?: (event: ReactMouseEvent<HTMLButtonElement>) => void;
   onRename?: (value: string) => void;
@@ -3921,6 +4443,9 @@ function NavItem({
       type="button"
       className={`nav-item ${active ? "active" : ""} ${nested ? "is-nested" : ""} ${editing ? "is-editing" : ""} ${draggable ? "is-page-draggable" : ""} ${dragging ? "is-dragging" : ""} ${dropPlacement ? `is-drop-${dropPlacement}` : ""}`}
       data-sidebar-page-id={pageId}
+      aria-haspopup={ariaHasPopup}
+      aria-expanded={ariaExpanded}
+      aria-controls={controls}
       onClick={() => {
         if (!editing) onClick?.();
       }}
@@ -3935,7 +4460,7 @@ function NavItem({
       {editing && onRename
         ? <InlineNavRename value={label} ariaLabel="페이지 이름" onSubmit={onRename} onCancel={() => onRename(label)} />
         : <span>{label}</span>}
-      {count && <em>{count}</em>}
+      {count && <em className="nav-count-badge">{count}</em>}
     </button>
   );
 }
