@@ -980,6 +980,7 @@ function App() {
   const [pendingBlockDeletion, setPendingBlockDeletion] = useState<string[] | null>(null);
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
   const [selectedBlockIds, setSelectedBlockIds] = useState<string[]>([]);
+  const selectedBlockIdsRef = useRef<string[]>([]);
   const [isBlockSelectionMode, setIsBlockSelectionMode] = useState(false);
   const [blockSelectionActionMenu, setBlockSelectionActionMenu] = useState<BlockSelectionActionMenu | null>(null);
   const [isBlockDragging, setIsBlockDragging] = useState(false);
@@ -1022,12 +1023,16 @@ function App() {
     pointerId: number;
     startX: number;
     startY: number;
+    startContentY: number;
+    lastClientX: number;
+    lastClientY: number;
     dragging: boolean;
     clickedBlockId: string | null;
     initialBlockIds: string[];
     additiveSelection: boolean;
     preserveClick: boolean;
   } | null>(null);
+  const refreshMarqueeSelectionRef = useRef<(() => void) | null>(null);
   const blockDragRef = useRef<{
     pointerId: number;
     blockIds: string[];
@@ -2199,7 +2204,13 @@ function App() {
     const uniqueIds = [...new Set(blockIds)];
     blockSelectionModeRef.current = uniqueIds.length > 0;
     setIsBlockSelectionMode(uniqueIds.length > 0);
-    setSelectedBlockIds(uniqueIds);
+    const previousIds = selectedBlockIdsRef.current;
+    const selectionChanged = previousIds.length !== uniqueIds.length
+      || previousIds.some((blockId, index) => blockId !== uniqueIds[index]);
+    if (selectionChanged) {
+      selectedBlockIdsRef.current = uniqueIds;
+      setSelectedBlockIds(uniqueIds);
+    }
     if (anchorId) blockSelectionAnchorRef.current = anchorId;
   };
 
@@ -2207,7 +2218,10 @@ function App() {
     blockSelectionModeRef.current = false;
     blockSelectionAnchorRef.current = null;
     setIsBlockSelectionMode(false);
-    setSelectedBlockIds([]);
+    if (selectedBlockIdsRef.current.length > 0) {
+      selectedBlockIdsRef.current = [];
+      setSelectedBlockIds([]);
+    }
     setBlockSelectionActionMenu(null);
   };
 
@@ -2292,10 +2306,17 @@ function App() {
   ) => {
     const isAdditiveSelection = event.metaKey || event.ctrlKey;
     const initialBlockIds = isAdditiveSelection ? getLiveSelectedBlockIds() : [];
+    const scrollArea = editorStageRef.current;
+    const scrollRect = scrollArea?.getBoundingClientRect();
     marqueeSelectionRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
+      startContentY: scrollArea && scrollRect
+        ? event.clientY - scrollRect.top + scrollArea.scrollTop
+        : event.clientY,
+      lastClientX: event.clientX,
+      lastClientY: event.clientY,
       dragging: false,
       clickedBlockId,
       initialBlockIds,
@@ -2312,10 +2333,99 @@ function App() {
     }
   };
 
+  const applyMarqueeSelection = (
+    marqueeState: NonNullable<typeof marqueeSelectionRef.current>,
+    clientX: number,
+    clientY: number,
+  ) => {
+    marqueeState.lastClientX = clientX;
+    marqueeState.lastClientY = clientY;
+
+    const scrollArea = editorStageRef.current;
+    const scrollRect = scrollArea?.getBoundingClientRect();
+    const anchoredStartY = scrollArea && scrollRect
+      ? scrollRect.top + marqueeState.startContentY - scrollArea.scrollTop
+      : marqueeState.startY;
+    const left = Math.min(marqueeState.startX, clientX);
+    const top = Math.min(anchoredStartY, clientY);
+    const right = Math.max(marqueeState.startX, clientX);
+    const bottom = Math.max(anchoredStartY, clientY);
+    const marquee = {
+      left,
+      top,
+      width: right - left,
+      height: bottom - top,
+    };
+    setBlockSelectionMarquee((current) => (
+      current
+      && current.left === marquee.left
+      && current.top === marquee.top
+      && current.width === marquee.width
+      && current.height === marquee.height
+        ? current
+        : marquee
+    ));
+
+    const root = editorContextRef.current;
+    if (!root) return;
+    const hitIds = [...root.querySelectorAll<HTMLElement>("[data-node-type='blockContainer']")]
+      .filter((element) => {
+        const content = element.querySelector<HTMLElement>(":scope > .bn-block-content")
+          ?? element.querySelector<HTMLElement>(".bn-block-content");
+        if (!content) return false;
+        const rect = content.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        return left <= rect.right
+          && right >= rect.left
+          && top <= rect.bottom
+          && bottom >= rect.top;
+      })
+      .map((element) => element.dataset.id)
+      .filter((blockId): blockId is string => Boolean(blockId));
+    const nextSelection = [...new Set([...marqueeState.initialBlockIds, ...hitIds])];
+    const orderedIds = getOrderedBlockIds();
+    nextSelection.sort((first, second) => orderedIds.indexOf(first) - orderedIds.indexOf(second));
+    if (nextSelection.length > 0) {
+      setBlockSelectionState(nextSelection, nextSelection[0]);
+      setFocusedBlockId(nextSelection.at(-1) ?? nextSelection[0]);
+    } else {
+      clearBlockSelection();
+    }
+  };
+
+  refreshMarqueeSelectionRef.current = () => {
+    const marqueeState = marqueeSelectionRef.current;
+    if (!marqueeState?.dragging) return;
+    applyMarqueeSelection(
+      marqueeState,
+      marqueeState.lastClientX,
+      marqueeState.lastClientY,
+    );
+  };
+
+  useEffect(() => {
+    const scrollArea = editorStageRef.current;
+    if (!scrollArea) return;
+    let frame = 0;
+    const handleScroll = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        refreshMarqueeSelectionRef.current?.();
+      });
+    };
+    scrollArea.addEventListener("scroll", handleScroll, { passive: true });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      scrollArea.removeEventListener("scroll", handleScroll);
+    };
+  }, []);
+
   const updateMarqueeSelection = (
     event: ReactPointerEvent<HTMLDivElement>,
     marqueeState: NonNullable<typeof marqueeSelectionRef.current>,
   ) => {
+    marqueeState.lastClientX = event.clientX;
+    marqueeState.lastClientY = event.clientY;
     const deltaX = event.clientX - marqueeState.startX;
     const deltaY = event.clientY - marqueeState.startY;
     const dragDistance = Math.hypot(deltaX, deltaY);
@@ -2353,43 +2463,7 @@ function App() {
       }
     }
 
-    const left = Math.min(marqueeState.startX, event.clientX);
-    const top = Math.min(marqueeState.startY, event.clientY);
-    const right = Math.max(marqueeState.startX, event.clientX);
-    const bottom = Math.max(marqueeState.startY, event.clientY);
-    const marquee = {
-      left,
-      top,
-      width: right - left,
-      height: bottom - top,
-    };
-    setBlockSelectionMarquee(marquee);
-
-    const root = editorContextRef.current;
-    if (!root) return;
-    const hitIds = [...root.querySelectorAll<HTMLElement>("[data-node-type='blockContainer']")]
-      .filter((element) => {
-        const content = element.querySelector<HTMLElement>(":scope > .bn-block-content")
-          ?? element.querySelector<HTMLElement>(".bn-block-content");
-        if (!content) return false;
-        const rect = content.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return false;
-        return left <= rect.right
-          && right >= rect.left
-          && top <= rect.bottom
-          && bottom >= rect.top;
-      })
-      .map((element) => element.dataset.id)
-      .filter((blockId): blockId is string => Boolean(blockId));
-    const nextSelection = [...new Set([...marqueeState.initialBlockIds, ...hitIds])];
-    const orderedIds = getOrderedBlockIds();
-    nextSelection.sort((first, second) => orderedIds.indexOf(first) - orderedIds.indexOf(second));
-    if (nextSelection.length > 0) {
-      setBlockSelectionState(nextSelection, nextSelection[0]);
-      setFocusedBlockId(nextSelection.at(-1) ?? nextSelection[0]);
-    } else {
-      clearBlockSelection();
-    }
+    applyMarqueeSelection(marqueeState, event.clientX, event.clientY);
   };
 
   const finishMarqueeSelection = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -2613,6 +2687,8 @@ function App() {
       event.stopPropagation();
       return;
     }
+    const target = event.target as HTMLElement;
+    if (target.closest(".block-selection-toolbar")) return;
     const blockId = getEventBlockId(event.target, event.clientX, event.clientY);
     if (!blockId) return;
     const isToggleBlockClick = event.shiftKey && (event.metaKey || event.altKey);
@@ -2662,6 +2738,7 @@ function App() {
         setBlockSelectionState(ids, blockSelectionAnchorRef.current ?? ids[0]);
       }
     } else {
+      selectedBlockIdsRef.current = [];
       setSelectedBlockIds([]);
       setIsBlockSelectionMode(false);
     }
