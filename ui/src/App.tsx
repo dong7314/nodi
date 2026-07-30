@@ -14,7 +14,9 @@ import { BlockNoteView } from "@blocknote/mantine";
 import { createReactBlockSpec, getDefaultReactSlashMenuItems, SuggestionMenuController, useCreateBlockNote, type DefaultReactSuggestionItem } from "@blocknote/react";
 import { createHighlighter } from "shiki";
 import { InlineDatabase } from "./InlineDatabase";
+import { PageSharePanel } from "./PageSharePanel";
 import { PageSettingsPanel, type PageSettings } from "./PageSettings";
+import { SharedPagesView } from "./SharedPagesView";
 import { SidebarScrollOverlay } from "./SidebarScrollOverlay";
 import { TagPicker } from "./TagPicker";
 import { WorkspaceSearchDialog } from "./WorkspaceSearchDialog";
@@ -37,6 +39,14 @@ import {
   type StoredPage,
   type StoredPages,
 } from "./page-store";
+import {
+  REGISTERED_NODI_USERS,
+  getCurrentNodiUser,
+  persistStoredPageShares,
+  readStoredPageShares,
+  type SharePermission,
+  type StoredPageShares,
+} from "./sharing-store";
 import "@blocknote/mantine/style.css";
 import {
   Archive,
@@ -58,7 +68,6 @@ import {
   Database,
   FileText,
   FolderPlus,
-  Globe2,
   GripVertical,
   Hash,
   Heading1,
@@ -71,7 +80,6 @@ import {
   List,
   ListChecks,
   ListOrdered,
-  Lock,
   MessageCircle,
   Moon,
   MoreHorizontal,
@@ -92,6 +100,7 @@ import {
   Trash2,
   Type,
   UserPlus,
+  Users,
   X,
 } from "lucide-react";
 
@@ -111,6 +120,7 @@ const USER_PROFILE_CHANGED_EVENT = "nodi:user-profile-changed";
 const APP_NOTICE_EVENT = "nodi:notice";
 
 type AppTheme = "light" | "dark";
+type WorkspaceSection = "pages" | "shared";
 type InboxNotification = {
   id: string;
   kind: "share" | "comment" | "mention";
@@ -950,6 +960,7 @@ function getInitialPages(): StoredPages {
 function App() {
   const initialPages = useMemo(getInitialPages, []);
   const initialFolders = useMemo(readStoredFolders, []);
+  const initialPageShares = useMemo(readStoredPageShares, []);
   const rootPage = initialPages[ROOT_PAGE_ID];
   const editor = useCreateBlockNote({
     schema: editorSchema,
@@ -961,6 +972,8 @@ function App() {
   const [currentPageId, setCurrentPageId] = useState(ROOT_PAGE_ID);
   const [title, setTitle] = useState(rootPage.title);
   const [userName, setUserName] = useState(getStoredUserName);
+  const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection>("pages");
+  const [pageShares, setPageShares] = useState<StoredPageShares>(initialPageShares);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [appTheme, setAppTheme] = useState<AppTheme>(getInitialAppTheme);
   const [savedAt, setSavedAt] = useState("방금 저장됨");
@@ -1076,6 +1089,14 @@ function App() {
     persistStoredFolders(nextFolders);
   };
 
+  const commitPageShares = (updater: (current: StoredPageShares) => StoredPageShares) => {
+    setPageShares((current) => {
+      const nextPageShares = updater(current);
+      persistStoredPageShares(nextPageShares);
+      return nextPageShares;
+    });
+  };
+
   const updatePage = (pageId: string, patch: Partial<StoredPage>) => {
     const page = pagesRef.current[pageId];
     if (!page) return;
@@ -1158,7 +1179,13 @@ function App() {
   }, [isArchived, currentPageId]);
 
   const openPage = (pageId: string) => {
-    if (pageId === currentPageIdRef.current) return;
+    if (pageId === currentPageIdRef.current) {
+      setWorkspaceSection("pages");
+      setInboxOpen(false);
+      setRightPanel(null);
+      editorStageRef.current?.scrollTo({ top: 0 });
+      return;
+    }
 
     updatePage(currentPageIdRef.current, {
       blocks: editor.document as unknown as PartialBlock[],
@@ -1175,6 +1202,7 @@ function App() {
 
     loadingPageRef.current = true;
     currentPageIdRef.current = pageId;
+    setWorkspaceSection("pages");
     setCurrentPageId(pageId);
     setTitle(targetPage.title);
     setPageSettings(targetPage.settings);
@@ -1192,6 +1220,81 @@ function App() {
       loadingPageRef.current = false;
       titleInputRef.current?.focus();
     });
+  };
+
+  const openSharedPages = () => {
+    saveDocument();
+    setWorkspaceSection("shared");
+    setInboxOpen(false);
+    setPageSettingsOpen(false);
+    setDrawerPageId(null);
+    setRightPanel(null);
+    setContextMenu(null);
+    setSidebarContextMenu(null);
+    editorStageRef.current?.scrollTo({ top: 0 });
+  };
+
+  const sharePageWithMember = (pageId: string, userId: string, permission: SharePermission) => {
+    const targetUser = REGISTERED_NODI_USERS.find((user) => user.id === userId);
+    const targetPage = pagesRef.current[pageId];
+    if (!targetUser || !targetPage) return;
+    const owner = getCurrentNodiUser(userName);
+    const now = new Date().toISOString();
+    commitPageShares((current) => {
+      const previous = current[pageId];
+      const members = previous?.members.some((member) => member.userId === userId)
+        ? previous.members.map((member) => member.userId === userId ? { ...member, permission } : member)
+        : [...(previous?.members ?? []), { userId, permission, sharedAt: now }];
+      return {
+        ...current,
+        [pageId]: {
+          pageId,
+          ownerId: owner.id,
+          ownerName: owner.name,
+          members,
+          updatedAt: now,
+        },
+      };
+    });
+    setNotice(`${targetUser.name}님에게 “${targetPage.title || "제목 없음"}” 페이지를 공유했어요`);
+  };
+
+  const updatePageSharePermission = (pageId: string, userId: string, permission: SharePermission) => {
+    commitPageShares((current) => {
+      const record = current[pageId];
+      if (!record) return current;
+      return {
+        ...current,
+        [pageId]: {
+          ...record,
+          members: record.members.map((member) => member.userId === userId ? { ...member, permission } : member),
+          updatedAt: new Date().toISOString(),
+        },
+      };
+    });
+  };
+
+  const removePageShareMember = (pageId: string, userId: string) => {
+    const targetUser = REGISTERED_NODI_USERS.find((user) => user.id === userId);
+    commitPageShares((current) => {
+      const record = current[pageId];
+      if (!record) return current;
+      const members = record.members.filter((member) => member.userId !== userId);
+      if (members.length === 0) {
+        const nextPageShares = { ...current };
+        delete nextPageShares[pageId];
+        return nextPageShares;
+      }
+      return {
+        ...current,
+        [pageId]: {
+          ...record,
+          members,
+          updatedAt: new Date().toISOString(),
+        },
+      };
+    });
+    if (targetUser) setNotice(`${targetUser.name}님의 페이지 접근 권한을 제거했어요`);
   };
 
   const createChildPage = (source: "slash" | "sidebar" = "slash", requestedFolderId?: string | null) => {
@@ -2162,6 +2265,11 @@ function App() {
     const currentPageWasDeleted = pageIdsToDelete.has(currentPageIdRef.current);
     const fallbackPageId = page.parentId && nextPages[page.parentId] ? page.parentId : ROOT_PAGE_ID;
     commitPages(nextPages);
+    commitPageShares((current) => {
+      const nextPageShares = { ...current };
+      pageIdsToDelete.forEach((deletedPageId) => delete nextPageShares[deletedPageId]);
+      return nextPageShares;
+    });
     if (drawerPageId && pageIdsToDelete.has(drawerPageId)) setDrawerPageId(null);
     setPendingPageDeletion(null);
     setSidebarContextMenu(null);
@@ -3144,9 +3252,16 @@ function App() {
   };
 
   const currentPage = pages[currentPageId] ?? rootPage;
+  const currentNodiUser = getCurrentNodiUser(userName);
   const isHomePage = currentPageId === ROOT_PAGE_ID;
   const isFavorite = Boolean(currentPage.favoritedAt);
   const unreadInboxCount = inboxNotifications.filter((notification) => notification.unread).length;
+  const sharedPageCount = Object.values(pageShares).filter((record) => (
+    record.ownerId === currentNodiUser.id
+    && record.members.length > 0
+    && Boolean(pages[record.pageId])
+    && !pages[record.pageId]?.archived
+  )).length;
   const favoritePages = Object.values(pages)
     .filter((page) => Boolean(page.favoritedAt))
     .sort((first, second) => (second.favoritedAt ?? "").localeCompare(first.favoritedAt ?? ""));
@@ -3275,7 +3390,7 @@ function App() {
         key={page.id}
         icon={<span className="nav-emoji">{page.settings.icon || "📄"}</span>}
         label={page.title || "제목 없음"}
-        active={currentPageId === page.id}
+        active={workspaceSection === "pages" && currentPageId === page.id}
         nested={nested}
         editing={sidebarRename?.kind === "page" && sidebarRename.id === page.id}
         draggable
@@ -3408,7 +3523,7 @@ function App() {
           <NavItem
             icon={<Home size={17} />}
             label="홈"
-            active={currentPageId === ROOT_PAGE_ID}
+            active={workspaceSection === "pages" && currentPageId === ROOT_PAGE_ID}
             onClick={() => {
               setInboxOpen(false);
               openPage(ROOT_PAGE_ID);
@@ -3483,7 +3598,13 @@ function App() {
               </section>
             )}
           </div>
-          <NavItem icon={<LayoutGrid size={17} />} label="공유 페이지" />
+          <NavItem
+            icon={<LayoutGrid size={17} />}
+            label="공유 페이지"
+            count={sharedPageCount > 0 ? String(sharedPageCount) : undefined}
+            active={workspaceSection === "shared"}
+            onClick={openSharedPages}
+          />
         </nav>
 
         <div className="nav-section favorites-section">
@@ -3496,7 +3617,7 @@ function App() {
                     key={page.id}
                     icon={<span className="nav-emoji">{page.settings.icon || "📄"}</span>}
                     label={page.title || "제목 없음"}
-                    active={currentPageId === page.id}
+                    active={workspaceSection === "pages" && currentPageId === page.id}
                     onClick={() => openPage(page.id)}
                   />
                 ))}
@@ -3598,7 +3719,9 @@ function App() {
               </button>
             )}
             <div className="crumb">
-              {isHomePage ? (
+              {workspaceSection === "shared" ? (
+                <span className="crumb-root" aria-current="page">공유 페이지</span>
+              ) : isHomePage ? (
                 <span className="crumb-root" aria-current="page">홈</span>
               ) : (
                 <>
@@ -3623,24 +3746,44 @@ function App() {
             </div>
           </div>
           <div className="topbar-actions">
-            <span className="save-state"><Cloud size={15} /> {savedAt}</span>
-            <button
-              className={`icon-button ${isFavorite ? "is-favorite" : ""}`}
-              type="button"
-              aria-label={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
-              aria-pressed={isFavorite}
-              data-nodi-tooltip={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
-              onClick={toggleFavorite}
-            >
-              <Star size={18} fill={isFavorite ? "currentColor" : "none"} />
-            </button>
-            <button className="icon-button" type="button" aria-label="공유" onClick={() => setRightPanel("share")}><Share2 size={18} /></button>
-            <button className="page-settings-trigger" type="button" aria-label="페이지 설정" onClick={() => setPageSettingsOpen(true)}><Settings2 size={16} /> 설정</button>
-            <button className="more-button" type="button" aria-label="더 보기" onClick={exportJson}><Download size={16} /> 내보내기</button>
+            {workspaceSection === "shared" ? (
+              <span className="shared-topbar-status"><Users size={15} /> Nodi 회원 공유 관리</span>
+            ) : (
+              <>
+                <span className="save-state"><Cloud size={15} /> {savedAt}</span>
+                <button
+                  className={`icon-button ${isFavorite ? "is-favorite" : ""}`}
+                  type="button"
+                  aria-label={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
+                  aria-pressed={isFavorite}
+                  data-nodi-tooltip={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
+                  onClick={toggleFavorite}
+                >
+                  <Star size={18} fill={isFavorite ? "currentColor" : "none"} />
+                </button>
+                <button className="icon-button" type="button" aria-label="공유" onClick={() => setRightPanel("share")}><Share2 size={18} /></button>
+                <button className="page-settings-trigger" type="button" aria-label="페이지 설정" onClick={() => setPageSettingsOpen(true)}><Settings2 size={16} /> 설정</button>
+                <button className="more-button" type="button" aria-label="더 보기" onClick={exportJson}><Download size={16} /> 내보내기</button>
+              </>
+            )}
           </div>
         </header>
 
         <div className="editor-scroll-area">
+        {workspaceSection === "shared" ? (
+          <SharedPagesView
+            pages={pages}
+            pageShares={pageShares}
+            registeredUsers={REGISTERED_NODI_USERS}
+            currentUser={currentNodiUser}
+            onOpenPage={openPage}
+            onManageShare={(pageId) => {
+              openPage(pageId);
+              setRightPanel("share");
+            }}
+          />
+        ) : (
+        <>
         <section ref={editorStageRef} className={`editor-stage ${isHomePage ? "is-home" : ""} ${pageSettings.fullWidth ? "is-wide" : ""} ${pageSettings.smallText ? "uses-small-text" : ""}`} onPointerDownCapture={handleEditorStagePointerDown}>
           {isArchived && <div className="archive-banner"><Archive size={15} /> 이 페이지는 보관됨 상태입니다.<button type="button" onClick={toggleArchive}>복원</button></div>}
           <div className={`cover cover--${pageSettings.cover}`} aria-hidden="true"><div className="cover-orb orb-one" /><div className="cover-orb orb-two" /><div className="cover-grid" /></div>
@@ -3958,11 +4101,35 @@ function App() {
           </article>
         </section>
         <EditorScrollOverlay targetRef={editorStageRef} />
+        </>
+        )}
         </div>
 
       </main>
 
-      {rightPanel && <QuickActionPanel type={rightPanel} pageLink={window.location.href} isPublic={pageSettings.publicAccess} onPublicChange={(publicAccess) => setPageSettings({ ...pageSettings, publicAccess })} onClose={() => setRightPanel(null)} onCopy={copyPageLink} onDraft={addDraft} />}
+      {rightPanel === "share" ? (
+        <PageSharePanel
+          pageTitle={title}
+          pageLink={window.location.href}
+          isPublic={pageSettings.publicAccess}
+          members={pageShares[currentPageId]?.members ?? []}
+          registeredUsers={REGISTERED_NODI_USERS}
+          onPublicChange={(publicAccess) => setPageSettings({ ...pageSettings, publicAccess })}
+          onShare={(userId, permission) => sharePageWithMember(currentPageId, userId, permission)}
+          onPermissionChange={(userId, permission) => updatePageSharePermission(currentPageId, userId, permission)}
+          onRemoveMember={(userId) => removePageShareMember(currentPageId, userId)}
+          onClose={() => setRightPanel(null)}
+          onCopy={copyPageLink}
+        />
+      ) : rightPanel ? (
+        <QuickActionPanel
+          type={rightPanel}
+          pageLink={window.location.href}
+          onClose={() => setRightPanel(null)}
+          onCopy={copyPageLink}
+          onDraft={addDraft}
+        />
+      ) : null}
       {sidebarContextMenu && (
         <SidebarItemContextMenu
           menu={sidebarContextMenu}
@@ -4112,7 +4279,7 @@ function App() {
         </div>
       )}
 
-      {!isHomePage && (
+      {workspaceSection === "pages" && !isHomePage && (
         <div className="template-dock">
           <span className="dock-label">시작하기</span>
           <button type="button" onClick={() => applyTemplate("daily")}><span>☀️</span> 데일리 노트</button>
@@ -4946,9 +5113,40 @@ function PagePreviewDrawer({
   );
 }
 
-function QuickActionPanel({ type, pageLink, isPublic, onPublicChange, onClose, onCopy, onDraft }: { type: "draft" | "link" | "share"; pageLink: string; isPublic: boolean; onPublicChange: (isPublic: boolean) => void; onClose: () => void; onCopy: () => void; onDraft: (kind: "plan" | "meeting") => void }) {
-  const copyLabel = type === "share" ? "공유 링크 복사" : "페이지 링크 복사";
-  return <aside className="quick-action-panel" aria-label={type === "draft" ? "초안 도구" : type === "link" ? "링크 도구" : "공유 도구"}><header><span>{type === "draft" ? <><Sparkles size={17} /> 초안 도구</> : type === "link" ? <><Link size={17} /> 페이지 링크</> : <><Share2 size={17} /> 공유</>}</span><button type="button" aria-label="패널 닫기" onClick={onClose}><X size={17} /></button></header>{type === "draft" ? <div className="quick-panel-body"><p>API 연결 전에도 바로 쓸 수 있는 구조 초안을 추가합니다.</p><button type="button" onClick={() => onDraft("plan")}><Sparkles size={15} /><span><strong>실행 계획</strong><small>다음 행동 체크리스트 추가</small></span></button><button type="button" onClick={() => onDraft("meeting")}><FileText size={15} /><span><strong>회의록</strong><small>요약과 결정 사항 추가</small></span></button></div> : <div className="quick-panel-body">{type === "share" && <div className={`share-access-card ${isPublic ? "is-public" : ""}`}><span className="share-access-icon">{isPublic ? <Globe2 size={17} /> : <Lock size={17} />}</span><span className="share-access-copy"><strong>{isPublic ? "웹에 공개됨" : "비공개 페이지"}</strong><small>{isPublic ? "링크가 있는 모든 사람이 볼 수 있음" : "나만 볼 수 있음"}</small></span><button className="share-access-switch" type="button" role="switch" aria-label="페이지 공개 전환" aria-checked={isPublic} onClick={() => onPublicChange(!isPublic)}><span /></button></div>}<p>{type === "share" ? isPublic ? "아래 링크를 복사해 다른 사람에게 전달할 수 있어요." : "공개 스위치를 켜야 공유 링크를 사용할 수 있어요." : "현재 페이지 주소입니다."}</p><div className="quick-link"><span>{pageLink}</span></div><button className="copy-action" type="button" disabled={type === "share" && !isPublic} onClick={onCopy}><Copy size={15} /> {copyLabel}</button>{type === "share" && <small className="share-note">공개 상태는 저장됩니다. 실제 외부 접속은 인증·공개 API 서버를 연결한 뒤 활성화됩니다.</small>}</div>}</aside>;
+function QuickActionPanel({
+  type,
+  pageLink,
+  onClose,
+  onCopy,
+  onDraft,
+}: {
+  type: "draft" | "link";
+  pageLink: string;
+  onClose: () => void;
+  onCopy: () => void;
+  onDraft: (kind: "plan" | "meeting") => void;
+}) {
+  return (
+    <aside className="quick-action-panel" aria-label={type === "draft" ? "초안 도구" : "링크 도구"}>
+      <header>
+        <span>{type === "draft" ? <><Sparkles size={17} /> 초안 도구</> : <><Link size={17} /> 페이지 링크</>}</span>
+        <button type="button" aria-label="패널 닫기" onClick={onClose}><X size={17} /></button>
+      </header>
+      {type === "draft" ? (
+        <div className="quick-panel-body">
+          <p>API 연결 전에도 바로 쓸 수 있는 구조 초안을 추가합니다.</p>
+          <button type="button" onClick={() => onDraft("plan")}><Sparkles size={15} /><span><strong>실행 계획</strong><small>다음 행동 체크리스트 추가</small></span></button>
+          <button type="button" onClick={() => onDraft("meeting")}><FileText size={15} /><span><strong>회의록</strong><small>요약과 결정 사항 추가</small></span></button>
+        </div>
+      ) : (
+        <div className="quick-panel-body">
+          <p>현재 페이지 주소입니다.</p>
+          <div className="quick-link"><span>{pageLink}</span></div>
+          <button className="copy-action" type="button" onClick={onCopy}><Copy size={15} /> 페이지 링크 복사</button>
+        </div>
+      )}
+    </aside>
+  );
 }
 
 function NodiContextMenu({ menu, archived, locked, selectedBlockCount, onAddBlock, onMoveBlock, onDuplicateBlock, onDeleteBlock, onOpenSettings, onCopyLink, onToggleArchive, onExport, onDeletePage }: { menu: ContextMenuState; archived: boolean; locked: boolean; selectedBlockCount: number; onAddBlock: () => void; onMoveBlock: (direction: "up" | "down") => void; onDuplicateBlock: () => void; onDeleteBlock: () => void; onOpenSettings: () => void; onCopyLink: () => void; onToggleArchive: () => void; onExport: () => void; onDeletePage: () => void }) {
