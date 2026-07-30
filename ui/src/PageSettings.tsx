@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { CalendarDays, Check, CircleDotDashed, Columns3, Eye, EyeOff, Globe2, Lock, Palette, Settings2, ShieldCheck, Tags, Type, Unlock, X } from "lucide-react";
+import { CalendarDays, Check, CircleDotDashed, Columns3, Eye, EyeOff, Lock, Palette, Settings2, Tags, Type, Unlock, X } from "lucide-react";
 import { DatePicker } from "./components/ui/date-picker";
 import { Select } from "./components/ui/select";
 import { TagPicker } from "./TagPicker";
@@ -116,7 +116,6 @@ export function PageSettingsPanel({ settings, onChange, onClose }: PageSettingsP
             <Toggle label="작은 텍스트" detail="본문 글자 크기를 조금 줄임" icon={<Type size={16} />} checked={settings.smallText} onChange={(checked) => update("smallText", checked)} />
             <Toggle label="속성 표시" detail="제목 아래의 페이지 속성" icon={settings.showProperties ? <Eye size={16} /> : <EyeOff size={16} />} checked={settings.showProperties} onChange={(checked) => update("showProperties", checked)} />
             <Toggle label="페이지 잠금" detail="본문과 데이터베이스 편집 방지" icon={settings.lockPage ? <Lock size={16} /> : <Unlock size={16} />} checked={settings.lockPage} onChange={(checked) => update("lockPage", checked)} />
-            <Toggle label="페이지 공유" detail={settings.publicAccess ? "링크가 있는 사람에게 공개" : "나만 볼 수 있음"} icon={settings.publicAccess ? <Globe2 size={16} /> : <ShieldCheck size={16} />} checked={settings.publicAccess} onChange={(checked) => update("publicAccess", checked)} />
           </section>
         </div>
       </aside>

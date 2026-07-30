@@ -836,7 +836,12 @@ function getNodiSlashMenuItems(
     subtext: "현재 위치에 비어 있는 독립 데이터베이스를 추가합니다.",
   };
 
-  return [...getDefaultReactSlashMenuItems(editor), addPage, addDatabase];
+  const visibleDefaultItems = getDefaultReactSlashMenuItems(editor).filter((item) => {
+    const title = item.title.trim().toLocaleLowerCase();
+    return !["video", "audio", "비디오", "오디오"].includes(title);
+  });
+
+  return [...visibleDefaultItems, addPage, addDatabase];
 }
 
 const defaultBlocks: PartialBlock[] = [
