@@ -13,6 +13,7 @@ import { ko } from "@blocknote/core/locales";
 import { BlockNoteView } from "@blocknote/mantine";
 import { createReactBlockSpec, getDefaultReactSlashMenuItems, SuggestionMenuController, useCreateBlockNote, type DefaultReactSuggestionItem } from "@blocknote/react";
 import { createHighlighter } from "shiki";
+import { BlockCommentPanel } from "./BlockCommentPanel";
 import { InlineDatabase } from "./InlineDatabase";
 import { PageSharePanel } from "./PageSharePanel";
 import { PageSettingsPanel, type PageSettings } from "./PageSettings";
@@ -26,6 +27,11 @@ import { DatePicker } from "./components/ui/date-picker";
 import { Select } from "./components/ui/select";
 import { ConfirmDialog } from "./components/ui/confirm-dialog";
 import { ChildPageBlock } from "./ChildPageBlock";
+import {
+  persistStoredBlockComments,
+  readStoredBlockComments,
+  type StoredBlockComments,
+} from "./comment-store";
 import {
   OPEN_PAGE_EVENT,
   MAX_FOLDER_DEPTH,
@@ -254,6 +260,32 @@ const BLOCK_COLOR_OPTIONS: readonly { value: BlockColorName; label: string }[] =
 ];
 
 const CONVERTIBLE_BLOCK_TYPES = new Set(BLOCK_TRANSFORM_OPTIONS.map((option) => option.type));
+
+function getBlockPreview(block: unknown) {
+  const collectText = (value: unknown): string => {
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) return value.map(collectText).join("");
+    if (!value || typeof value !== "object") return "";
+    const candidate = value as { text?: unknown; content?: unknown; type?: unknown };
+    if (typeof candidate.text === "string") return candidate.text;
+    return collectText(candidate.content);
+  };
+  const candidate = block as { content?: unknown; type?: string } | null | undefined;
+  const preview = collectText(candidate?.content).replace(/\s+/g, " ").trim();
+  if (preview) return preview.slice(0, 120);
+  const fallbackByType: Record<string, string> = {
+    bulletListItem: "글머리 기호 목록",
+    numberedListItem: "번호 매기기 목록",
+    checkListItem: "할 일",
+    heading: "제목",
+    codeBlock: "코드",
+    image: "이미지",
+    file: "파일",
+    database: "데이터베이스",
+    childPage: "하위 페이지",
+  };
+  return fallbackByType[candidate?.type ?? ""] ?? "빈 블록";
+}
 
 function getInitialAppTheme(): AppTheme {
   try {
@@ -961,6 +993,7 @@ function App() {
   const initialPages = useMemo(getInitialPages, []);
   const initialFolders = useMemo(readStoredFolders, []);
   const initialPageShares = useMemo(readStoredPageShares, []);
+  const initialBlockComments = useMemo(readStoredBlockComments, []);
   const rootPage = initialPages[ROOT_PAGE_ID];
   const editor = useCreateBlockNote({
     schema: editorSchema,
@@ -974,6 +1007,7 @@ function App() {
   const [userName, setUserName] = useState(getStoredUserName);
   const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection>("pages");
   const [pageShares, setPageShares] = useState<StoredPageShares>(initialPageShares);
+  const [blockComments, setBlockComments] = useState<StoredBlockComments>(initialBlockComments);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [appTheme, setAppTheme] = useState<AppTheme>(getInitialAppTheme);
   const [savedAt, setSavedAt] = useState("방금 저장됨");
@@ -996,6 +1030,7 @@ function App() {
   const [inboxOpen, setInboxOpen] = useState(false);
   const [inboxNotifications, setInboxNotifications] = useState(getInitialInboxNotifications);
   const [pendingBlockDeletion, setPendingBlockDeletion] = useState<string[] | null>(null);
+  const [activeCommentBlockId, setActiveCommentBlockId] = useState<string | null>(null);
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
   const [selectedBlockIds, setSelectedBlockIds] = useState<string[]>([]);
   const selectedBlockIdsRef = useRef<string[]>([]);
@@ -1011,6 +1046,7 @@ function App() {
   const editorContextRef = useRef<HTMLDivElement>(null);
   const blockSelectionToolbarRef = useRef<HTMLDivElement>(null);
   const blockSelectionOverlayRefs = useRef(new Map<string, HTMLDivElement>());
+  const blockCommentMarkerRefs = useRef(new Map<string, HTMLButtonElement>());
   const pagesRef = useRef(initialPages);
   const foldersRef = useRef(initialFolders);
   const sidebarDraggedPageIdRef = useRef<string | null>(null);
@@ -1077,6 +1113,10 @@ function App() {
     if (!sidebarOpen) setInboxOpen(false);
   }, [sidebarOpen]);
 
+  useEffect(() => {
+    if (rightPanel || pageSettingsOpen) setActiveCommentBlockId(null);
+  }, [rightPanel, pageSettingsOpen]);
+
   const commitPages = (nextPages: StoredPages) => {
     pagesRef.current = nextPages;
     setPages(nextPages);
@@ -1094,6 +1134,14 @@ function App() {
       const nextPageShares = updater(current);
       persistStoredPageShares(nextPageShares);
       return nextPageShares;
+    });
+  };
+
+  const commitBlockComments = (updater: (current: StoredBlockComments) => StoredBlockComments) => {
+    setBlockComments((current) => {
+      const nextComments = updater(current);
+      persistStoredBlockComments(nextComments);
+      return nextComments;
     });
   };
 
@@ -1183,6 +1231,7 @@ function App() {
       setWorkspaceSection("pages");
       setInboxOpen(false);
       setRightPanel(null);
+      setActiveCommentBlockId(null);
       editorStageRef.current?.scrollTo({ top: 0 });
       return;
     }
@@ -1210,6 +1259,7 @@ function App() {
     setPageSettingsOpen(false);
     setDrawerPageId(null);
     setRightPanel(null);
+    setActiveCommentBlockId(null);
     setContextMenu(null);
     editor.replaceBlocks(
       editor.document,
@@ -1229,6 +1279,7 @@ function App() {
     setPageSettingsOpen(false);
     setDrawerPageId(null);
     setRightPanel(null);
+    setActiveCommentBlockId(null);
     setContextMenu(null);
     setSidebarContextMenu(null);
     editorStageRef.current?.scrollTo({ top: 0 });
@@ -2222,6 +2273,10 @@ function App() {
       setTitle("제목 없음");
       setPageSettings(defaultPageSettings);
       setIsArchived(false);
+      commitBlockComments((current) => Object.fromEntries(
+        Object.entries(current).filter(([, thread]) => thread.pageId !== pageId),
+      ));
+      setActiveCommentBlockId(null);
       setPendingPageDeletion(null);
       setNotice("페이지를 휴지통으로 옮겼어요");
       return;
@@ -2270,7 +2325,11 @@ function App() {
       pageIdsToDelete.forEach((deletedPageId) => delete nextPageShares[deletedPageId]);
       return nextPageShares;
     });
+    commitBlockComments((current) => Object.fromEntries(
+      Object.entries(current).filter(([, thread]) => !pageIdsToDelete.has(thread.pageId)),
+    ));
     if (drawerPageId && pageIdsToDelete.has(drawerPageId)) setDrawerPageId(null);
+    if (currentPageWasDeleted) setActiveCommentBlockId(null);
     setPendingPageDeletion(null);
     setSidebarContextMenu(null);
     if (currentPageWasDeleted) openPage(fallbackPageId);
@@ -2801,7 +2860,7 @@ function App() {
       return;
     }
     const target = event.target as HTMLElement;
-    if (target.closest(".block-selection-toolbar")) return;
+    if (target.closest(".block-selection-toolbar, .block-comment-marker")) return;
     const blockId = getEventBlockId(event.target, event.clientX, event.clientY);
     if (!blockId) return;
     const isToggleBlockClick = event.shiftKey && (event.metaKey || event.altKey);
@@ -2922,6 +2981,14 @@ function App() {
       editor.replaceBlocks(editor.document, [{ type: "paragraph", content: "" }]);
     } else {
       editor.removeBlocks(normalizedIds);
+    }
+    commitBlockComments((current) => Object.fromEntries(
+      Object.entries(current).filter(([, thread]) => (
+        thread.pageId !== currentPageIdRef.current || !normalizedIds.includes(thread.blockId)
+      )),
+    ));
+    if (activeCommentBlockId && normalizedIds.includes(activeCommentBlockId)) {
+      setActiveCommentBlockId(null);
     }
     clearBlockSelection();
     setPendingBlockDeletion(null);
@@ -3077,6 +3144,44 @@ function App() {
         .filter((rect): rect is BlockSelectionMarquee => Boolean(rect));
 
       const toolbar = blockSelectionToolbarRef.current;
+      Object.values(blockComments)
+        .filter((thread) => (
+          thread.pageId === currentPageId
+          && !thread.resolvedAt
+          && thread.messages.length > 0
+        ))
+        .forEach((thread) => {
+          const marker = blockCommentMarkerRefs.current.get(thread.blockId);
+          const element = root.querySelector<HTMLElement>(
+            `[data-node-type='blockContainer'][data-id="${CSS.escape(thread.blockId)}"]`,
+          );
+          const content = element?.querySelector<HTMLElement>(":scope > .bn-block-content")
+            ?? element?.querySelector<HTMLElement>(".bn-block-content");
+          if (!marker || !content) {
+            marker?.removeAttribute("data-positioned");
+            return;
+          }
+          const rect = content.getBoundingClientRect();
+          const scrollRect = scrollArea?.getBoundingClientRect();
+          const topbarBottom = document.querySelector<HTMLElement>(".topbar")?.getBoundingClientRect().bottom ?? 0;
+          const visibleTop = Math.max(0, scrollRect?.top ?? 0, topbarBottom);
+          const visibleBottom = Math.min(window.innerHeight, scrollRect?.bottom ?? window.innerHeight);
+          if (
+            rect.width <= 0
+            || rect.height <= 0
+            || rect.bottom <= visibleTop
+            || rect.top >= visibleBottom
+          ) {
+            marker.removeAttribute("data-positioned");
+            return;
+          }
+          const markerWidth = marker.offsetWidth || 36;
+          const markerCenter = rect.top + Math.min(rect.height / 2, 18);
+          marker.style.left = `${Math.min(window.innerWidth - markerWidth - 10, rect.right + 8)}px`;
+          marker.style.top = `${Math.max(visibleTop + 16, Math.min(visibleBottom - 16, markerCenter))}px`;
+          marker.dataset.positioned = "true";
+        });
+
       if (!toolbar || rects.length === 0) {
         toolbar?.removeAttribute("data-positioned");
         return;
@@ -3109,7 +3214,7 @@ function App() {
       scrollArea?.removeEventListener("scroll", updatePosition);
       window.removeEventListener("resize", schedulePosition);
     };
-  }, [currentPageId, selectedBlockIds]);
+  }, [blockComments, currentPageId, selectedBlockIds]);
 
   useEffect(() => {
     document.documentElement.classList.toggle("is-nodi-block-dragging", isBlockDragging);
@@ -3253,6 +3358,128 @@ function App() {
 
   const currentPage = pages[currentPageId] ?? rootPage;
   const currentNodiUser = getCurrentNodiUser(userName);
+  const currentPageShare = pageShares[currentPageId];
+  const canCommentOnCurrentPage = pageSettings.publicAccess || Boolean(currentPageShare?.members.length);
+  const currentPageCommentThreads = Object.values(blockComments).filter((thread) => thread.pageId === currentPageId);
+  const pageCommentCounts = Object.values(blockComments).reduce<Record<string, number>>((counts, thread) => {
+    if (thread.resolvedAt) return counts;
+    counts[thread.pageId] = (counts[thread.pageId] ?? 0) + thread.messages.length;
+    return counts;
+  }, {});
+  const activeCommentThread = activeCommentBlockId
+    ? currentPageCommentThreads.find((thread) => thread.blockId === activeCommentBlockId)
+    : undefined;
+  const activeCommentBlock = activeCommentBlockId ? editor.getBlock(activeCommentBlockId) : undefined;
+  const activeCommentBlockPreview = activeCommentThread?.blockPreview || getBlockPreview(activeCommentBlock);
+
+  const openBlockComments = (blockId: string) => {
+    if (!editor.getBlock(blockId)) {
+      setNotice("댓글을 연결할 블록을 찾을 수 없어요");
+      return;
+    }
+    setActiveCommentBlockId(blockId);
+    setRightPanel(null);
+    setPageSettingsOpen(false);
+    setContextMenu(null);
+    setBlockSelectionActionMenu(null);
+  };
+
+  const addBlockComment = (blockId: string, body: string) => {
+    if (!canCommentOnCurrentPage) {
+      setNotice("페이지를 공유한 뒤 댓글을 남길 수 있어요");
+      return;
+    }
+    const block = editor.getBlock(blockId);
+    if (!block) {
+      setActiveCommentBlockId(null);
+      setNotice("댓글을 연결한 블록이 삭제되었어요");
+      return;
+    }
+    const now = new Date().toISOString();
+    commitBlockComments((current) => {
+      const previous = Object.values(current).find((thread) => (
+        thread.pageId === currentPageId && thread.blockId === blockId
+      ));
+      const message = {
+        id: makeId("comment"),
+        authorId: currentNodiUser.id,
+        authorName: currentNodiUser.name,
+        authorEmail: currentNodiUser.email,
+        body,
+        createdAt: now,
+      };
+      if (previous) {
+        return {
+          ...current,
+          [previous.id]: {
+            ...previous,
+            blockPreview: getBlockPreview(block),
+            messages: [...previous.messages, message],
+            resolvedAt: null,
+            resolvedBy: null,
+            updatedAt: now,
+          },
+        };
+      }
+      const threadId = makeId("comment-thread");
+      return {
+        ...current,
+        [threadId]: {
+          id: threadId,
+          pageId: currentPageId,
+          blockId,
+          blockPreview: getBlockPreview(block),
+          messages: [message],
+          resolvedAt: null,
+          resolvedBy: null,
+          updatedAt: now,
+        },
+      };
+    });
+    setNotice("블록에 댓글을 남겼어요");
+  };
+
+  const deleteBlockComment = (threadId: string, commentId: string) => {
+    commitBlockComments((current) => {
+      const thread = current[threadId];
+      if (!thread) return current;
+      const targetComment = thread.messages.find((message) => message.id === commentId);
+      if (!targetComment || targetComment.authorId !== currentNodiUser.id) return current;
+      const messages = thread.messages.filter((message) => message.id !== commentId);
+      if (messages.length === 0) {
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      }
+      return {
+        ...current,
+        [threadId]: {
+          ...thread,
+          messages,
+          updatedAt: new Date().toISOString(),
+        },
+      };
+    });
+    setNotice("댓글을 삭제했어요");
+  };
+
+  const setBlockCommentResolved = (threadId: string, resolved: boolean) => {
+    commitBlockComments((current) => {
+      const thread = current[threadId];
+      if (!thread) return current;
+      return {
+        ...current,
+        [threadId]: {
+          ...thread,
+          resolvedAt: resolved ? new Date().toISOString() : null,
+          resolvedBy: resolved ? currentNodiUser.id : null,
+          updatedAt: new Date().toISOString(),
+        },
+      };
+    });
+    setNotice(resolved ? "댓글을 해결로 표시했어요" : "댓글을 다시 열었어요");
+  };
+
   const isHomePage = currentPageId === ROOT_PAGE_ID;
   const isFavorite = Boolean(currentPage.favoritedAt);
   const unreadInboxCount = inboxNotifications.filter((notification) => notification.unread).length;
@@ -3305,6 +3532,10 @@ function App() {
   };
   const personalPageCount = Object.keys(pages).length - 1;
   const liveSelectedBlockIds = getLiveSelectedBlockIds();
+  const selectedCommentThread = liveSelectedBlockIds.length === 1
+    ? currentPageCommentThreads.find((thread) => thread.blockId === liveSelectedBlockIds[0])
+    : undefined;
+  const selectedCommentCount = selectedCommentThread?.messages.length ?? 0;
   type LiveEditorBlock = NonNullable<ReturnType<typeof editor.getBlock>>;
   const liveSelectedBlocks = liveSelectedBlockIds
     .map((blockId) => editor.getBlock(blockId))
@@ -3776,6 +4007,7 @@ function App() {
             pageShares={pageShares}
             registeredUsers={REGISTERED_NODI_USERS}
             currentUser={currentNodiUser}
+            commentCounts={pageCommentCounts}
             onOpenPage={openPage}
             onManageShare={(pageId) => {
               openPage(pageId);
@@ -3941,6 +4173,33 @@ function App() {
                   aria-hidden="true"
                 />
               ))}
+              {currentPageCommentThreads
+                .filter((thread) => !thread.resolvedAt && thread.messages.length > 0)
+                .map((thread) => (
+                  <button
+                    key={thread.blockId}
+                    ref={(element) => {
+                      if (element) blockCommentMarkerRefs.current.set(thread.blockId, element);
+                      else blockCommentMarkerRefs.current.delete(thread.blockId);
+                    }}
+                    className="block-comment-marker"
+                    type="button"
+                    aria-label={`댓글 ${thread.messages.length}개 열기`}
+                    title={`댓글 ${thread.messages.length}개`}
+                    onPointerDown={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                    }}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      openBlockComments(thread.blockId);
+                    }}
+                  >
+                    <MessageCircle size={13} />
+                    <span>{thread.messages.length}</span>
+                  </button>
+                ))}
               {blockDropIndicator && (
                 <div
                   className="block-drop-indicator"
@@ -3988,7 +4247,6 @@ function App() {
                     <GripVertical size={14} />
                     {liveSelectedBlockIds.length}개 블록
                   </span>
-                  <span className="block-selection-hint">선택한 블록을 함께 편집</span>
                   <span className="block-selection-divider" aria-hidden="true" />
                   <button
                     type="button"
@@ -4056,6 +4314,29 @@ function App() {
                     <ChevronDown size={12} />
                   </button>
                   <button
+                    className="block-comment-toolbar-button"
+                    type="button"
+                    aria-label={selectedCommentCount > 0 ? `댓글 ${selectedCommentCount}개 열기` : "블록에 댓글 달기"}
+                    title={liveSelectedBlockIds.length === 1
+                      ? canCommentOnCurrentPage
+                        ? "블록 댓글"
+                        : "페이지를 공유하면 댓글을 작성할 수 있어요"
+                      : "댓글은 한 번에 하나의 블록에 연결할 수 있어요"}
+                    disabled={liveSelectedBlockIds.length !== 1}
+                    onPointerDown={(event) => runSelectionToolbarPointerAction(
+                      event,
+                      () => openBlockComments(liveSelectedBlockIds[0]),
+                    )}
+                    onClick={(event) => runSelectionToolbarKeyboardAction(
+                      event,
+                      () => openBlockComments(liveSelectedBlockIds[0]),
+                    )}
+                  >
+                    <MessageCircle size={15} />
+                    <span>댓글</span>
+                    {selectedCommentCount > 0 && <em>{selectedCommentCount}</em>}
+                  </button>
+                  <button
                     type="button"
                     aria-label="블록 선택 해제"
                     title="선택 해제"
@@ -4107,6 +4388,27 @@ function App() {
 
       </main>
 
+      {activeCommentBlockId && (
+        <BlockCommentPanel
+          key={`${currentPageId}:${activeCommentBlockId}`}
+          pageTitle={title}
+          blockPreview={activeCommentBlockPreview}
+          thread={activeCommentThread}
+          currentUser={currentNodiUser}
+          canComment={canCommentOnCurrentPage}
+          onAddComment={(body) => addBlockComment(activeCommentBlockId, body)}
+          onDeleteComment={(commentId) => {
+            if (activeCommentThread) deleteBlockComment(activeCommentThread.id, commentId);
+          }}
+          onResolve={() => {
+            if (activeCommentThread) setBlockCommentResolved(activeCommentThread.id, true);
+          }}
+          onReopen={() => {
+            if (activeCommentThread) setBlockCommentResolved(activeCommentThread.id, false);
+          }}
+          onClose={() => setActiveCommentBlockId(null)}
+        />
+      )}
       {rightPanel === "share" ? (
         <PageSharePanel
           pageTitle={title}
@@ -4185,10 +4487,18 @@ function App() {
         selectedBlockCount={contextMenu.kind === "block" && selectedBlockIds.includes(contextMenu.blockId)
           ? selectedBlockIds.length
           : 1}
+        commentCount={contextMenu.kind === "block"
+          ? currentPageCommentThreads.find((thread) => thread.blockId === contextMenu.blockId)?.messages.length ?? 0
+          : 0}
+        commentsAvailable={contextMenu.kind === "block"
+          && (!selectedBlockIds.includes(contextMenu.blockId) || selectedBlockIds.length === 1)}
         onAddBlock={addBlockAfter}
         onMoveBlock={moveContextBlock}
         onDuplicateBlock={duplicateBlock}
         onDeleteBlock={requestBlockDeletion}
+        onComment={() => {
+          if (contextMenu.kind === "block") openBlockComments(contextMenu.blockId);
+        }}
         onOpenSettings={() => { setContextMenu(null); setPageSettingsOpen(true); }}
         onCopyLink={() => { setContextMenu(null); void copyPageLink(); }}
         onToggleArchive={() => { setContextMenu(null); toggleArchive(); }}
@@ -5149,10 +5459,15 @@ function QuickActionPanel({
   );
 }
 
-function NodiContextMenu({ menu, archived, locked, selectedBlockCount, onAddBlock, onMoveBlock, onDuplicateBlock, onDeleteBlock, onOpenSettings, onCopyLink, onToggleArchive, onExport, onDeletePage }: { menu: ContextMenuState; archived: boolean; locked: boolean; selectedBlockCount: number; onAddBlock: () => void; onMoveBlock: (direction: "up" | "down") => void; onDuplicateBlock: () => void; onDeleteBlock: () => void; onOpenSettings: () => void; onCopyLink: () => void; onToggleArchive: () => void; onExport: () => void; onDeletePage: () => void }) {
+function NodiContextMenu({ menu, archived, locked, selectedBlockCount, commentCount, commentsAvailable, onAddBlock, onMoveBlock, onDuplicateBlock, onDeleteBlock, onComment, onOpenSettings, onCopyLink, onToggleArchive, onExport, onDeletePage }: { menu: ContextMenuState; archived: boolean; locked: boolean; selectedBlockCount: number; commentCount: number; commentsAvailable: boolean; onAddBlock: () => void; onMoveBlock: (direction: "up" | "down") => void; onDuplicateBlock: () => void; onDeleteBlock: () => void; onComment: () => void; onOpenSettings: () => void; onCopyLink: () => void; onToggleArchive: () => void; onExport: () => void; onDeletePage: () => void }) {
   return <div className="nodi-context-menu" role="menu" aria-label={menu.kind === "block" ? "블록 메뉴" : "페이지 메뉴"} style={{ left: menu.x, top: menu.y }} onMouseDown={(event) => event.stopPropagation()}>
     {menu.kind === "block" ? <>
       <span className="context-menu-heading">{selectedBlockCount > 1 ? `${selectedBlockCount}개 블록` : "블록"}</span>
+      <button type="button" role="menuitem" disabled={!commentsAvailable} onClick={onComment}>
+        <MessageCircle size={15} />
+        <span>{commentCount > 0 ? `댓글 ${commentCount}개` : "댓글 달기"}</span>
+      </button>
+      <div className="context-menu-divider" />
       <button type="button" role="menuitem" disabled={locked} onClick={onAddBlock}><Plus size={15} /> 아래에 새 블록</button>
       <button type="button" role="menuitem" disabled={locked} onClick={() => onMoveBlock("up")}><ArrowUp size={15} /><span>위로 이동</span><kbd>⌘⇧↑</kbd></button>
       <button type="button" role="menuitem" disabled={locked} onClick={() => onMoveBlock("down")}><ArrowDown size={15} /><span>아래로 이동</span><kbd>⌘⇧↓</kbd></button>

@@ -1,4 +1,4 @@
-import { ArrowRight, FileText, Settings2, Share2, UserPlus, Users } from "lucide-react";
+import { ArrowRight, FileText, MessageCircle, Settings2, Share2, UserPlus, Users } from "lucide-react";
 import type { StoredPages } from "./page-store";
 import type { NodiUser, StoredPageShares } from "./sharing-store";
 
@@ -7,6 +7,7 @@ type SharedPagesViewProps = {
   pageShares: StoredPageShares;
   registeredUsers: NodiUser[];
   currentUser: NodiUser;
+  commentCounts: Record<string, number>;
   onOpenPage: (pageId: string) => void;
   onManageShare: (pageId: string) => void;
 };
@@ -16,6 +17,7 @@ export function SharedPagesView({
   pageShares,
   registeredUsers,
   currentUser,
+  commentCounts,
   onOpenPage,
   onManageShare,
 }: SharedPagesViewProps) {
@@ -76,6 +78,11 @@ export function SharedPagesView({
                     {members.length > 4 && <em>+{members.length - 4}</em>}
                   </div>
                   <span>{members.some((member) => member.permission === "edit") ? "편집 권한 포함" : "보기 전용"}</span>
+                  {(commentCounts[record.pageId] ?? 0) > 0 && (
+                    <span className="shared-page-comment-count">
+                      <MessageCircle size={13} /> 댓글 {commentCounts[record.pageId]}
+                    </span>
+                  )}
                   <button type="button" onClick={() => onManageShare(record.pageId)}>
                     <Settings2 size={14} /> 공유 관리
                   </button>
