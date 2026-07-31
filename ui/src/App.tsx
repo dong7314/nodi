@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
+  ClipboardEvent as ReactClipboardEvent,
   FocusEvent as ReactFocusEvent,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
@@ -14,13 +15,17 @@ import { BlockNoteView } from "@blocknote/mantine";
 import { createReactBlockSpec, getDefaultReactSlashMenuItems, SuggestionMenuController, useCreateBlockNote, type DefaultReactSuggestionItem } from "@blocknote/react";
 import { createHighlighter } from "shiki";
 import { BlockCommentPanel } from "./BlockCommentPanel";
+import { AuthDialog, type AuthDialogMode } from "./AuthDialog";
 import { InlineDatabase } from "./InlineDatabase";
 import { PageSharePanel } from "./PageSharePanel";
 import { PageSettingsPanel, type PageSettings } from "./PageSettings";
 import { SharedPagesView } from "./SharedPagesView";
 import { SidebarScrollOverlay } from "./SidebarScrollOverlay";
 import { TagPicker } from "./TagPicker";
+import { NodiUserAvatar } from "./NodiUserAvatar";
+import { WorkspaceSettingsDialog } from "./WorkspaceSettingsDialog";
 import { WorkspaceSearchDialog } from "./WorkspaceSearchDialog";
+import { APP_NOTICE_EVENT, uploadNodiAttachment } from "./attachment-storage";
 import { DEFAULT_TAG_OPTIONS, toDateInput } from "./types";
 import { makeId } from "./types";
 import { DatePicker } from "./components/ui/date-picker";
@@ -32,6 +37,16 @@ import {
   readStoredBlockComments,
   type StoredBlockComments,
 } from "./comment-store";
+import {
+  bootstrapLocalAuth,
+  logoutLocalAccount,
+  readApprovedLocalUsers,
+  readLocalAuthUser,
+  readRegistrationRequests,
+  REGISTRATION_REQUESTS_CHANGED_EVENT,
+  updateLocalAccountProfile,
+  type LocalAuthUser,
+} from "./account-store";
 import {
   OPEN_PAGE_EVENT,
   MAX_FOLDER_DEPTH,
@@ -47,12 +62,17 @@ import {
 } from "./page-store";
 import {
   REGISTERED_NODI_USERS,
-  getCurrentNodiUser,
   persistStoredPageShares,
   readStoredPageShares,
+  type NodiAvatarColor,
   type SharePermission,
   type StoredPageShares,
 } from "./sharing-store";
+import {
+  persistStarterPresets,
+  readStarterPresets,
+  type StarterPreset,
+} from "./starter-presets";
 import "@blocknote/mantine/style.css";
 import {
   Archive,
@@ -66,15 +86,14 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  ChevronsUpDown,
   Clock3,
-  Cloud,
   Command,
   Download,
   Database,
   FileText,
   FolderPlus,
   GripVertical,
+  HardDrive,
   Hash,
   Heading1,
   Heading2,
@@ -86,6 +105,8 @@ import {
   List,
   ListChecks,
   ListOrdered,
+  LoaderCircle,
+  LogIn,
   MessageCircle,
   Moon,
   MoreHorizontal,
@@ -97,7 +118,6 @@ import {
   Quote,
   Repeat2,
   Search,
-  Settings,
   Settings2,
   Share2,
   Sparkles,
@@ -123,9 +143,8 @@ const USER_NAME_STORAGE_KEY = "nodi:user:name";
 const USER_PROFILE_STORAGE_KEYS = ["nodi:user:profile", "nodi:auth:user"];
 const DEFAULT_USER_NAME = "Lee";
 const USER_PROFILE_CHANGED_EVENT = "nodi:user-profile-changed";
-const APP_NOTICE_EVENT = "nodi:notice";
-
 type AppTheme = "light" | "dark";
+type LocalSaveState = "saving" | "saved" | "error";
 type WorkspaceSection = "pages" | "shared";
 type InboxNotification = {
   id: string;
@@ -182,6 +201,9 @@ function getPrimaryShortcutLabel() {
 }
 
 function getStoredUserName() {
+  const authenticatedUser = readLocalAuthUser();
+  if (!authenticatedUser) return "게스트";
+
   try {
     const directName = window.localStorage.getItem(USER_NAME_STORAGE_KEY)?.trim();
     if (directName) return directName;
@@ -219,6 +241,72 @@ function formatHomePageUpdatedAt(value: string) {
   return new Intl.DateTimeFormat("ko-KR", { month: "short", day: "numeric" }).format(date);
 }
 
+function formatPageUpdatedAt(value: string, now = Date.now()) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "최근";
+
+  const elapsed = Math.max(0, now - date.getTime());
+  if (elapsed < 60_000) return "지금";
+  if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)}분 전`;
+  if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)}시간 전`;
+
+  const current = new Date(now);
+  const yesterday = new Date(current.getFullYear(), current.getMonth(), current.getDate() - 1);
+  if (
+    date.getFullYear() === yesterday.getFullYear()
+    && date.getMonth() === yesterday.getMonth()
+    && date.getDate() === yesterday.getDate()
+  ) return "어제";
+
+  if (date.getFullYear() === current.getFullYear()) {
+    return new Intl.DateTimeFormat("ko-KR", { month: "long", day: "numeric" }).format(date);
+  }
+  return new Intl.DateTimeFormat("ko-KR", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+function formatExactUpdatedAt(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat("ko-KR", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(date);
+}
+
+function RelativeUpdatedAt({ value }: { value: string }) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [value]);
+
+  return <strong title={formatExactUpdatedAt(value)}>{formatPageUpdatedAt(value, now)}</strong>;
+}
+
+function arePageSettingsEqual(first: PageSettings, second: PageSettings) {
+  return first.icon === second.icon
+    && first.cover === second.cover
+    && first.fullWidth === second.fullWidth
+    && first.smallText === second.smallText
+    && first.lockPage === second.lockPage
+    && first.publicAccess === second.publicAccess
+    && first.showProperties === second.showProperties
+    && first.status === second.status
+    && first.date === second.date
+    && first.tags.length === second.tags.length
+    && first.tags.every((tag, index) => tag === second.tags[index]);
+}
+
 function formatHomeMemoDate() {
   return new Intl.DateTimeFormat("ko-KR", {
     month: "long",
@@ -231,8 +319,31 @@ type BlockSelectionActionMenu = {
   kind: "transform" | "color";
   x: number;
   y: number;
+  placement: "top" | "bottom";
+  maxHeight: number;
+  anchor: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+  };
 };
-type BlockColorName = "default" | "gray" | "brown" | "red" | "orange" | "yellow" | "green" | "blue" | "purple" | "pink";
+type BlockColorName =
+  | "default"
+  | "gray"
+  | "slate"
+  | "brown"
+  | "red"
+  | "rose"
+  | "orange"
+  | "yellow"
+  | "lime"
+  | "green"
+  | "teal"
+  | "blue"
+  | "indigo"
+  | "purple"
+  | "pink";
 
 const BLOCK_TRANSFORM_OPTIONS = [
   { key: "paragraph", label: "텍스트", type: "paragraph", icon: Type },
@@ -249,12 +360,17 @@ const BLOCK_TRANSFORM_OPTIONS = [
 const BLOCK_COLOR_OPTIONS: readonly { value: BlockColorName; label: string }[] = [
   { value: "default", label: "기본" },
   { value: "gray", label: "회색" },
+  { value: "slate", label: "슬레이트" },
   { value: "brown", label: "갈색" },
   { value: "red", label: "빨강" },
+  { value: "rose", label: "로즈" },
   { value: "orange", label: "주황" },
   { value: "yellow", label: "노랑" },
+  { value: "lime", label: "라임" },
   { value: "green", label: "초록" },
+  { value: "teal", label: "청록" },
   { value: "blue", label: "파랑" },
+  { value: "indigo", label: "인디고" },
   { value: "purple", label: "보라" },
   { value: "pink", label: "분홍" },
 ];
@@ -362,7 +478,7 @@ type SidebarRenameState =
 
 type SidebarPageDropTarget =
   | { kind: "page"; pageId: string; placement: "before" | "after" }
-  | { kind: "folder"; folderId: string; placement: "before" | "inside" | "after" }
+  | { kind: "folder"; folderId: string; placement: "before" | "start" | "inside" | "after" }
   | { kind: "unfiled" };
 
 type SidebarFolderDropTarget =
@@ -917,7 +1033,13 @@ function getSavedBlocks(): PartialBlock[] {
 function getSavedPageSettings(): PageSettings {
   try {
     const saved = window.localStorage.getItem(PAGE_SETTINGS_STORAGE_KEY);
-    if (saved) return { ...defaultPageSettings, ...(JSON.parse(saved) as Partial<PageSettings>) };
+    if (saved) {
+      return {
+        ...defaultPageSettings,
+        ...(JSON.parse(saved) as Partial<PageSettings>),
+        publicAccess: false,
+      };
+    }
   } catch {
     // Settings fall back to a clean, readable page.
   }
@@ -945,16 +1067,23 @@ function getInitialPages(): StoredPages {
           const normalizedPage: StoredPage = {
             ...page,
             title: page.id === ROOT_PAGE_ID && shouldMigrateHomeTitle ? homePageTitle : page.title,
-            settings: { ...defaultPageSettings, ...page.settings },
+            settings: {
+              ...defaultPageSettings,
+              ...page.settings,
+              publicAccess: page.id === ROOT_PAGE_ID ? false : Boolean(page.settings.publicAccess),
+            },
             folderId: typeof page.folderId === "string" ? page.folderId : null,
             order: typeof page.order === "number" ? page.order : index,
-            favoritedAt: typeof page.favoritedAt === "string" ? page.favoritedAt : null,
+            favoritedAt: page.id === ROOT_PAGE_ID
+              ? null
+              : typeof page.favoritedAt === "string" ? page.favoritedAt : null,
           };
           if (
             page.folderId === undefined
             || page.order === undefined
             || page.favoritedAt === undefined
             || page.settings.publicAccess === undefined
+            || (page.id === ROOT_PAGE_ID && (page.favoritedAt !== null || page.settings.publicAccess))
             || (page.id === ROOT_PAGE_ID && shouldMigrateHomeTitle)
           ) changed = true;
           return [page.id, normalizedPage];
@@ -990,6 +1119,7 @@ function getInitialPages(): StoredPages {
 }
 
 function App() {
+  const initialAuthUser = useMemo(bootstrapLocalAuth, []);
   const initialPages = useMemo(getInitialPages, []);
   const initialFolders = useMemo(readStoredFolders, []);
   const initialPageShares = useMemo(readStoredPageShares, []);
@@ -999,19 +1129,24 @@ function App() {
     schema: editorSchema,
     initialContent: rootPage.blocks as never,
     dictionary: ko,
+    uploadFile: uploadNodiAttachment,
   });
   const [pages, setPages] = useState<StoredPages>(initialPages);
   const [folders, setFolders] = useState<StoredFolders>(initialFolders);
   const [currentPageId, setCurrentPageId] = useState(ROOT_PAGE_ID);
   const [title, setTitle] = useState(rootPage.title);
-  const [userName, setUserName] = useState(getStoredUserName);
+  const [authUser, setAuthUser] = useState<LocalAuthUser | null>(initialAuthUser);
+  const [authDialogMode, setAuthDialogMode] = useState<AuthDialogMode | null>(null);
+  const [userName, setUserName] = useState(() => initialAuthUser?.name ?? "게스트");
+  const [registrationDirectoryRevision, setRegistrationDirectoryRevision] = useState(0);
   const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection>("pages");
   const [pageShares, setPageShares] = useState<StoredPageShares>(initialPageShares);
   const [blockComments, setBlockComments] = useState<StoredBlockComments>(initialBlockComments);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [appTheme, setAppTheme] = useState<AppTheme>(getInitialAppTheme);
-  const [savedAt, setSavedAt] = useState("방금 저장됨");
+  const [localSaveState, setLocalSaveState] = useState<LocalSaveState>("saved");
   const [notice, setNotice] = useState<string | null>(null);
+  const [noticeClosing, setNoticeClosing] = useState(false);
   const [pageSettings, setPageSettings] = useState<PageSettings>(rootPage.settings);
   const [pageSettingsOpen, setPageSettingsOpen] = useState(false);
   const [drawerPageId, setDrawerPageId] = useState<string | null>(null);
@@ -1027,8 +1162,12 @@ function App() {
   const [sidebarDraggedFolderId, setSidebarDraggedFolderId] = useState<string | null>(null);
   const [sidebarFolderDropTarget, setSidebarFolderDropTarget] = useState<SidebarFolderDropTarget | null>(null);
   const [workspaceSearchOpen, setWorkspaceSearchOpen] = useState(false);
+  const [workspaceSettingsOpen, setWorkspaceSettingsOpen] = useState(false);
   const [inboxOpen, setInboxOpen] = useState(false);
   const [inboxNotifications, setInboxNotifications] = useState(getInitialInboxNotifications);
+  const [starterPresets, setStarterPresets] = useState<StarterPreset[]>(readStarterPresets);
+  const [starterDockPageId, setStarterDockPageId] = useState<string | null>(null);
+  const [selectedStarterPreset, setSelectedStarterPreset] = useState<string | null>(null);
   const [pendingBlockDeletion, setPendingBlockDeletion] = useState<string[] | null>(null);
   const [activeCommentBlockId, setActiveCommentBlockId] = useState<string | null>(null);
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
@@ -1045,8 +1184,10 @@ function App() {
   const pagesScrollRef = useRef<HTMLDivElement>(null);
   const editorContextRef = useRef<HTMLDivElement>(null);
   const blockSelectionToolbarRef = useRef<HTMLDivElement>(null);
+  const blockSelectionActionMenuRef = useRef<HTMLDivElement>(null);
   const blockSelectionOverlayRefs = useRef(new Map<string, HTMLDivElement>());
   const blockCommentMarkerRefs = useRef(new Map<string, HTMLButtonElement>());
+  const localSaveStateTimerRef = useRef<number | null>(null);
   const pagesRef = useRef(initialPages);
   const foldersRef = useRef(initialFolders);
   const sidebarDraggedPageIdRef = useRef<string | null>(null);
@@ -1099,6 +1240,15 @@ function App() {
   const isDarkMode = appTheme === "dark";
   const primaryShortcutLabel = useMemo(getPrimaryShortcutLabel, []);
 
+  const blockSelectionActionMenuPositionKey = blockSelectionActionMenu
+    ? [
+        blockSelectionActionMenu.kind,
+        blockSelectionActionMenu.anchor.top,
+        blockSelectionActionMenu.anchor.right,
+        blockSelectionActionMenu.anchor.bottom,
+      ].join(":")
+    : "closed";
+
   useLayoutEffect(() => {
     document.documentElement.dataset.theme = appTheme;
     document.documentElement.style.colorScheme = appTheme;
@@ -1108,6 +1258,10 @@ function App() {
       // The selected theme still applies for the current session.
     }
   }, [appTheme]);
+
+  useEffect(() => () => {
+    if (localSaveStateTimerRef.current) window.clearTimeout(localSaveStateTimerRef.current);
+  }, []);
 
   useEffect(() => {
     if (!sidebarOpen) setInboxOpen(false);
@@ -1120,7 +1274,23 @@ function App() {
   const commitPages = (nextPages: StoredPages) => {
     pagesRef.current = nextPages;
     setPages(nextPages);
-    persistStoredPages(nextPages);
+    setLocalSaveState("saving");
+    if (localSaveStateTimerRef.current) {
+      window.clearTimeout(localSaveStateTimerRef.current);
+      localSaveStateTimerRef.current = null;
+    }
+    try {
+      persistStoredPages(nextPages);
+      localSaveStateTimerRef.current = window.setTimeout(() => {
+        localSaveStateTimerRef.current = null;
+        setLocalSaveState("saved");
+      }, 320);
+      return true;
+    } catch {
+      setLocalSaveState("error");
+      setNotice("로컬 저장 공간이 부족하거나 사용할 수 없어요");
+      return false;
+    }
   };
 
   const commitFolders = (nextFolders: StoredFolders) => {
@@ -1145,17 +1315,37 @@ function App() {
     });
   };
 
-  const updatePage = (pageId: string, patch: Partial<StoredPage>) => {
+  const updatePage = (
+    pageId: string,
+    patch: Partial<StoredPage>,
+    options: { preserveUpdatedAt?: boolean } = {},
+  ) => {
     const page = pagesRef.current[pageId];
     if (!page) return;
-    const nextPage = { ...page, ...patch, updatedAt: new Date().toISOString() };
-    commitPages({ ...pagesRef.current, [pageId]: nextPage });
+    const safePatch = pageId === ROOT_PAGE_ID
+      ? {
+          ...patch,
+          favoritedAt: null,
+          settings: patch.settings ? { ...patch.settings, publicAccess: false } : page.settings,
+        }
+      : patch;
+    const nextPage = {
+      ...page,
+      ...safePatch,
+      updatedAt: options.preserveUpdatedAt ? page.updatedAt : new Date().toISOString(),
+    };
+    const pageSaved = commitPages({ ...pagesRef.current, [pageId]: nextPage });
 
-    if (pageId === ROOT_PAGE_ID) {
-      if (patch.blocks) window.localStorage.setItem(CONTENT_STORAGE_KEY, JSON.stringify(patch.blocks));
-      if (patch.title !== undefined) window.localStorage.setItem(TITLE_STORAGE_KEY, patch.title);
-      if (patch.settings) window.localStorage.setItem(PAGE_SETTINGS_STORAGE_KEY, JSON.stringify(patch.settings));
-      if (patch.archived !== undefined) window.localStorage.setItem(PAGE_ARCHIVED_STORAGE_KEY, String(patch.archived));
+    if (pageId === ROOT_PAGE_ID && pageSaved) {
+      try {
+        if (patch.blocks) window.localStorage.setItem(CONTENT_STORAGE_KEY, JSON.stringify(patch.blocks));
+        if (patch.title !== undefined) window.localStorage.setItem(TITLE_STORAGE_KEY, patch.title);
+        if (patch.settings) window.localStorage.setItem(PAGE_SETTINGS_STORAGE_KEY, JSON.stringify(nextPage.settings));
+        if (patch.archived !== undefined) window.localStorage.setItem(PAGE_ARCHIVED_STORAGE_KEY, String(patch.archived));
+      } catch {
+        // The canonical `nodi:pages` document is already saved above. These
+        // legacy keys only keep older local workspaces compatible.
+      }
     }
   };
 
@@ -1192,17 +1382,88 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const syncRegistrationDirectory = () => {
+      setRegistrationDirectoryRevision((current) => current + 1);
+    };
+    window.addEventListener("storage", syncRegistrationDirectory);
+    window.addEventListener(REGISTRATION_REQUESTS_CHANGED_EVENT, syncRegistrationDirectory);
+    return () => {
+      window.removeEventListener("storage", syncRegistrationDirectory);
+      window.removeEventListener(REGISTRATION_REQUESTS_CHANGED_EVENT, syncRegistrationDirectory);
+    };
+  }, []);
+
   const saveDocument = () => {
+    const currentPage = pagesRef.current[currentPageIdRef.current];
+    const nextTitle = title.trim() || "제목 없음";
+    const hasMetadataChanges = Boolean(
+      currentPage
+      && (
+        currentPage.title !== nextTitle
+        || !arePageSettingsEqual(currentPage.settings, pageSettings)
+        || currentPage.archived !== isArchived
+      )
+    );
     updatePage(currentPageIdRef.current, {
       blocks: editor.document as unknown as PartialBlock[],
-      title: title.trim() || "제목 없음",
+      title: nextTitle,
       settings: pageSettings,
       archived: isArchived,
+    }, { preserveUpdatedAt: !hasMetadataChanges });
+  };
+
+  const updateUserProfile = ({
+    name: nextUserName,
+    avatarColor,
+    avatarIcon,
+  }: {
+    name: string;
+    avatarColor: NodiAvatarColor;
+    avatarIcon?: string;
+  }) => {
+    let storedProfile: Record<string, unknown> = {};
+    try {
+      const savedProfile = window.localStorage.getItem("nodi:user:profile");
+      if (savedProfile) storedProfile = JSON.parse(savedProfile) as Record<string, unknown>;
+    } catch {
+      storedProfile = {};
+    }
+    window.localStorage.setItem(USER_NAME_STORAGE_KEY, nextUserName);
+    window.localStorage.setItem("nodi:user:profile", JSON.stringify({
+      ...storedProfile,
+      name: nextUserName,
+      avatarColor,
+      avatarIcon,
+    }));
+    updateLocalAccountProfile({
+      name: nextUserName,
+      avatarColor,
+      avatarIcon,
     });
-    setSavedAt("방금 저장됨");
+    setAuthUser((current) => current ? {
+      ...current,
+      name: nextUserName,
+      avatarColor,
+      avatarIcon,
+    } : current);
+    window.dispatchEvent(new CustomEvent(USER_PROFILE_CHANGED_EVENT));
+    setNotice("계정 프로필을 변경했어요");
+  };
+
+  const logout = () => {
+    saveDocument();
+    logoutLocalAccount();
+    setWorkspaceSettingsOpen(false);
+    setAuthDialogMode(null);
+    window.location.reload();
   };
 
   const openWorkspaceSearch = () => {
+    if (!authUser) {
+      setAuthDialogMode("login");
+      return;
+    }
     saveDocument();
     setContextMenu(null);
     setSidebarContextMenu(null);
@@ -1212,21 +1473,30 @@ function App() {
   };
 
   useEffect(() => {
+    const currentPage = pagesRef.current[currentPageIdRef.current];
+    const nextTitle = title.trim() || "제목 없음";
+    if (!currentPage || currentPage.title === nextTitle) return;
     const saveTimer = window.setTimeout(() => {
-      updatePage(currentPageIdRef.current, { title: title.trim() || "제목 없음" });
+      updatePage(currentPageIdRef.current, { title: nextTitle });
     }, 300);
     return () => window.clearTimeout(saveTimer);
   }, [title, currentPageId]);
 
   useEffect(() => {
+    const currentPage = pagesRef.current[currentPageIdRef.current];
+    if (!currentPage || arePageSettingsEqual(currentPage.settings, pageSettings)) return;
     updatePage(currentPageIdRef.current, { settings: pageSettings });
   }, [pageSettings, currentPageId]);
 
   useEffect(() => {
+    const currentPage = pagesRef.current[currentPageIdRef.current];
+    if (!currentPage || currentPage.archived === isArchived) return;
     updatePage(currentPageIdRef.current, { archived: isArchived });
   }, [isArchived, currentPageId]);
 
   const openPage = (pageId: string) => {
+    setStarterDockPageId(null);
+    setSelectedStarterPreset(null);
     if (pageId === currentPageIdRef.current) {
       setWorkspaceSection("pages");
       setInboxOpen(false);
@@ -1236,12 +1506,7 @@ function App() {
       return;
     }
 
-    updatePage(currentPageIdRef.current, {
-      blocks: editor.document as unknown as PartialBlock[],
-      title: title.trim() || "제목 없음",
-      settings: pageSettings,
-      archived: isArchived,
-    });
+    saveDocument();
 
     const targetPage = pagesRef.current[pageId];
     if (!targetPage) {
@@ -1273,6 +1538,10 @@ function App() {
   };
 
   const openSharedPages = () => {
+    if (!authUser) {
+      setAuthDialogMode("login");
+      return;
+    }
     saveDocument();
     setWorkspaceSection("shared");
     setInboxOpen(false);
@@ -1285,11 +1554,37 @@ function App() {
     editorStageRef.current?.scrollTo({ top: 0 });
   };
 
+  const openPageSettingsPanel = () => {
+    if (!authUser) {
+      setAuthDialogMode("login");
+      return;
+    }
+    setRightPanel(null);
+    setActiveCommentBlockId(null);
+    setPageSettingsOpen(true);
+  };
+
+  const openSharePanel = () => {
+    if (!authUser) {
+      setAuthDialogMode("login");
+      return;
+    }
+    setPageSettingsOpen(false);
+    setActiveCommentBlockId(null);
+    setRightPanel("share");
+  };
+
   const sharePageWithMember = (pageId: string, userId: string, permission: SharePermission) => {
-    const targetUser = REGISTERED_NODI_USERS.find((user) => user.id === userId);
+    if (!authUser) return;
+    if (pageId === ROOT_PAGE_ID) {
+      setRightPanel(null);
+      setNotice("개인 홈은 다른 사용자와 공유할 수 없어요");
+      return;
+    }
+    const targetUser = registeredNodiUsers.find((user) => user.id === userId);
     const targetPage = pagesRef.current[pageId];
     if (!targetUser || !targetPage) return;
-    const owner = getCurrentNodiUser(userName);
+    const owner = authUser;
     const now = new Date().toISOString();
     commitPageShares((current) => {
       const previous = current[pageId];
@@ -1311,6 +1606,7 @@ function App() {
   };
 
   const updatePageSharePermission = (pageId: string, userId: string, permission: SharePermission) => {
+    if (pageId === ROOT_PAGE_ID) return;
     commitPageShares((current) => {
       const record = current[pageId];
       if (!record) return current;
@@ -1326,7 +1622,7 @@ function App() {
   };
 
   const removePageShareMember = (pageId: string, userId: string) => {
-    const targetUser = REGISTERED_NODI_USERS.find((user) => user.id === userId);
+    const targetUser = registeredNodiUsers.find((user) => user.id === userId);
     commitPageShares((current) => {
       const record = current[pageId];
       if (!record) return current;
@@ -1348,33 +1644,30 @@ function App() {
     if (targetUser) setNotice(`${targetUser.name}님의 페이지 접근 권한을 제거했어요`);
   };
 
-  const createChildPage = (source: "slash" | "sidebar" = "slash", requestedFolderId?: string | null) => {
-    if (pageSettings.lockPage) {
+  const createPage = (source: "slash" | "sidebar" = "slash", requestedFolderId?: string | null) => {
+    const createsChildPageBlock = source === "slash";
+    if (createsChildPageBlock && pageSettings.lockPage) {
       setNotice("페이지 잠금을 해제한 뒤 하위 페이지를 만들 수 있어요");
       return;
     }
 
     const pageId = makeId("page");
     const pageTitle = "제목 없음";
-    const pageBlock = {
-      type: "childPage",
-      props: { pageId, title: pageTitle },
-    } as unknown as PartialBlock;
-
-    if (source === "slash") {
+    if (createsChildPageBlock) {
+      const pageBlock = {
+        type: "childPage",
+        props: { pageId, title: pageTitle },
+      } as unknown as PartialBlock;
       insertOrUpdateBlockForSlashMenu(editor as unknown as BlockNoteEditor<any, any, any>, pageBlock);
-    } else {
-      const lastBlock = editor.document.at(-1);
-      if (lastBlock) editor.insertBlocks([pageBlock], lastBlock, "after");
     }
 
     const now = new Date().toISOString();
-    const parentId = currentPageIdRef.current;
-    const parent = pagesRef.current[parentId];
+    const parentId = createsChildPageBlock ? currentPageIdRef.current : null;
+    const parent = parentId ? pagesRef.current[parentId] : null;
     const folderId = requestedFolderId !== undefined
       ? requestedFolderId
-      : source === "slash"
-        ? parent.folderId
+      : createsChildPageBlock
+        ? parent?.folderId ?? null
         : null;
     const nextOrder = getNextSidebarOrder(pagesRef.current, foldersRef.current, folderId);
     const nextPage: StoredPage = {
@@ -1390,19 +1683,24 @@ function App() {
       createdAt: now,
       updatedAt: now,
     };
-    commitPages({
-      ...pagesRef.current,
-      [parentId]: {
+    const nextPages = { ...pagesRef.current };
+    if (createsChildPageBlock && parentId && parent) {
+      nextPages[parentId] = {
         ...parent,
         blocks: editor.document as unknown as PartialBlock[],
         updatedAt: now,
-      },
+      };
+    }
+    commitPages({
+      ...nextPages,
       [pageId]: nextPage,
     });
     setRightPanel(null);
     setSidebarCreateMenuOpen(false);
     if (source === "sidebar") {
       openPage(pageId);
+      setStarterDockPageId(pageId);
+      setSelectedStarterPreset(null);
     } else {
       setDrawerPageId(pageId);
     }
@@ -1449,10 +1747,20 @@ function App() {
   });
 
   useEffect(() => {
-    if (!notice) return;
-    const timer = window.setTimeout(() => setNotice(null), 2400);
+    if (!notice) {
+      setNoticeClosing(false);
+      return;
+    }
+    setNoticeClosing(false);
+    const timer = window.setTimeout(() => setNoticeClosing(true), 2200);
     return () => window.clearTimeout(timer);
   }, [notice]);
+
+  useEffect(() => {
+    if (!notice || !noticeClosing) return;
+    const timer = window.setTimeout(() => setNotice(null), 220);
+    return () => window.clearTimeout(timer);
+  }, [notice, noticeClosing]);
 
   useEffect(() => {
     const showAppNotice = (event: Event) => setNotice((event as CustomEvent<string>).detail);
@@ -1526,30 +1834,28 @@ function App() {
     }
   }, [inboxNotifications]);
 
-  const applyTemplate = (template: "daily" | "brainstorm") => {
-    const blocks: PartialBlock[] =
-      template === "daily"
-        ? [
-            { type: "heading", props: { level: 2 }, content: "오늘의 초점" },
-            { type: "checkListItem", props: { checked: false }, content: "" },
-            { type: "heading", props: { level: 2 }, content: "메모" },
-            { type: "paragraph", content: "" },
-            { type: "heading", props: { level: 2 }, content: "하루 회고" },
-            { type: "bulletListItem", content: "잘한 일" },
-            { type: "bulletListItem", content: "내일의 나에게" },
-          ]
-        : [
-            { type: "heading", props: { level: 2 }, content: "문제" },
-            { type: "paragraph", content: "" },
-            { type: "heading", props: { level: 2 }, content: "아이디어" },
-            { type: "bulletListItem", content: "" },
-            { type: "heading", props: { level: 2 }, content: "다음 행동" },
-            { type: "checkListItem", props: { checked: false }, content: "" },
-          ];
+  const dismissStarterDock = () => {
+    setStarterDockPageId(null);
+    setSelectedStarterPreset(null);
+  };
 
+  const dismissStarterDockForCurrentPage = () => {
+    if (starterDockPageId === currentPageIdRef.current) dismissStarterDock();
+  };
+
+  const startWithSelectedPreset = () => {
+    if (!selectedStarterPreset) return;
+    const preset = starterPresets.find((item) => item.id === selectedStarterPreset);
+    if (!preset) return;
+
+    const blocks = JSON.parse(JSON.stringify(
+      preset.blocks.length > 0 ? preset.blocks : [{ type: "paragraph", content: "" }],
+    )) as PartialBlock[];
     editor.replaceBlocks(editor.document, blocks);
-    setTitle(template === "daily" ? "오늘의 기록" : "아이디어 스케치");
-    setNotice("템플릿을 적용했어요");
+    setTitle(preset.pageTitle.trim() || "제목 없음");
+    setNotice(`“${preset.name}” 프리셋을 적용했어요`);
+    dismissStarterDock();
+    window.requestAnimationFrame(() => editor.focus());
   };
 
   const exportJson = () => {
@@ -1589,6 +1895,11 @@ function App() {
   };
 
   const copyPageLink = async () => {
+    if (currentPageIdRef.current === ROOT_PAGE_ID) {
+      setRightPanel(null);
+      setNotice("개인 홈은 외부에 공유할 수 없어요");
+      return;
+    }
     try {
       await navigator.clipboard.writeText(window.location.href);
       setNotice("이 페이지의 링크를 복사했어요");
@@ -1603,7 +1914,15 @@ function App() {
   };
 
   const toggleFavorite = () => {
+    if (!authUser) {
+      setAuthDialogMode("login");
+      return;
+    }
     const pageId = currentPageIdRef.current;
+    if (pageId === ROOT_PAGE_ID) {
+      setNotice("개인 홈은 즐겨찾기 대상에 포함되지 않아요");
+      return;
+    }
     const page = pagesRef.current[pageId];
     if (!page) return;
     const favoritedAt = page.favoritedAt ? null : new Date().toISOString();
@@ -1820,7 +2139,7 @@ function App() {
     if (target.kind === "folder" && !targetFolder) return;
     const targetFolderId = target.kind === "page"
       ? getPageSidebarParentId(targetPage!, foldersRef.current)
-      : target.kind === "folder" && target.placement === "inside"
+      : target.kind === "folder" && (target.placement === "start" || target.placement === "inside")
         ? target.folderId
         : target.kind === "folder"
           ? targetFolder?.parentId ?? null
@@ -1836,6 +2155,8 @@ function App() {
       const targetIndex = destinationItems.findIndex((item) => item.kind === "page" && item.id === target.pageId);
       if (targetIndex < 0) return;
       insertionIndex = targetIndex + (target.placement === "after" ? 1 : 0);
+    } else if (target.kind === "folder" && target.placement === "start") {
+      insertionIndex = 0;
     } else if (target.kind === "folder" && target.placement !== "inside") {
       const targetIndex = destinationItems.findIndex((item) => item.kind === "folder" && item.id === target.folderId);
       if (targetIndex < 0) return;
@@ -1909,6 +2230,38 @@ function App() {
     draggedPageId: string,
   ) => {
     const hitElement = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+    const folderStartDropTarget = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-sidebar-folder-id]"),
+    )
+      .filter((folderElement) => {
+        const folderRow = folderElement.querySelector<HTMLElement>(":scope > [data-sidebar-folder-row-id]");
+        const childList = folderElement.querySelector<HTMLElement>(":scope > .sidebar-folder-pages");
+        if (!folderRow || !childList) return false;
+        const folderRowRect = folderRow.getBoundingClientRect();
+        const childListRect = childList.getBoundingClientRect();
+        const firstChildRect = childList.firstElementChild?.getBoundingClientRect();
+        const folderRect = folderElement.getBoundingClientRect();
+        const startCorridorTop = folderRowRect.bottom;
+        const startCorridorBottom = firstChildRect
+          ? firstChildRect.top + firstChildRect.height / 2
+          : childListRect.top + Math.min(14, childListRect.height);
+        return clientY >= startCorridorTop
+          && clientY <= startCorridorBottom
+          && clientX >= folderRect.left
+          && clientX <= folderRect.right;
+      })
+      .sort((first, second) => (
+        Number(second.dataset.sidebarFolderDepth ?? 0) - Number(first.dataset.sidebarFolderDepth ?? 0)
+      ))[0];
+    const folderStartDropTargetId = folderStartDropTarget?.dataset.sidebarFolderId;
+    if (folderStartDropTargetId) {
+      setSidebarDropTarget({
+        kind: "folder",
+        folderId: folderStartDropTargetId,
+        placement: "start",
+      });
+      return;
+    }
     const targetPageElement = hitElement?.closest<HTMLElement>("[data-sidebar-page-id]");
     const targetPageId = targetPageElement?.dataset.sidebarPageId;
     if (targetPageId && targetPageId !== draggedPageId) {
@@ -1923,12 +2276,10 @@ function App() {
     const targetFolderRow = hitElement?.closest<HTMLElement>("[data-sidebar-folder-row-id]");
     const targetFolderId = targetFolderRow?.dataset.sidebarFolderRowId;
     if (targetFolderId) {
-      const targetRect = targetFolderRow.getBoundingClientRect();
-      const pointerRatio = Math.max(0, Math.min(1, (clientY - targetRect.top) / Math.max(1, targetRect.height)));
       setSidebarDropTarget({
         kind: "folder",
         folderId: targetFolderId,
-        placement: pointerRatio < .3 ? "before" : pointerRatio > .7 ? "after" : "inside",
+        placement: "inside",
       });
       return;
     }
@@ -1941,7 +2292,7 @@ function App() {
       setSidebarDropTarget(siblingTarget);
       return;
     }
-    if (hitElement?.closest(".sidebar-unfiled-pages, .pages-section > .section-label")) {
+    if (hitElement?.closest(".sidebar-unfiled-pages")) {
       setSidebarDropTarget({ kind: "unfiled" });
       return;
     }
@@ -2732,6 +3083,18 @@ function App() {
     if (!contentElement) return;
     const contentRect = contentElement.getBoundingClientRect();
     const isBlockMargin = event.clientX < contentRect.left - 6 || event.clientX > contentRect.right + 6;
+    const inlineTextContent = target.closest<HTMLElement>(".bn-inline-content");
+    const startsInsideWrittenText = Boolean(
+      !isBlockMargin
+      && inlineTextContent
+      && !target.closest("[contenteditable='false']")
+      && inlineTextContent.textContent?.trim(),
+    );
+    if (startsInsideWrittenText) {
+      // 여러 줄의 텍스트를 선택하는 동안 세로 이동이 커지더라도
+      // 블록 marquee 선택으로 전환하지 않고 네이티브 텍스트 선택을 유지한다.
+      return;
+    }
     const isInlineWhitespace = !isBlockMargin
       && !target.closest(".database-block, [contenteditable='false']")
       && !isPointOverRenderedText(contentElement, event.clientX, event.clientY);
@@ -2997,11 +3360,93 @@ function App() {
     window.requestAnimationFrame(() => editor.focus());
   };
 
+  const hasNativeEditorTextSelection = () => {
+    const selection = window.getSelection();
+    const editorRoot = editorContextRef.current;
+    if (
+      !selection
+      || !editorRoot
+      || selection.rangeCount === 0
+      || selection.isCollapsed
+      || selection.toString().length === 0
+      || !selection.anchorNode
+      || !selection.focusNode
+    ) {
+      return false;
+    }
+
+    return editorRoot.contains(selection.anchorNode)
+      && editorRoot.contains(selection.focusNode);
+  };
+
+  const handleEditorCut = (event: ReactClipboardEvent<HTMLDivElement>) => {
+    // 텍스트를 드래그해 선택한 상태에서는 BlockNote/브라우저의 기본
+    // 잘라내기를 그대로 사용한다. 이전 블록 선택 상태가 남아 있더라도
+    // 네이티브 텍스트 선택을 우선해야 현재 문장만 정확히 잘린다.
+    if (hasNativeEditorTextSelection()) {
+      if (blockSelectionModeRef.current) {
+        window.setTimeout(clearBlockSelection, 0);
+      }
+      return;
+    }
+
+    const eventTarget = event.target as HTMLElement;
+    const activeElement = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const isNativeFormControl = Boolean(
+      eventTarget.closest("input, textarea, select")
+      || activeElement?.closest("input, textarea, select"),
+    );
+    if (isNativeFormControl) return;
+
+    let blockIds = selectedBlockIdsRef.current;
+    if (!blockSelectionModeRef.current || blockIds.length === 0) {
+      try {
+        // 선택 범위 없이 텍스트 커서만 있는 상태에서는 현재 작성 중인
+        // 블록 하나를 잘라낸다. 블록을 먼저 선택할 필요가 없다.
+        blockIds = [editor.getTextCursorPosition().block.id];
+      } catch {
+        return;
+      }
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    if (pageSettings.lockPage) {
+      setNotice("잠긴 페이지에서는 블록을 잘라낼 수 없어요");
+      return;
+    }
+
+    const normalizedIds = normalizeBlockIds(blockIds);
+    type EditorBlock = NonNullable<ReturnType<typeof editor.getBlock>>;
+    const blocks = normalizedIds
+      .map((blockId) => editor.getBlock(blockId))
+      .filter((block): block is EditorBlock => block !== undefined);
+    if (blocks.length === 0) return;
+
+    try {
+      const clipboardBlocks = blocks as unknown as PartialBlock[];
+      const markdown = editor.blocksToMarkdownLossy(clipboardBlocks);
+      const externalHtml = editor.blocksToHTMLLossy(clipboardBlocks);
+      const blockNoteHtml = editor.blocksToFullHTML(clipboardBlocks);
+      event.clipboardData.clearData();
+      event.clipboardData.setData("blocknote/html", blockNoteHtml);
+      event.clipboardData.setData("text/html", externalHtml);
+      event.clipboardData.setData("text/plain", markdown);
+      removeBlocks(normalizedIds);
+      setNotice(`${blocks.length}개 블록을 잘라냈어요`);
+    } catch {
+      setNotice("블록을 클립보드에 복사하지 못했어요");
+    }
+  };
+
   const handleEditorKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement;
     const isEditorEvent = Boolean(target.closest(".bn-editor"));
     if (pageSettings.lockPage || (!isEditorEvent && !blockSelectionModeRef.current)) return;
     const hasPrimaryModifier = event.metaKey || event.ctrlKey;
+    const isNativeTextControl = Boolean(target.closest("input, textarea, select"));
     let cursorBlockId: string | undefined;
     try {
       cursorBlockId = editor.getTextCursorPosition().block.id;
@@ -3021,10 +3466,20 @@ function App() {
       }
       return;
     }
-    if (hasPrimaryModifier && event.key.toLowerCase() === "a" && blockId && !event.shiftKey && !event.altKey) {
+    if (
+      hasPrimaryModifier
+      && event.key.toLowerCase() === "a"
+      && !event.shiftKey
+      && !event.altKey
+      && !isNativeTextControl
+    ) {
+      const orderedBlockIds = getOrderedBlockIds();
+      if (orderedBlockIds.length === 0) return;
       event.preventDefault();
       event.stopPropagation();
-      selectSingleBlock(blockId);
+      window.getSelection()?.removeAllRanges();
+      setBlockSelectionState(orderedBlockIds, orderedBlockIds[0]);
+      setFocusedBlockId(orderedBlockIds[orderedBlockIds.length - 1]);
       return;
     }
     if (!blockSelectionModeRef.current || selectedBlockIds.length === 0) return;
@@ -3128,10 +3583,11 @@ function App() {
             return null;
           }
           const selectionGap = Math.min(1, rect.height / 4);
+          const selectionHorizontalInset = currentPageId === ROOT_PAGE_ID ? 0 : 7;
           const selectionRect = {
-            left: rect.left - 7,
+            left: rect.left - selectionHorizontalInset,
             top: rect.top + selectionGap,
-            width: rect.width + 14,
+            width: rect.width + selectionHorizontalInset * 2,
             height: Math.max(2, rect.height - selectionGap * 2),
           };
           overlay.style.left = `${selectionRect.left}px`;
@@ -3177,7 +3633,8 @@ function App() {
           }
           const markerWidth = marker.offsetWidth || 36;
           const markerCenter = rect.top + Math.min(rect.height / 2, 18);
-          marker.style.left = `${Math.min(window.innerWidth - markerWidth - 10, rect.right + 8)}px`;
+          const markerOffset = 13;
+          marker.style.left = `${Math.min(window.innerWidth - markerWidth - 10, rect.right + markerOffset)}px`;
           marker.style.top = `${Math.max(visibleTop + 16, Math.min(visibleBottom - 16, markerCenter))}px`;
           marker.dataset.positioned = "true";
         });
@@ -3215,6 +3672,63 @@ function App() {
       window.removeEventListener("resize", schedulePosition);
     };
   }, [blockComments, currentPageId, selectedBlockIds]);
+
+  useLayoutEffect(() => {
+    const menuState = blockSelectionActionMenu;
+    const menu = blockSelectionActionMenuRef.current;
+    if (!menuState || !menu) return;
+
+    const viewportPadding = 12;
+    const triggerGap = 6;
+    const availableBelow = Math.max(
+      0,
+      window.innerHeight - viewportPadding - menuState.anchor.bottom - triggerGap,
+    );
+    const availableAbove = Math.max(
+      0,
+      menuState.anchor.top - triggerGap - viewportPadding,
+    );
+    // Measure the untransformed layout size. getBoundingClientRect() includes
+    // the opening scale animation and feeding that value back into max-height
+    // causes a shrinking render loop while the menu is opening.
+    const desiredHeight = menu.scrollHeight;
+    const placement = desiredHeight <= availableBelow
+      ? "bottom"
+      : desiredHeight <= availableAbove
+        ? "top"
+        : availableAbove > availableBelow
+          ? "top"
+          : "bottom";
+    const maxHeight = desiredHeight;
+    const menuWidth = menu.offsetWidth;
+    const x = Math.max(
+      viewportPadding,
+      Math.min(
+        menuState.anchor.right - menuWidth,
+        window.innerWidth - viewportPadding - menuWidth,
+      ),
+    );
+    const desiredY = placement === "top"
+      ? menuState.anchor.top - triggerGap - maxHeight
+      : menuState.anchor.bottom + triggerGap;
+    const y = Math.max(
+      viewportPadding,
+      Math.min(desiredY, window.innerHeight - viewportPadding - maxHeight),
+    );
+
+    setBlockSelectionActionMenu((current) => {
+      if (!current || current.kind !== menuState.kind) return current;
+      if (
+        Math.abs(current.x - x) < .5
+        && Math.abs(current.y - y) < .5
+        && Math.abs(current.maxHeight - maxHeight) < .5
+        && current.placement === placement
+      ) {
+        return current;
+      }
+      return { ...current, x, y, maxHeight, placement };
+    });
+  }, [blockSelectionActionMenuPositionKey]);
 
   useEffect(() => {
     document.documentElement.classList.toggle("is-nodi-block-dragging", isBlockDragging);
@@ -3357,9 +3871,70 @@ function App() {
   };
 
   const currentPage = pages[currentPageId] ?? rootPage;
-  const currentNodiUser = getCurrentNodiUser(userName);
+  const localSaveLabel = localSaveState === "saving"
+    ? "저장 중"
+    : localSaveState === "error"
+      ? "저장 실패"
+      : "저장됨";
+  const LocalSaveIcon = localSaveState === "saving" ? LoaderCircle : HardDrive;
+  const isAuthenticated = Boolean(authUser);
+  const currentNodiUser = useMemo(() => authUser ? {
+    ...authUser,
+    avatarColor: authUser.avatarColor as NodiAvatarColor,
+  } : {
+    id: "guest:local",
+    name: "게스트",
+    email: "guest@nodi.local",
+    avatarColor: "gray" as const,
+    role: "member" as const,
+  }, [authUser]);
+  const registeredNodiUsers = useMemo(() => {
+    const approvedUsers = readRegistrationRequests()
+      .filter((request) => request.status === "approved")
+      .map((request) => ({
+        id: request.id,
+        name: request.name,
+        email: request.email,
+        avatarColor: "gray" as const,
+        role: "member" as const,
+      }));
+    const localUsers = readApprovedLocalUsers().map((user) => ({
+      ...user,
+      avatarColor: user.avatarColor as NodiAvatarColor,
+    }));
+    const knownIds = new Set(REGISTERED_NODI_USERS.map((user) => user.id));
+    const knownEmails = new Set(REGISTERED_NODI_USERS.map((user) => user.email.toLocaleLowerCase()));
+    const requestUsers = approvedUsers.filter((user) => (
+      !knownIds.has(user.id) && !knownEmails.has(user.email.toLocaleLowerCase())
+    ));
+    const combinedUsers = [
+      ...REGISTERED_NODI_USERS,
+      ...localUsers,
+      ...requestUsers,
+    ];
+    return combinedUsers.filter((user, index) => (
+      combinedUsers.findIndex((candidate) => (
+        candidate.id === user.id
+        || candidate.email.toLocaleLowerCase() === user.email.toLocaleLowerCase()
+      )) === index
+    ));
+  }, [registrationDirectoryRevision]);
   const currentPageShare = pageShares[currentPageId];
-  const canCommentOnCurrentPage = pageSettings.publicAccess || Boolean(currentPageShare?.members.length);
+  const isCurrentPageOwner = !currentPageShare || currentPageShare.ownerId === currentNodiUser.id;
+  const isInvitedNodiMember = Boolean(currentPageShare?.members.some((member) => (
+    member.userId === currentNodiUser.id
+    && registeredNodiUsers.some((user) => user.id === member.userId)
+  )));
+  const isSharedWithNodiMember = Boolean(currentPageShare?.members.length);
+  const canCommentOnCurrentPage = Boolean(
+    isAuthenticated
+    &&
+    currentPageShare
+    && ((isCurrentPageOwner && isSharedWithNodiMember) || isInvitedNodiMember),
+  );
+  const commentDisabledReason = isCurrentPageOwner
+    ? "Nodi 회원에게 페이지를 공유하면 댓글을 작성할 수 있어요."
+    : "이 페이지에 초대된 Nodi 회원만 댓글을 작성할 수 있어요.";
   const currentPageCommentThreads = Object.values(blockComments).filter((thread) => thread.pageId === currentPageId);
   const pageCommentCounts = Object.values(blockComments).reduce<Record<string, number>>((counts, thread) => {
     if (thread.resolvedAt) return counts;
@@ -3384,9 +3959,9 @@ function App() {
     setBlockSelectionActionMenu(null);
   };
 
-  const addBlockComment = (blockId: string, body: string) => {
+  const addBlockComment = (blockId: string, body: string, parentId: string | null) => {
     if (!canCommentOnCurrentPage) {
-      setNotice("페이지를 공유한 뒤 댓글을 남길 수 있어요");
+      setNotice(commentDisabledReason);
       return;
     }
     const block = editor.getBlock(blockId);
@@ -3400,8 +3975,15 @@ function App() {
       const previous = Object.values(current).find((thread) => (
         thread.pageId === currentPageId && thread.blockId === blockId
       ));
+      const requestedParent = parentId
+        ? previous?.messages.find((message) => message.id === parentId)
+        : undefined;
+      const normalizedParentId = requestedParent
+        ? requestedParent.parentId ?? requestedParent.id
+        : null;
       const message = {
         id: makeId("comment"),
+        parentId: normalizedParentId,
         authorId: currentNodiUser.id,
         authorName: currentNodiUser.name,
         authorEmail: currentNodiUser.email,
@@ -3445,7 +4027,10 @@ function App() {
       if (!thread) return current;
       const targetComment = thread.messages.find((message) => message.id === commentId);
       if (!targetComment || targetComment.authorId !== currentNodiUser.id) return current;
-      const messages = thread.messages.filter((message) => message.id !== commentId);
+      const messages = thread.messages.filter((message) => (
+        message.id !== commentId
+        && (targetComment.parentId || message.parentId !== commentId)
+      ));
       if (messages.length === 0) {
         const next = { ...current };
         delete next[threadId];
@@ -3480,17 +4065,22 @@ function App() {
     setNotice(resolved ? "댓글을 해결로 표시했어요" : "댓글을 다시 열었어요");
   };
 
-  const isHomePage = currentPageId === ROOT_PAGE_ID;
-  const isFavorite = Boolean(currentPage.favoritedAt);
+  const isHomePage = isAuthenticated && currentPageId === ROOT_PAGE_ID;
+  const isFavorite = !isHomePage && Boolean(currentPage.favoritedAt);
   const unreadInboxCount = inboxNotifications.filter((notification) => notification.unread).length;
   const sharedPageCount = Object.values(pageShares).filter((record) => (
-    record.ownerId === currentNodiUser.id
-    && record.members.length > 0
+    (
+      (record.ownerId === currentNodiUser.id && record.members.length > 0)
+      || (
+        record.ownerId !== currentNodiUser.id
+        && record.members.some((member) => member.userId === currentNodiUser.id)
+      )
+    )
     && Boolean(pages[record.pageId])
     && !pages[record.pageId]?.archived
   )).length;
   const favoritePages = Object.values(pages)
-    .filter((page) => Boolean(page.favoritedAt))
+    .filter((page) => page.id !== ROOT_PAGE_ID && Boolean(page.favoritedAt))
     .sort((first, second) => (second.favoritedAt ?? "").localeCompare(first.favoritedAt ?? ""));
   const homeRecentPages = Object.values(pages)
     .filter((page) => page.id !== ROOT_PAGE_ID && !page.archived)
@@ -3571,13 +4161,45 @@ function App() {
       return;
     }
     const rect = trigger.getBoundingClientRect();
-    const menuWidth = kind === "transform" ? 232 : 288;
-    const estimatedHeight = kind === "transform" ? 326 : 224;
-    const x = Math.min(Math.max(12, rect.right - menuWidth), window.innerWidth - menuWidth - 12);
-    const y = rect.bottom + estimatedHeight + 8 <= window.innerHeight
-      ? rect.bottom + 6
-      : Math.max(12, rect.top - estimatedHeight - 6);
-    setBlockSelectionActionMenu((current) => current?.kind === kind ? null : { kind, x, y });
+    const menuWidth = kind === "transform" ? 232 : 187;
+    const estimatedHeight = kind === "transform" ? 326 : 340;
+    const viewportPadding = 12;
+    const triggerGap = 6;
+    const availableBelow = Math.max(
+      0,
+      window.innerHeight - viewportPadding - rect.bottom - triggerGap,
+    );
+    const availableAbove = Math.max(0, rect.top - triggerGap - viewportPadding);
+    const placement = estimatedHeight <= availableBelow
+      ? "bottom"
+      : estimatedHeight <= availableAbove
+        ? "top"
+        : availableAbove > availableBelow
+          ? "top"
+          : "bottom";
+    const maxHeight = estimatedHeight;
+    const x = Math.max(
+      viewportPadding,
+      Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - viewportPadding),
+    );
+    const desiredY = placement === "top"
+      ? rect.top - maxHeight - triggerGap
+      : rect.bottom + triggerGap;
+    const y = Math.max(
+      viewportPadding,
+      Math.min(desiredY, window.innerHeight - viewportPadding - maxHeight),
+    );
+    const anchor = {
+      left: rect.left,
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+    };
+    setBlockSelectionActionMenu((current) => (
+      current?.kind === kind
+        ? null
+        : { kind, x, y, placement, maxHeight, anchor }
+    ));
   };
   const transformSelectedBlocks = (option: typeof BLOCK_TRANSFORM_OPTIONS[number]) => {
     if (!canTransformSelectedBlocks || pageSettings.lockPage) return;
@@ -3702,7 +4324,7 @@ function App() {
                 : renderSidebarPage(item.page, true)
             ))}
             {!hasChildren && (
-              <button className="empty-folder-action" type="button" onClick={() => createChildPage("sidebar", folder.id)}>
+              <button className="empty-folder-action" type="button" onClick={() => createPage("sidebar", folder.id)}>
                 <Plus size={13} /> 페이지 추가
               </button>
             )}
@@ -3721,11 +4343,10 @@ function App() {
         inert={sidebarOpen ? undefined : true}
       >
         <div className="workspace-head">
-          <button className="workspace-switcher" type="button">
+          <div className="workspace-brand" aria-label="Nodi">
             <span className="workspace-mark">N</span>
-            <span className="workspace-name">나의 공간</span>
-            <ChevronsUpDown size={14} />
-          </button>
+            <strong className="workspace-name">Nodi</strong>
+          </div>
           <button
             className="icon-button quiet"
             type="button"
@@ -3738,19 +4359,20 @@ function App() {
           </button>
         </div>
 
-        <button
-          className="search-trigger"
-          type="button"
-          aria-haspopup="dialog"
-          aria-expanded={workspaceSearchOpen}
-          onClick={openWorkspaceSearch}
-        >
-          <Search size={16} />
-          <span>검색</span>
-          <kbd>{primaryShortcutLabel} K</kbd>
-        </button>
+        {isAuthenticated && <>
+          <button
+            className="search-trigger"
+            type="button"
+            aria-haspopup="dialog"
+            aria-expanded={workspaceSearchOpen}
+            onClick={openWorkspaceSearch}
+          >
+            <Search size={16} />
+            <span>검색</span>
+            <kbd>{primaryShortcutLabel} K</kbd>
+          </button>
 
-        <nav className="main-nav">
+          <nav className="main-nav">
           <NavItem
             icon={<Home size={17} />}
             label="홈"
@@ -3830,38 +4452,39 @@ function App() {
             )}
           </div>
           <NavItem
-            icon={<LayoutGrid size={17} />}
+            icon={<Share2 size={17} />}
             label="공유 페이지"
             count={sharedPageCount > 0 ? String(sharedPageCount) : undefined}
             active={workspaceSection === "shared"}
             onClick={openSharedPages}
           />
-        </nav>
+          </nav>
 
-        <div className="nav-section favorites-section">
-          <div className="section-label"><span>즐겨찾기</span></div>
-          {favoritePages.length > 0 && (
-            <div className="sidebar-scroll-shell favorites-scroll-shell">
-              <div ref={favoritesScrollRef} className="favorites-list sidebar-native-scroll" aria-label="즐겨찾기 페이지">
-                {favoritePages.map((page) => (
-                  <NavItem
-                    key={page.id}
-                    icon={<span className="nav-emoji">{page.settings.icon || "📄"}</span>}
-                    label={page.title || "제목 없음"}
-                    active={workspaceSection === "pages" && currentPageId === page.id}
-                    onClick={() => openPage(page.id)}
-                  />
-                ))}
+          <div className="nav-section favorites-section">
+            <div className="section-label"><span>즐겨찾기</span></div>
+            {favoritePages.length > 0 && (
+              <div className="sidebar-scroll-shell favorites-scroll-shell">
+                <div ref={favoritesScrollRef} className="favorites-list sidebar-native-scroll" aria-label="즐겨찾기 페이지">
+                  {favoritePages.map((page) => (
+                    <NavItem
+                      key={page.id}
+                      icon={<span className="nav-emoji">{page.settings.icon || "📄"}</span>}
+                      label={page.title || "제목 없음"}
+                      active={workspaceSection === "pages" && currentPageId === page.id}
+                      onClick={() => openPage(page.id)}
+                    />
+                  ))}
+                </div>
+                <SidebarScrollOverlay targetRef={favoritesScrollRef} edgeFades />
               </div>
-              <SidebarScrollOverlay targetRef={favoritesScrollRef} edgeFades />
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        </>}
 
         <div className="sidebar-scroll-shell pages-section-scroll-shell">
           <div ref={pagesScrollRef} className={`nav-section pages-section sidebar-native-scroll ${sidebarFolderDropTarget?.kind === "root" ? "is-folder-root-drop-target" : ""}`}>
             <div className="section-label">
-              <span>개인 페이지</span>
+              <span>페이지</span>
               <div className="sidebar-create-wrap">
                 <button
                   type="button"
@@ -3877,9 +4500,9 @@ function App() {
                 {sidebarCreateMenuOpen && (
                   <div className="sidebar-create-menu sidebar-floating-menu" role="menu">
                     <span>새로 만들기</span>
-                    <button type="button" role="menuitem" onClick={() => createChildPage("sidebar", null)}>
+                    <button type="button" role="menuitem" onClick={() => createPage("sidebar", null)}>
                       <FileText size={15} />
-                      <span><strong>페이지</strong><small>현재 페이지 아래에 추가</small></span>
+                      <span><strong>페이지</strong><small>페이지 목록에 독립적으로 추가</small></span>
                     </button>
                     <button type="button" role="menuitem" onClick={() => createFolder(null)}>
                       <FolderPlus size={15} />
@@ -3890,42 +4513,68 @@ function App() {
               </div>
             </div>
 
-            {personalPageCount === 0 && Object.keys(folders).length === 0
+            {isAuthenticated && personalPageCount === 0 && Object.keys(folders).length === 0
               ? <span className="empty-page-nav">+ 버튼이나 /페이지로 시작해보세요</span>
-              : <>
+              : (
                 <div
                   className={`sidebar-unfiled-pages ${sidebarDraggedPageId ? "is-drag-active" : ""} ${sidebarPageDropTarget?.kind === "unfiled" ? "is-drop-target" : ""}`}
                 >
+                  {!isAuthenticated && (
+                    <NavItem
+                      icon={<span className="nav-emoji">{rootPage.settings.icon || "📄"}</span>}
+                      label={rootPage.title || "로컬 메모"}
+                      active={currentPageId === ROOT_PAGE_ID}
+                      onClick={() => openPage(ROOT_PAGE_ID)}
+                    />
+                  )}
                   {rootSidebarItems.map((item) => (
                     item.kind === "folder"
                       ? renderSidebarFolder(item.folder)
                       : renderSidebarPage(item.page)
                   ))}
                 </div>
-              </>}
+              )}
           </div>
           <SidebarScrollOverlay targetRef={pagesScrollRef} edgeFades />
         </div>
 
-        <div className="sidebar-footer">
-          <button type="button" className="footer-nav"><Settings size={16} /> 설정</button>
-          <button
-            type="button"
-            className="footer-nav theme-toggle"
-            role="switch"
-            aria-checked={isDarkMode}
-            aria-label={isDarkMode ? "라이트 모드로 전환" : "다크 모드로 전환"}
-            onClick={() => setAppTheme((theme) => theme === "dark" ? "light" : "dark")}
-          >
-            {isDarkMode ? <Sun size={16} /> : <Moon size={16} />}
-            <span>다크 모드</span>
-            <span className="theme-toggle-track" aria-hidden="true"><span /></span>
-          </button>
-          <div className="profile-row">
-            <div className="avatar">{userName.trim().charAt(0).toUpperCase() || "U"}</div>
-            <div><strong>{userName}</strong><span>Free plan</span></div>
-            <MoreHorizontal size={17} />
-          </div>
+        <div className={`sidebar-footer ${isAuthenticated ? "" : "is-guest"}`}>
+          {isAuthenticated ? <>
+            <button
+              type="button"
+              className="footer-nav theme-toggle"
+              role="switch"
+              aria-checked={isDarkMode}
+              aria-label={isDarkMode ? "라이트 모드로 전환" : "다크 모드로 전환"}
+              onClick={() => setAppTheme((theme) => theme === "dark" ? "light" : "dark")}
+            >
+              {isDarkMode ? <Sun size={16} /> : <Moon size={16} />}
+              <span>다크 모드</span>
+              <span className="theme-toggle-track" aria-hidden="true"><span /></span>
+            </button>
+            <div className="profile-row">
+              <NodiUserAvatar user={currentNodiUser} className="sidebar-profile-avatar" />
+              <div><strong>{userName}</strong></div>
+              <button
+                type="button"
+                className="profile-settings-trigger"
+                aria-label="프로필 설정 열기"
+                aria-haspopup="dialog"
+                aria-expanded={workspaceSettingsOpen}
+                onClick={() => setWorkspaceSettingsOpen(true)}
+              >
+                <MoreHorizontal size={17} />
+              </button>
+            </div>
+          </> : (
+            <section className="guest-auth-card" aria-label="게스트 계정">
+              <span className="guest-auth-icon"><HardDrive size={16} /></span>
+              <div>
+                <strong>게스트로 사용 중</strong>
+                <small>메모는 이 브라우저에 저장됩니다.</small>
+              </div>
+            </section>
+          )}
         </div>
       </aside>
 
@@ -3956,7 +4605,7 @@ function App() {
                 <span className="crumb-root" aria-current="page">홈</span>
               ) : (
                 <>
-                  <span className="crumb-root">개인 페이지</span>
+                  <span className="crumb-root">{isAuthenticated ? "개인 페이지" : "로컬 페이지"}</span>
                   {breadcrumbPages.map((page, index) => {
                     const isCurrentPage = index === breadcrumbPages.length - 1;
                     return (
@@ -3979,22 +4628,37 @@ function App() {
           <div className="topbar-actions">
             {workspaceSection === "shared" ? (
               <span className="shared-topbar-status"><Users size={15} /> Nodi 회원 공유 관리</span>
+            ) : isHomePage ? (
+              <span className="home-topbar-status"><Home size={15} /> 프라이빗 페이지</span>
             ) : (
               <>
-                <span className="save-state"><Cloud size={15} /> {savedAt}</span>
-                <button
-                  className={`icon-button ${isFavorite ? "is-favorite" : ""}`}
-                  type="button"
-                  aria-label={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
-                  aria-pressed={isFavorite}
-                  data-nodi-tooltip={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
-                  onClick={toggleFavorite}
+                <span
+                  className={`save-state is-${localSaveState}`}
+                  role="status"
+                  aria-live="polite"
+                  title={localSaveState === "error" ? "이 브라우저에 저장하지 못했습니다." : "이 브라우저에 저장됩니다."}
                 >
-                  <Star size={18} fill={isFavorite ? "currentColor" : "none"} />
-                </button>
-                <button className="icon-button" type="button" aria-label="공유" onClick={() => setRightPanel("share")}><Share2 size={18} /></button>
-                <button className="page-settings-trigger" type="button" aria-label="페이지 설정" onClick={() => setPageSettingsOpen(true)}><Settings2 size={16} /> 설정</button>
-                <button className="more-button" type="button" aria-label="더 보기" onClick={exportJson}><Download size={16} /> 내보내기</button>
+                  <LocalSaveIcon size={15} /> {localSaveLabel}
+                </span>
+                {isAuthenticated ? <>
+                  <button
+                    className={`icon-button ${isFavorite ? "is-favorite" : ""}`}
+                    type="button"
+                    aria-label={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
+                    aria-pressed={isFavorite}
+                    data-nodi-tooltip={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
+                    onClick={toggleFavorite}
+                  >
+                    <Star size={18} fill={isFavorite ? "currentColor" : "none"} />
+                  </button>
+                  <button className="icon-button" type="button" aria-label="공유" onClick={openSharePanel}><Share2 size={18} /></button>
+                  <button className="page-settings-trigger" type="button" aria-label="페이지 설정" onClick={openPageSettingsPanel}><Settings2 size={16} /> 설정</button>
+                  <button className="more-button" type="button" aria-label="더 보기" onClick={exportJson}><Download size={16} /> 내보내기</button>
+                </> : (
+                  <button className="guest-topbar-login" type="button" onClick={() => setAuthDialogMode("login")}>
+                    <LogIn size={15} /> 로그인
+                  </button>
+                )}
               </>
             )}
           </div>
@@ -4005,26 +4669,26 @@ function App() {
           <SharedPagesView
             pages={pages}
             pageShares={pageShares}
-            registeredUsers={REGISTERED_NODI_USERS}
+            registeredUsers={registeredNodiUsers}
             currentUser={currentNodiUser}
             commentCounts={pageCommentCounts}
             onOpenPage={openPage}
             onManageShare={(pageId) => {
               openPage(pageId);
-              setRightPanel("share");
+              openSharePanel();
             }}
           />
         ) : (
         <>
         <section ref={editorStageRef} className={`editor-stage ${isHomePage ? "is-home" : ""} ${pageSettings.fullWidth ? "is-wide" : ""} ${pageSettings.smallText ? "uses-small-text" : ""}`} onPointerDownCapture={handleEditorStagePointerDown}>
           {isArchived && <div className="archive-banner"><Archive size={15} /> 이 페이지는 보관됨 상태입니다.<button type="button" onClick={toggleArchive}>복원</button></div>}
-          <div className={`cover cover--${pageSettings.cover}`} aria-hidden="true"><div className="cover-orb orb-one" /><div className="cover-orb orb-two" /><div className="cover-grid" /></div>
+          {!isHomePage && <div className={`cover cover--${pageSettings.cover}`} aria-hidden="true"><div className="cover-orb orb-one" /><div className="cover-orb orb-two" /><div className="cover-grid" /></div>}
           <article className={`note-page ${isHomePage ? "home-note-page" : ""} ${pageSettings.fullWidth ? "page-wide" : ""}`} onContextMenu={(event) => openContextMenu(event, "page")}>
             {isHomePage ? (
               <div className="home-dashboard">
                 <section className="home-welcome-card" aria-labelledby="home-title">
                   <div className="home-welcome-main">
-                    <span className="home-kicker"><Sparkles size={14} /> 나만의 홈</span>
+                    <span className="home-kicker">나만의 홈</span>
                     <input
                       id="home-title"
                       ref={titleInputRef}
@@ -4036,7 +4700,7 @@ function App() {
                     />
                     <p>중요한 페이지를 한눈에 살펴보고, 오늘 필요한 생각을 바로 이어서 기록해보세요.</p>
                     <div className="home-welcome-actions">
-                      <button type="button" className="is-primary" onClick={() => createChildPage("sidebar", null)}>
+                      <button type="button" className="is-primary" onClick={() => createPage("sidebar", null)}>
                         <Plus size={15} /> 새 페이지
                       </button>
                       <button type="button" onClick={openWorkspaceSearch}>
@@ -4072,7 +4736,7 @@ function App() {
                         <div className="home-empty-panel">
                           <FileText size={18} />
                           <span>아직 작성한 페이지가 없어요.</span>
-                          <button type="button" onClick={() => createChildPage("sidebar", null)}>첫 페이지 만들기</button>
+                          <button type="button" onClick={() => createPage("sidebar", null)}>첫 페이지 만들기</button>
                         </div>
                       )}
                     </div>
@@ -4126,23 +4790,28 @@ function App() {
               </div>
             ) : (
               <>
-                <button className="page-emoji" type="button" aria-label="페이지 아이콘 설정" onClick={() => setPageSettingsOpen(true)}>{pageSettings.icon}</button>
+                {isAuthenticated
+                  ? <button className="page-emoji" type="button" aria-label="페이지 아이콘 설정" onClick={openPageSettingsPanel}>{pageSettings.icon}</button>
+                  : <span className="page-emoji" aria-hidden="true">{pageSettings.icon}</span>}
                 <input
                   ref={titleInputRef}
                   className="title-input"
                   value={title}
-                  onChange={(event) => setTitle(event.target.value)}
+                  onChange={(event) => {
+                    setTitle(event.target.value);
+                    dismissStarterDockForCurrentPage();
+                  }}
                   aria-label="페이지 제목"
                   placeholder="제목 없음"
                   disabled={pageSettings.lockPage}
                 />
-                {pageSettings.showProperties && <div className="page-properties" aria-label="페이지 속성">
-                  <div className="property property-updated"><Clock3 size={14} /><span>수정</span><strong>지금</strong></div>
+                {isAuthenticated && pageSettings.showProperties && <div className="page-properties" aria-label="페이지 속성">
+                  <div className="property property-updated"><Clock3 size={14} /><span>수정</span><RelativeUpdatedAt value={currentPage.updatedAt} /></div>
                   <div className="property property-status"><Hash size={14} /><span>상태</span><Select disabled={pageSettings.lockPage} value={pageSettings.status} onValueChange={(value) => setPageSettings({ ...pageSettings, status: value as PageSettings["status"] })} options={pageStatusOptions} ariaLabel="페이지 상태" className={`status-select ${pageSettings.status === "초안" ? "status-waiting" : pageSettings.status === "진행 중" ? "status-progress" : "status-done"}`} /></div>
                   <div className="property property-tags"><Hash size={14} /><span>태그</span><TagPicker value={pageSettings.tags} options={DEFAULT_TAG_OPTIONS} disabled={pageSettings.lockPage} compact onChange={(tags) => setPageSettings({ ...pageSettings, tags })} /></div>
                   <div className="property property-date"><Clock3 size={14} /><span>날짜</span><DatePicker compact disabled={pageSettings.lockPage} value={pageSettings.date} onChange={(date) => setPageSettings({ ...pageSettings, date })} ariaLabel="페이지 날짜" /></div>
                   <span className="page-property-separator" aria-hidden="true" />
-                  <button className="add-property" type="button" onClick={() => setPageSettingsOpen(true)}><Plus size={14} /> 속성 설정</button>
+                  <button className="add-property" type="button" onClick={openPageSettingsPanel}><Plus size={14} /> 속성 설정</button>
                 </div>}
               </>
             )}
@@ -4159,6 +4828,8 @@ function App() {
               onPointerUpCapture={finishEditorPointerInteraction}
               onPointerCancelCapture={finishEditorPointerInteraction}
               onKeyDownCapture={handleEditorKeyDown}
+              onCutCapture={handleEditorCut}
+              onInputCapture={dismissStarterDockForCurrentPage}
             >
               <div className="block-selection-gutter is-left" aria-hidden="true" />
               <div className="block-selection-gutter is-right" aria-hidden="true" />
@@ -4173,7 +4844,7 @@ function App() {
                   aria-hidden="true"
                 />
               ))}
-              {currentPageCommentThreads
+              {isAuthenticated && currentPageCommentThreads
                 .filter((thread) => !thread.resolvedAt && thread.messages.length > 0)
                 .map((thread) => (
                   <button
@@ -4313,7 +4984,7 @@ function App() {
                     <span>색상</span>
                     <ChevronDown size={12} />
                   </button>
-                  <button
+                  {isAuthenticated && <button
                     className="block-comment-toolbar-button"
                     type="button"
                     aria-label={selectedCommentCount > 0 ? `댓글 ${selectedCommentCount}개 열기` : "블록에 댓글 달기"}
@@ -4335,7 +5006,7 @@ function App() {
                     <MessageCircle size={15} />
                     <span>댓글</span>
                     {selectedCommentCount > 0 && <em>{selectedCommentCount}</em>}
-                  </button>
+                  </button>}
                   <button
                     type="button"
                     aria-label="블록 선택 해제"
@@ -4351,21 +5022,23 @@ function App() {
                 editor={editor}
                 onChange={() => {
                   if (loadingPageRef.current) return;
+                  dismissStarterDockForCurrentPage();
                   updatePage(currentPageIdRef.current, {
                     blocks: editor.document as unknown as PartialBlock[],
                   });
-                  setSavedAt("저장됨");
                 }}
                 onSelectionChange={syncEditorSelection}
                 theme={appTheme}
                 editable={!pageSettings.lockPage}
+                formattingToolbar={!isBlockSelectionMode}
+                linkToolbar={!isBlockSelectionMode}
                 slashMenu={false}
                 data-theming-css-variables-demo
               >
                 <SuggestionMenuController
                   triggerCharacter="/"
                   getItems={async (query) => filterSuggestionItems(
-                    getNodiSlashMenuItems(editor, () => createChildPage("slash")),
+                    getNodiSlashMenuItems(editor, () => createPage("slash")),
                     query,
                   )}
                 />
@@ -4388,20 +5061,19 @@ function App() {
 
       </main>
 
-      {activeCommentBlockId && (
+      {isAuthenticated && activeCommentBlockId && (
         <BlockCommentPanel
           key={`${currentPageId}:${activeCommentBlockId}`}
           pageTitle={title}
           blockPreview={activeCommentBlockPreview}
           thread={activeCommentThread}
           currentUser={currentNodiUser}
+          registeredUsers={registeredNodiUsers}
           canComment={canCommentOnCurrentPage}
-          onAddComment={(body) => addBlockComment(activeCommentBlockId, body)}
+          disabledReason={commentDisabledReason}
+          onAddComment={(body, parentId) => addBlockComment(activeCommentBlockId, body, parentId)}
           onDeleteComment={(commentId) => {
             if (activeCommentThread) deleteBlockComment(activeCommentThread.id, commentId);
-          }}
-          onResolve={() => {
-            if (activeCommentThread) setBlockCommentResolved(activeCommentThread.id, true);
           }}
           onReopen={() => {
             if (activeCommentThread) setBlockCommentResolved(activeCommentThread.id, false);
@@ -4409,20 +5081,22 @@ function App() {
           onClose={() => setActiveCommentBlockId(null)}
         />
       )}
-      {rightPanel === "share" ? (
-        <PageSharePanel
-          pageTitle={title}
-          pageLink={window.location.href}
-          isPublic={pageSettings.publicAccess}
-          members={pageShares[currentPageId]?.members ?? []}
-          registeredUsers={REGISTERED_NODI_USERS}
-          onPublicChange={(publicAccess) => setPageSettings({ ...pageSettings, publicAccess })}
-          onShare={(userId, permission) => sharePageWithMember(currentPageId, userId, permission)}
-          onPermissionChange={(userId, permission) => updatePageSharePermission(currentPageId, userId, permission)}
-          onRemoveMember={(userId) => removePageShareMember(currentPageId, userId)}
-          onClose={() => setRightPanel(null)}
-          onCopy={copyPageLink}
-        />
+      {isAuthenticated && (rightPanel === "share" ? (
+        !isHomePage ? (
+          <PageSharePanel
+            pageTitle={title}
+            pageLink={window.location.href}
+            isPublic={pageSettings.publicAccess}
+            members={pageShares[currentPageId]?.members ?? []}
+            registeredUsers={registeredNodiUsers}
+            onPublicChange={(publicAccess) => setPageSettings({ ...pageSettings, publicAccess })}
+            onShare={(userId, permission) => sharePageWithMember(currentPageId, userId, permission)}
+            onPermissionChange={(userId, permission) => updatePageSharePermission(currentPageId, userId, permission)}
+            onRemoveMember={(userId) => removePageShareMember(currentPageId, userId)}
+            onClose={() => setRightPanel(null)}
+            onCopy={copyPageLink}
+          />
+        ) : null
       ) : rightPanel ? (
         <QuickActionPanel
           type={rightPanel}
@@ -4431,7 +5105,7 @@ function App() {
           onCopy={copyPageLink}
           onDraft={addDraft}
         />
-      ) : null}
+      ) : null)}
       {sidebarContextMenu && (
         <SidebarItemContextMenu
           menu={sidebarContextMenu}
@@ -4458,7 +5132,7 @@ function App() {
           onToggleFolder={toggleFolder}
           onCreatePage={(folderId) => {
             setSidebarContextMenu(null);
-            createChildPage("sidebar", folderId);
+            createPage("sidebar", folderId);
           }}
           onCreateFolder={(parentId) => createFolder(parentId)}
           onDeleteFolder={removeFolder}
@@ -4490,8 +5164,9 @@ function App() {
         commentCount={contextMenu.kind === "block"
           ? currentPageCommentThreads.find((thread) => thread.blockId === contextMenu.blockId)?.messages.length ?? 0
           : 0}
-        commentsAvailable={contextMenu.kind === "block"
+        commentsAvailable={isAuthenticated && contextMenu.kind === "block"
           && (!selectedBlockIds.includes(contextMenu.blockId) || selectedBlockIds.length === 1)}
+        memberFeaturesAvailable={isAuthenticated}
         onAddBlock={addBlockAfter}
         onMoveBlock={moveContextBlock}
         onDuplicateBlock={duplicateBlock}
@@ -4499,7 +5174,8 @@ function App() {
         onComment={() => {
           if (contextMenu.kind === "block") openBlockComments(contextMenu.blockId);
         }}
-        onOpenSettings={() => { setContextMenu(null); setPageSettingsOpen(true); }}
+        shareAvailable={isAuthenticated && !isHomePage}
+        onOpenSettings={() => { setContextMenu(null); openPageSettingsPanel(); }}
         onCopyLink={() => { setContextMenu(null); void copyPageLink(); }}
         onToggleArchive={() => { setContextMenu(null); toggleArchive(); }}
         onExport={() => { setContextMenu(null); exportJson(); }}
@@ -4508,10 +5184,16 @@ function App() {
 
       {blockSelectionActionMenu && (
         <div
+          ref={blockSelectionActionMenuRef}
           className={`block-selection-action-menu is-${blockSelectionActionMenu.kind}`}
+          data-placement={blockSelectionActionMenu.placement}
           role="menu"
           aria-label={blockSelectionActionMenu.kind === "transform" ? "블록 전환" : "블록 색상"}
-          style={{ left: blockSelectionActionMenu.x, top: blockSelectionActionMenu.y }}
+          style={{
+            left: blockSelectionActionMenu.x,
+            top: blockSelectionActionMenu.y,
+            maxHeight: blockSelectionActionMenu.maxHeight,
+          }}
           onPointerDown={(event) => {
             event.preventDefault();
             event.stopPropagation();
@@ -4589,17 +5271,34 @@ function App() {
         </div>
       )}
 
-      {workspaceSection === "pages" && !isHomePage && (
-        <div className="template-dock">
-          <span className="dock-label">시작하기</span>
-          <button type="button" onClick={() => applyTemplate("daily")}><span>☀️</span> 데일리 노트</button>
-          <button type="button" onClick={() => applyTemplate("brainstorm")}><span>💡</span> 아이디어</button>
-          <button type="button" onClick={() => { editor.focus(); setNotice("새 블록을 작성해보세요"); }}><FileText size={15} /> 빈 페이지</button>
+      {isAuthenticated && workspaceSection === "pages" && !isHomePage && starterDockPageId === currentPageId && starterPresets.length > 0 && (
+        <div className="template-dock" role="group" aria-label="새 페이지 시작 프리셋">
+          <button
+            className="dock-start-button"
+            type="button"
+            disabled={!selectedStarterPreset}
+            onClick={startWithSelectedPreset}
+          >
+            시작하기
+          </button>
+          <span className="dock-separator" aria-hidden="true" />
+          {starterPresets.map((preset) => (
+            <button
+              className="dock-preset-button"
+              type="button"
+              key={preset.id}
+              aria-pressed={selectedStarterPreset === preset.id}
+              onClick={() => setSelectedStarterPreset(preset.id)}
+            >
+              <span>{preset.icon || "✨"}</span>
+              {preset.name}
+            </button>
+          ))}
         </div>
       )}
 
       <NodiTooltipLayer />
-      {workspaceSearchOpen && (
+      {isAuthenticated && workspaceSearchOpen && (
         <WorkspaceSearchDialog
           pages={pages}
           folders={folders}
@@ -4612,8 +5311,40 @@ function App() {
           }}
         />
       )}
-      {notice && <div className="toast"><Bell size={16} />{notice}<button type="button" onClick={() => setNotice(null)} aria-label="알림 닫기"><X size={14} /></button></div>}
-      {pageSettingsOpen && <PageSettingsPanel settings={pageSettings} onChange={setPageSettings} onClose={() => setPageSettingsOpen(false)} />}
+      {notice && (
+        <div className={`toast ${sidebarOpen ? "is-sidebar-open" : "is-sidebar-closed"} ${noticeClosing ? "is-leaving" : ""}`}>
+          <Bell size={16} />
+          {notice}
+          <button type="button" onClick={() => setNoticeClosing(true)} aria-label="알림 닫기"><X size={14} /></button>
+        </div>
+      )}
+      {isAuthenticated && pageSettingsOpen && <PageSettingsPanel settings={pageSettings} onChange={setPageSettings} onClose={() => setPageSettingsOpen(false)} />}
+      {isAuthenticated && workspaceSettingsOpen && (
+        <WorkspaceSettingsDialog
+          user={currentNodiUser}
+          theme={appTheme}
+          starterPresets={starterPresets}
+          onThemeChange={setAppTheme}
+          onStarterPresetsChange={(presets) => {
+            setStarterPresets(presets);
+            persistStarterPresets(presets);
+            if (selectedStarterPreset && !presets.some((preset) => preset.id === selectedStarterPreset)) {
+              setSelectedStarterPreset(null);
+            }
+            setNotice("시작 프리셋을 저장했어요");
+          }}
+          onProfileChange={updateUserProfile}
+          onLogout={logout}
+          onClose={() => setWorkspaceSettingsOpen(false)}
+        />
+      )}
+      {authDialogMode && (
+        <AuthDialog
+          initialMode={authDialogMode}
+          onAuthenticated={() => window.location.reload()}
+          onClose={() => setAuthDialogMode(null)}
+        />
+      )}
       {pendingPageDeletion && pages[pendingPageDeletion] && (
         <PageDeleteConfirm
           title={pages[pendingPageDeletion].title}
@@ -4639,6 +5370,11 @@ const NODI_TOOLTIP_TRIGGER_SELECTOR = [
   "button[aria-label]",
   "[role='button'][aria-label]",
   "[role='separator'][aria-label]",
+].join(", ");
+const NODI_TOOLTIP_MANAGED_EXTERNALLY_SELECTOR = [
+  ".bn-toolbar",
+  ".bn-formatting-toolbar",
+  ".bn-side-menu",
 ].join(", ");
 
 function NodiTooltipLayer() {
@@ -4670,6 +5406,7 @@ function NodiTooltipLayer() {
     let pointerDownPosition: { x: number; y: number } | null = null;
 
     const prepareElement = (element: Element) => {
+      if (element.closest(NODI_TOOLTIP_MANAGED_EXTERNALLY_SELECTOR)) return;
       const nativeTitle = element.getAttribute("title")?.trim();
       if (!nativeTitle) return;
       element.setAttribute("data-nodi-tooltip", nativeTitle);
@@ -4699,11 +5436,12 @@ function NodiTooltipLayer() {
       attributeFilter: ["title"],
     });
 
-    const resolveTrigger = (target: EventTarget | null) => (
-      target instanceof Element
-        ? target.closest<HTMLElement>(NODI_TOOLTIP_TRIGGER_SELECTOR)
-        : null
-    );
+    const resolveTrigger = (target: EventTarget | null) => {
+      if (!(target instanceof Element)) return null;
+      const trigger = target.closest<HTMLElement>(NODI_TOOLTIP_TRIGGER_SELECTOR);
+      if (!trigger || trigger.closest(NODI_TOOLTIP_MANAGED_EXTERNALLY_SELECTOR)) return null;
+      return trigger;
+    };
     const getTooltipText = (target: HTMLElement) => {
       const explicitText = target.dataset.nodiTooltip?.trim();
       if (explicitText) return explicitText;
@@ -5225,6 +5963,7 @@ function PagePreviewDrawer({
     schema: editorSchema,
     initialContent: (page.blocks.length ? page.blocks : [{ type: "paragraph", content: "" }]) as never,
     dictionary: ko,
+    uploadFile: uploadNodiAttachment,
   });
   const [previewTitle, setPreviewTitle] = useState(page.title);
   const [drawerWidth, setDrawerWidth] = useState(() => {
@@ -5459,15 +6198,15 @@ function QuickActionPanel({
   );
 }
 
-function NodiContextMenu({ menu, archived, locked, selectedBlockCount, commentCount, commentsAvailable, onAddBlock, onMoveBlock, onDuplicateBlock, onDeleteBlock, onComment, onOpenSettings, onCopyLink, onToggleArchive, onExport, onDeletePage }: { menu: ContextMenuState; archived: boolean; locked: boolean; selectedBlockCount: number; commentCount: number; commentsAvailable: boolean; onAddBlock: () => void; onMoveBlock: (direction: "up" | "down") => void; onDuplicateBlock: () => void; onDeleteBlock: () => void; onComment: () => void; onOpenSettings: () => void; onCopyLink: () => void; onToggleArchive: () => void; onExport: () => void; onDeletePage: () => void }) {
+function NodiContextMenu({ menu, archived, locked, selectedBlockCount, commentCount, commentsAvailable, memberFeaturesAvailable, shareAvailable, onAddBlock, onMoveBlock, onDuplicateBlock, onDeleteBlock, onComment, onOpenSettings, onCopyLink, onToggleArchive, onExport, onDeletePage }: { menu: ContextMenuState; archived: boolean; locked: boolean; selectedBlockCount: number; commentCount: number; commentsAvailable: boolean; memberFeaturesAvailable: boolean; shareAvailable: boolean; onAddBlock: () => void; onMoveBlock: (direction: "up" | "down") => void; onDuplicateBlock: () => void; onDeleteBlock: () => void; onComment: () => void; onOpenSettings: () => void; onCopyLink: () => void; onToggleArchive: () => void; onExport: () => void; onDeletePage: () => void }) {
   return <div className="nodi-context-menu" role="menu" aria-label={menu.kind === "block" ? "블록 메뉴" : "페이지 메뉴"} style={{ left: menu.x, top: menu.y }} onMouseDown={(event) => event.stopPropagation()}>
     {menu.kind === "block" ? <>
       <span className="context-menu-heading">{selectedBlockCount > 1 ? `${selectedBlockCount}개 블록` : "블록"}</span>
-      <button type="button" role="menuitem" disabled={!commentsAvailable} onClick={onComment}>
+      {memberFeaturesAvailable && <><button type="button" role="menuitem" disabled={!commentsAvailable} onClick={onComment}>
         <MessageCircle size={15} />
         <span>{commentCount > 0 ? `댓글 ${commentCount}개` : "댓글 달기"}</span>
       </button>
-      <div className="context-menu-divider" />
+      <div className="context-menu-divider" /></>}
       <button type="button" role="menuitem" disabled={locked} onClick={onAddBlock}><Plus size={15} /> 아래에 새 블록</button>
       <button type="button" role="menuitem" disabled={locked} onClick={() => onMoveBlock("up")}><ArrowUp size={15} /><span>위로 이동</span><kbd>⌘⇧↑</kbd></button>
       <button type="button" role="menuitem" disabled={locked} onClick={() => onMoveBlock("down")}><ArrowDown size={15} /><span>아래로 이동</span><kbd>⌘⇧↓</kbd></button>
@@ -5476,11 +6215,13 @@ function NodiContextMenu({ menu, archived, locked, selectedBlockCount, commentCo
       <button type="button" role="menuitem" className="context-menu-danger" disabled={locked} onClick={onDeleteBlock}><Trash2 size={15} /><span>{selectedBlockCount > 1 ? "선택한 블록 삭제" : "블록 삭제"}</span><kbd>Del</kbd></button>
     </> : <>
       <span className="context-menu-heading">페이지</span>
-      <button type="button" role="menuitem" onClick={onOpenSettings}><Settings2 size={15} /> 페이지 설정</button>
-      <button type="button" role="menuitem" onClick={onCopyLink}><Link size={15} /> 페이지 링크 복사</button>
-      <button type="button" role="menuitem" onClick={onToggleArchive}><Archive size={15} /> {archived ? "페이지 복원" : "페이지 보관"}</button>
-      <button type="button" role="menuitem" onClick={onExport}><Download size={15} /> JSON 내보내기</button>
-      <div className="context-menu-divider" />
+      {memberFeaturesAvailable && <>
+        <button type="button" role="menuitem" onClick={onOpenSettings}><Settings2 size={15} /> 페이지 설정</button>
+        {shareAvailable && <button type="button" role="menuitem" onClick={onCopyLink}><Link size={15} /> 페이지 링크 복사</button>}
+        <button type="button" role="menuitem" onClick={onToggleArchive}><Archive size={15} /> {archived ? "페이지 복원" : "페이지 보관"}</button>
+        <button type="button" role="menuitem" onClick={onExport}><Download size={15} /> JSON 내보내기</button>
+        <div className="context-menu-divider" />
+      </>}
       <button type="button" role="menuitem" className="context-menu-danger" onClick={onDeletePage}><Trash2 size={15} /> 페이지 휴지통으로 이동</button>
     </>}
   </div>;
