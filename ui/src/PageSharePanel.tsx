@@ -10,6 +10,8 @@ import {
   X,
 } from "lucide-react";
 import { Select } from "./components/ui/select";
+import { NodiUserAvatar } from "./NodiUserAvatar";
+import { SidebarScrollOverlay } from "./SidebarScrollOverlay";
 import type {
   NodiUser,
   PageShareMember,
@@ -49,8 +51,11 @@ export function PageSharePanel({
   onClose,
 }: PageSharePanelProps) {
   const panelRef = useRef<HTMLElement>(null);
+  const inviteRef = useRef<HTMLDivElement>(null);
+  const sharedMemberListRef = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState("");
   const [permission, setPermission] = useState<SharePermission>("edit");
+  const [openPermissionSelect, setOpenPermissionSelect] = useState<string | null>(null);
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const memberIds = useMemo(() => new Set(members.map((member) => member.userId)), [members]);
   const matchedUsers = useMemo(() => {
@@ -70,10 +75,23 @@ export function PageSharePanel({
       if (!target) return;
       if (panelRef.current?.contains(target)) return;
       if (target.closest("[data-radix-popper-content-wrapper], .shadcn-select-content")) return;
+      if (openPermissionSelect) {
+        setOpenPermissionSelect(null);
+        return;
+      }
       onClose();
     };
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key !== "Escape") return;
+      if (openPermissionSelect) {
+        setOpenPermissionSelect(null);
+        return;
+      }
+      if (normalizedQuery) {
+        setQuery("");
+        return;
+      }
+      onClose();
     };
     document.addEventListener("pointerdown", closeOnOutsidePointer, true);
     window.addEventListener("keydown", closeOnEscape);
@@ -81,7 +99,19 @@ export function PageSharePanel({
       document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [onClose]);
+  }, [normalizedQuery, onClose, openPermissionSelect]);
+
+  useEffect(() => {
+    if (!normalizedQuery) return;
+    const closeResultsOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (!target || inviteRef.current?.contains(target)) return;
+      if (target.closest("[data-radix-popper-content-wrapper], .shadcn-select-content")) return;
+      setQuery("");
+    };
+    document.addEventListener("pointerdown", closeResultsOnOutsidePointer, true);
+    return () => document.removeEventListener("pointerdown", closeResultsOnOutsidePointer, true);
+  }, [normalizedQuery]);
 
   return (
     <aside ref={panelRef} className="page-share-panel" role="dialog" aria-label="페이지 공유">
@@ -100,90 +130,114 @@ export function PageSharePanel({
             {members.length > 0 && <em>{members.length}명</em>}
           </div>
 
-          <div className="member-share-invite">
-            <label className="member-search-field">
-              <Search size={15} />
-              <input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="이름 또는 이메일 검색"
-                aria-label="Nodi 회원 검색"
-              />
-              {query && (
-                <button type="button" aria-label="검색어 지우기" onClick={() => setQuery("")}>
-                  <X size={13} />
-                </button>
-              )}
-            </label>
-            <Select
-              value={permission}
-              onValueChange={(value) => setPermission(value as SharePermission)}
-              options={permissionOptions}
-              ariaLabel="초대 권한"
-              className="member-invite-permission"
-            />
-          </div>
-
-          {normalizedQuery && (
-            <div className="member-search-results" role="listbox" aria-label="검색된 Nodi 회원">
-              {matchedUsers.length > 0 ? matchedUsers.map((user) => (
-                <button
-                  key={user.id}
-                  type="button"
-                  role="option"
-                  aria-selected="false"
-                  onClick={() => {
-                    onShare(user.id, permission);
-                    setQuery("");
-                  }}
-                >
-                  <UserAvatar user={user} />
-                  <span>
-                    <strong>{user.name}</strong>
-                    <small>{user.email}</small>
-                  </span>
-                  <UserPlus size={15} />
-                </button>
-              )) : (
-                <p>일치하는 Nodi 회원이 없어요.</p>
-              )}
-            </div>
-          )}
-
-          <div className="shared-member-list">
-            {members.length > 0 ? members.map((member) => {
-              const user = registeredUsers.find((candidate) => candidate.id === member.userId);
-              if (!user) return null;
-              return (
-                <div className="shared-member-row" key={member.userId}>
-                  <UserAvatar user={user} />
-                  <span>
-                    <strong>{user.name}</strong>
-                    <small>{user.email}</small>
-                  </span>
-                  <Select
-                    value={member.permission}
-                    onValueChange={(value) => onPermissionChange(member.userId, value as SharePermission)}
-                    options={permissionOptions}
-                    ariaLabel={`${user.name} 공유 권한`}
-                    className="shared-member-permission"
-                  />
-                  <button
-                    className="shared-member-remove"
-                    type="button"
-                    aria-label={`${user.name} 공유 해제`}
-                    onClick={() => onRemoveMember(member.userId)}
-                  >
-                    <X size={14} />
+          <div ref={inviteRef} className="member-share-invite-wrap">
+            <div className="member-share-invite">
+              <label className="member-search-field">
+                <Search size={15} />
+                <input
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="이름 또는 이메일 검색"
+                  aria-label="Nodi 회원 검색"
+                  aria-controls={normalizedQuery ? "member-search-results" : undefined}
+                  aria-expanded={Boolean(normalizedQuery)}
+                />
+                {query && (
+                  <button type="button" aria-label="검색어 지우기" onClick={() => setQuery("")}>
+                    <X size={13} />
                   </button>
-                </div>
-              );
-            }) : (
-              <div className="shared-member-empty">
-                <Users size={17} />
-                <span><strong>아직 초대된 회원이 없어요.</strong><small>위 검색창에서 Nodi 회원을 찾아보세요.</small></span>
+                )}
+              </label>
+              <Select
+                value={permission}
+                onValueChange={(value) => setPermission(value as SharePermission)}
+                options={permissionOptions}
+                ariaLabel="초대 권한"
+                className="member-invite-permission"
+                open={openPermissionSelect === "invite"}
+                onOpenChange={(open) => setOpenPermissionSelect((current) => (
+                  open ? "invite" : current === "invite" ? null : current
+                ))}
+              />
+            </div>
+
+            {normalizedQuery && (
+              <div
+                id="member-search-results"
+                className="member-search-results"
+                role="listbox"
+                aria-label="검색된 Nodi 회원"
+              >
+                {matchedUsers.length > 0 ? matchedUsers.map((user) => (
+                  <button
+                    key={user.id}
+                    type="button"
+                    role="option"
+                    aria-selected="false"
+                    onClick={() => {
+                      onShare(user.id, permission);
+                      setQuery("");
+                    }}
+                  >
+                    <NodiUserAvatar user={user} />
+                    <span>
+                      <strong>{user.name}</strong>
+                      <small>{user.email}</small>
+                    </span>
+                    <UserPlus size={15} />
+                  </button>
+                )) : (
+                  <p>일치하는 Nodi 회원이 없어요.</p>
+                )}
               </div>
             )}
+          </div>
+
+          <div className="shared-member-scroll-shell sidebar-scroll-shell">
+            <div
+              ref={sharedMemberListRef}
+              className={`shared-member-list sidebar-native-scroll ${members.length > 5 ? "is-scrollable" : ""}`}
+            >
+              {members.length > 0 ? members.map((member) => {
+                const user = registeredUsers.find((candidate) => candidate.id === member.userId);
+                if (!user) return null;
+                return (
+                  <div className="shared-member-row" key={member.userId}>
+                    <NodiUserAvatar user={user} />
+                    <span>
+                      <strong>{user.name}</strong>
+                      <small>{user.email}</small>
+                    </span>
+                    <Select
+                      value={member.permission}
+                      onValueChange={(value) => onPermissionChange(member.userId, value as SharePermission)}
+                      options={permissionOptions}
+                      ariaLabel={`${user.name} 공유 권한`}
+                      className="shared-member-permission"
+                      open={openPermissionSelect === `member:${member.userId}`}
+                      onOpenChange={(open) => setOpenPermissionSelect((current) => {
+                        const selectId = `member:${member.userId}`;
+                        return open ? selectId : current === selectId ? null : current;
+                      })}
+                    />
+                    <button
+                      className="shared-member-remove"
+                      type="button"
+                      aria-label={`${user.name} 공유 해제`}
+                      onClick={() => onRemoveMember(member.userId)}
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                );
+              }) : (
+                <div className="shared-member-empty">
+                  <Users size={17} />
+                  <span><strong>아직 초대된 회원이 없어요.</strong><small>위 검색창에서 Nodi 회원을 찾아보세요.</small></span>
+                </div>
+              )}
+            </div>
+            <SidebarScrollOverlay targetRef={sharedMemberListRef} />
           </div>
         </section>
 
@@ -216,13 +270,5 @@ export function PageSharePanel({
         </section>
       </div>
     </aside>
-  );
-}
-
-function UserAvatar({ user }: { user: NodiUser }) {
-  return (
-    <span className="share-user-avatar" data-color={user.avatarColor} aria-hidden="true">
-      {user.name.trim().charAt(0)}
-    </span>
   );
 }
