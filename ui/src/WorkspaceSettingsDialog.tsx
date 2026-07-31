@@ -747,8 +747,12 @@ function StarterPresetSettings({
                   >
                     <span>{preset.icon || "✨"}</span>
                     <span>
-                      <strong>{preset.name.trim() || "이름 없는 프리셋"}</strong>
-                      <small>{preset.pageTitle.trim() || "제목 없음"}</small>
+                      <strong title={preset.name.trim() || "이름 없는 프리셋"}>
+                        {preset.name.trim() || "이름 없는 프리셋"}
+                      </strong>
+                      <small title={preset.pageTitle.trim() || "제목 없음"}>
+                        {preset.pageTitle.trim() || "제목 없음"}
+                      </small>
                     </span>
                   </button>
                   <button

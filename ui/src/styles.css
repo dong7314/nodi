@@ -1232,9 +1232,11 @@ body:has(.workspace-settings-layer) .record-confirm-layer {
 .workspace-preset-list-item {
   min-width: 0;
   min-height: 49px;
+  padding-right: 4px;
   position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 25px;
+  grid-template-columns: minmax(0, 1fr) 23px;
+  column-gap: 3px;
   align-items: center;
   border-radius: 7px;
   transition: background-color .14s ease;
@@ -1250,6 +1252,7 @@ body:has(.workspace-settings-layer) .record-confirm-layer {
   background: transparent;
 }
 .workspace-preset-list-item > button:first-child {
+  overflow: hidden;
   display: grid;
   grid-template-columns: 27px minmax(0, 1fr);
   align-items: center;
@@ -1272,6 +1275,9 @@ body:has(.workspace-settings-layer) .record-confirm-layer {
 }
 .workspace-preset-list-item strong,
 .workspace-preset-list-item small {
+  display: block;
+  width: 100%;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1280,8 +1286,8 @@ body:has(.workspace-settings-layer) .record-confirm-layer {
 .workspace-preset-list-item small { color: #a09b94; font-size: 9.5px; }
 .workspace-preset-list-item.is-selected strong { color: #5d54b5; }
 .workspace-preset-list-item > button:last-child {
-  width: 25px;
-  height: 25px;
+  width: 23px;
+  height: 23px;
   padding: 0;
   display: grid;
   place-items: center;
