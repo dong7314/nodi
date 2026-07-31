@@ -904,10 +904,14 @@ body:has(.workspace-settings-layer) .record-confirm-layer {
 .workspace-avatar-preview.share-user-avatar[data-has-icon="true"] { font-size: 26px; }
 .workspace-avatar-editor > div { min-width: 0; display: grid; gap: 8px; }
 .workspace-avatar-icons {
-  display: grid;
-  grid-template-columns: repeat(10, 28px);
+  min-width: 0;
+  display: flex;
+  flex-wrap: nowrap;
   gap: 5px;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
+.workspace-avatar-icons::-webkit-scrollbar { display: none; }
 .workspace-avatar-icons > button {
   width: 28px;
   height: 28px;
@@ -1523,7 +1527,7 @@ body:has(.workspace-settings-layer) .record-confirm-layer {
   }
   .workspace-settings-tabs > button small { display: none; }
   .workspace-settings-content { padding: 0 16px 18px; }
-  .workspace-avatar-icons { grid-template-columns: repeat(5, 28px); }
+  .workspace-avatar-icons { overflow-x: auto; }
   .workspace-preset-layout { grid-template-columns: 118px minmax(0, 1fr); gap: 8px; }
   .workspace-preset-editor { padding: 9px; }
   .workspace-preset-icon-grid { grid-template-columns: repeat(6, 28px); }

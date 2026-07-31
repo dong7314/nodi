@@ -30,7 +30,7 @@ import {
   type RegistrationRequestStatus,
 } from "./account-store";
 import { ConfirmDialog } from "./components/ui/confirm-dialog";
-import { NodiUserAvatar } from "./NodiUserAvatar";
+import { NODI_INITIAL_AVATAR_ICON, NodiUserAvatar } from "./NodiUserAvatar";
 import { isPageIcon, PAGE_ICONS } from "./page-icons";
 import type { NodiAvatarColor, NodiUser } from "./sharing-store";
 import {
@@ -58,7 +58,7 @@ type WorkspaceSettingsDialogProps = {
 };
 
 const avatarColors: NodiAvatarColor[] = ["purple", "blue", "green", "orange", "pink", "gray"];
-const avatarIcons = ["", "✨", "🌿", "🌙", "📚", "🎯", "☕", "🪴", "🧩", "🚀"];
+const avatarIcons = ["", NODI_INITIAL_AVATAR_ICON, "✨", "🌿", "🌙", "📚", "🎯", "☕", "🪴", "🧩", "🚀"];
 const MAX_PRESET_JSON_FILE_SIZE = 5 * 1024 * 1024;
 
 type ImportedPresetJson = {
@@ -462,7 +462,7 @@ function AccountSettings({
       />
       <section className="workspace-settings-section">
         <div className="workspace-settings-section-heading">
-          <span><strong>사용자 아이콘</strong><small>페이지 공유와 댓글에 표시됩니다.</small></span>
+          <span><strong>사용자 프로필</strong><small>페이지 공유와 댓글에 표시됩니다.</small></span>
         </div>
         <div className="workspace-avatar-editor">
           <NodiUserAvatar
@@ -470,31 +470,42 @@ function AccountSettings({
             className="workspace-avatar-preview"
           />
           <div>
-            <div className="workspace-avatar-icons" aria-label="사용자 아이콘 선택">
-              {avatarIcons.map((icon) => (
-                <button
-                  type="button"
-                  key={icon || "automatic"}
-                  className={avatarIcon === icon ? "is-selected" : ""}
-                  aria-label={icon ? `${icon} 아이콘` : "이름과 이메일로 자동 생성"}
-                  aria-pressed={avatarIcon === icon}
-                  onClick={() => onAvatarIconChange(icon)}
-                >
-                  {icon || (
-                    <NodiUserAvatar
-                      user={{
-                        ...user,
-                        name: draftName || user.name,
-                        avatarColor,
-                        avatarIcon: undefined,
-                      }}
-                      className="workspace-avatar-auto-option"
-                    />
-                  )}
-                </button>
-              ))}
+            <div className="workspace-avatar-icons" aria-label="사용자 프로필 선택">
+              {avatarIcons.map((icon) => {
+                const isAutomaticAvatar = icon === "";
+                const isInitialAvatar = icon === NODI_INITIAL_AVATAR_ICON;
+
+                return (
+                  <button
+                    type="button"
+                    key={icon || "automatic"}
+                    className={avatarIcon === icon ? "is-selected" : ""}
+                    aria-label={
+                      isAutomaticAvatar
+                        ? "이름과 이메일로 자동 생성"
+                        : isInitialAvatar
+                          ? "이름 첫 글자 사용"
+                          : `${icon} 아이콘`
+                    }
+                    aria-pressed={avatarIcon === icon}
+                    onClick={() => onAvatarIconChange(icon)}
+                  >
+                    {isAutomaticAvatar || isInitialAvatar ? (
+                      <NodiUserAvatar
+                        user={{
+                          ...user,
+                          name: draftName || user.name,
+                          avatarColor,
+                          avatarIcon: isInitialAvatar ? NODI_INITIAL_AVATAR_ICON : undefined,
+                        }}
+                        className="workspace-avatar-auto-option"
+                      />
+                    ) : icon}
+                  </button>
+                );
+              })}
             </div>
-            <div className="workspace-avatar-colors" aria-label="사용자 아이콘 색상">
+            <div className="workspace-avatar-colors" aria-label="사용자 프로필 색상">
               {avatarColors.map((color) => (
                 <button
                   type="button"
