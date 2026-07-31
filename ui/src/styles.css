@@ -123,7 +123,7 @@ button { cursor: pointer; }
   font-family: "Rubik", var(--nodi-font-family);
   font-size: 17px;
   font-weight: 550;
-  letter-spacing: .5px;
+  letter-spacing: .2px;
   line-height: 1;
 }
 .icon-button { width: 32px; height: 32px; border-radius: 6px; color: #777671; background: transparent; border: 0; display: grid; place-items: center; }
@@ -1617,7 +1617,7 @@ body:has(.workspace-settings-layer) .record-confirm-layer {
 
 .editor-stage { padding-bottom: 115px; }.cover { height: 180px; position: relative; overflow: hidden; background: linear-gradient(110deg, #ebe7ff 0%, #f5efff 49%, #e8f5f0 100%); }.cover::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, transparent 58%, #fbfbfa 100%); }.cover--sunset { background: linear-gradient(110deg, #ffe8cf 0%, #fff3e5 49%, #f6dfea 100%); }.cover--ocean { background: linear-gradient(110deg, #d8efff 0%, #e6f7fb 49%, #d9f2e8 100%); }.cover--paper { background: linear-gradient(110deg, #f3eee3 0%, #fbf8ef 49%, #eceae3 100%); }.cover-orb { position: absolute; border-radius: 50%; filter: blur(3px); opacity: .78; }.orb-one { width: 300px; height: 300px; background: radial-gradient(circle at 35% 30%, #d0b8ff, #a49ce900 69%); left: 13%; top: -180px; }.cover--sunset .orb-one { background: radial-gradient(circle at 35% 30%, #ffb67d, #f3a68400 69%); }.cover--ocean .orb-one { background: radial-gradient(circle at 35% 30%, #8bc8ec, #8bc8ec00 69%); }.cover--paper .orb-one { background: radial-gradient(circle at 35% 30%, #ded2b8, #ded2b800 69%); }.orb-two { width: 340px; height: 340px; background: radial-gradient(circle at 50% 45%, #bce6d6, #bce6d600 67%); right: 12%; top: -155px; }.cover--sunset .orb-two { background: radial-gradient(circle at 50% 45%, #ebb0cc, #ebb0cc00 67%); }.cover--ocean .orb-two { background: radial-gradient(circle at 50% 45%, #9ee4d1, #9ee4d100 67%); }.cover--paper .orb-two { background: radial-gradient(circle at 50% 45%, #d7d9c9, #d7d9c900 67%); }.cover-grid { position: absolute; inset: 0; opacity: .25; background-image: linear-gradient(#a59bc626 1px, transparent 1px),linear-gradient(90deg,#a59bc626 1px,transparent 1px); background-size: 29px 29px; transform: perspective(210px) rotateX(56deg) scale(1.45) translateY(46px); transform-origin: top; }
 .note-page { width: min(820px, calc(100vw - 340px)); margin: -68px auto 0; position: relative; z-index: 1; }.note-page.page-wide { width: min(1120px, calc(100vw - 200px)); }.page-emoji { display: grid; place-items: center; width: 66px; height: 66px; padding: 0; border-radius: 18px; border: 1px solid #e7e3f4; background: rgba(255,255,255,.91); box-shadow: 0 9px 20px #7263a01a; color: #746add; font-size: 31px; margin-bottom: 15px; }.page-emoji:hover { transform: translateY(-1px); box-shadow: 0 11px 22px #7263a025; }
-.title-input { display: block; width: 100%; background: transparent; border: none; outline: none; padding: 0; color: #272622; font-size: 38px; font-weight: 710; line-height: 1.22; }.title-input:disabled { color: #55534d; }.title-input::placeholder { color: #b6b5b1; }.page-properties { display: flex; gap: 15px; margin-top: 22px; align-items: center; min-height: 25px; flex-wrap: wrap; }.property { font-size: 12px; color: #a09e99; display: inline-flex; align-items: center; gap: 7px; min-height: 26px; }.property svg { color: #96948f; }.property strong { color: #686660; font-weight: 500; }.property button, .add-property { background: none; border: 0; color: #a09e99; padding: 1px 2px; font-size: 12px; }.property button:hover, .add-property:hover { color: #5e5c57; text-decoration: underline; }.add-property { display: flex; gap: 4px; align-items: center; }.property select { color: #5a5868; border: 0; background: #eeeafa; padding: 3px 8px; border-radius: 999px; outline: 0; font-size: 11px; }.property input[type="date"] { color: #77746f; border: 0; background: transparent; font-size: 11px; width: 96px; outline: 0; }.property-tags { position: relative; }.divider { height: 1px; background: #ededea; margin: 13px 0 16px; }
+.title-input { display: block; width: 100%; background: transparent; border: none; outline: none; padding: 0; color: #272622; font-size: 38px; font-weight: 650; line-height: 1.22; }.title-input:disabled { color: #55534d; }.title-input::placeholder { color: #b6b5b1; }.page-properties { display: flex; gap: 15px; margin-top: 22px; align-items: center; min-height: 25px; flex-wrap: wrap; }.property { font-size: 12px; color: #a09e99; display: inline-flex; align-items: center; gap: 7px; min-height: 26px; }.property svg { color: #96948f; }.property strong { color: #686660; font-weight: 500; }.property button, .add-property { background: none; border: 0; color: #a09e99; padding: 1px 2px; font-size: 12px; }.property button:hover, .add-property:hover { color: #5e5c57; text-decoration: underline; }.add-property { display: flex; gap: 4px; align-items: center; }.property select { color: #5a5868; border: 0; background: #eeeafa; padding: 3px 8px; border-radius: 999px; outline: 0; font-size: 11px; }.property input[type="date"] { color: #77746f; border: 0; background: transparent; font-size: 11px; width: 96px; outline: 0; }.property-tags { position: relative; }.divider { height: 1px; background: #ededea; margin: 13px 0 16px; }
 
 /* Home is a useful workspace dashboard while the BlockNote canvas remains fully editable. */
 .editor-stage.is-home {
@@ -1664,7 +1664,7 @@ body:has(.workspace-settings-layer) .record-confirm-layer {
   background: transparent;
   font: inherit;
   font-size: 30px;
-  font-weight: 730;
+  font-weight: 650;
   line-height: 1.25;
 }
 .home-title-input:disabled { color: #55514b; }
@@ -8809,6 +8809,7 @@ body:has(.page-share-panel) [data-radix-popper-content-wrapper]:has(> .shadcn-se
   margin: 5px 0 8px;
   color: #37332e;
   font-size: 30px;
+  font-weight: 650;
 }
 .shared-pages-hero p { margin: 0; color: #7f7a73; font-size: 13px; }
 .shared-pages-summary {
