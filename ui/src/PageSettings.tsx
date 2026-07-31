@@ -4,6 +4,7 @@ import { DatePicker } from "./components/ui/date-picker";
 import { Select } from "./components/ui/select";
 import { TagPicker } from "./TagPicker";
 import { DEFAULT_TAG_OPTIONS } from "./types";
+import { PAGE_ICONS } from "./page-icons";
 
 export type CoverTheme = "aurora" | "sunset" | "ocean" | "paper";
 
@@ -26,11 +27,6 @@ type PageSettingsPanelProps = {
   onClose: () => void;
 };
 
-const icons = [
-  "✦", "📝", "🌿", "💡", "📚", "☀️", "🎯", "🪄",
-  "📄", "📌", "🗂️", "✅", "📅", "🚀", "💬", "🔖",
-  "🧭", "🧠", "🎨", "💻", "📊", "🏠", "❤️", "⭐",
-];
 const covers: { id: CoverTheme; label: string }[] = [
   { id: "aurora", label: "오로라" },
   { id: "sunset", label: "노을" },
@@ -96,7 +92,7 @@ export function PageSettingsPanel({ settings, onChange, onClose }: PageSettingsP
         <div className="page-settings-scroll">
           <section className="setting-section">
             <label>아이콘</label>
-            <div className="icon-grid">{icons.map((icon) => <button type="button" key={icon} className={settings.icon === icon ? "selected" : ""} onClick={() => update("icon", icon)}>{icon}{settings.icon === icon && <Check size={12} />}</button>)}</div>
+            <div className="icon-grid">{PAGE_ICONS.map((icon) => <button type="button" key={icon} className={settings.icon === icon ? "selected" : ""} onClick={() => update("icon", icon)}>{icon}{settings.icon === icon && <Check size={12} />}</button>)}</div>
           </section>
 
           <section className="setting-section">
