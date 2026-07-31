@@ -1,6 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Check,
   CheckCircle2,
   CornerDownRight,
   MessageCircle,
@@ -8,7 +7,9 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import type { BlockCommentThread } from "./comment-store";
+import type { BlockCommentMessage, BlockCommentThread } from "./comment-store";
+import { ConfirmDialog } from "./components/ui/confirm-dialog";
+import { NodiUserAvatar } from "./NodiUserAvatar";
 import type { NodiUser } from "./sharing-store";
 
 type BlockCommentPanelProps = {
@@ -16,10 +17,11 @@ type BlockCommentPanelProps = {
   blockPreview: string;
   thread?: BlockCommentThread;
   currentUser: NodiUser;
+  registeredUsers: NodiUser[];
   canComment: boolean;
-  onAddComment: (body: string) => void;
+  disabledReason: string;
+  onAddComment: (body: string, parentId: string | null) => void;
   onDeleteComment: (commentId: string) => void;
-  onResolve: () => void;
   onReopen: () => void;
   onClose: () => void;
 };
@@ -47,16 +49,23 @@ export function BlockCommentPanel({
   blockPreview,
   thread,
   currentUser,
+  registeredUsers,
   canComment,
+  disabledReason,
   onAddComment,
   onDeleteComment,
-  onResolve,
   onReopen,
   onClose,
 }: BlockCommentPanelProps) {
   const [draft, setDraft] = useState("");
+  const [replyTargetId, setReplyTargetId] = useState<string | null>(null);
+  const [pendingDeleteCommentId, setPendingDeleteCommentId] = useState<string | null>(null);
+  const [isClosing, setIsClosing] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const messageListRef = useRef<HTMLDivElement>(null);
+  const isClosingRef = useRef(false);
+  const closeTimerRef = useRef<number | null>(null);
+  const onCloseRef = useRef(onClose);
   const isResolved = Boolean(thread?.resolvedAt);
   const messageCount = thread?.messages.length ?? 0;
   const canSubmit = canComment && !isResolved && Boolean(draft.trim());
@@ -64,48 +73,148 @@ export function BlockCommentPanel({
     () => new Set(thread?.messages.map((message) => message.authorId) ?? []).size,
     [thread?.messages],
   );
+  const rootMessages = useMemo(
+    () => thread?.messages.filter((message) => !message.parentId) ?? [],
+    [thread?.messages],
+  );
+  const repliesByParent = useMemo(() => {
+    const grouped = new Map<string, BlockCommentMessage[]>();
+    thread?.messages.forEach((message) => {
+      if (!message.parentId) return;
+      const replies = grouped.get(message.parentId) ?? [];
+      replies.push(message);
+      grouped.set(message.parentId, replies);
+    });
+    return grouped;
+  }, [thread?.messages]);
+  const pendingDeleteComment = pendingDeleteCommentId
+    ? thread?.messages.find((message) => message.id === pendingDeleteCommentId)
+    : undefined;
+  const pendingDeleteReplyCount = pendingDeleteComment
+    ? repliesByParent.get(pendingDeleteComment.id)?.length ?? 0
+    : 0;
+  const replyTarget = replyTargetId
+    ? thread?.messages.find((message) => message.id === replyTargetId)
+    : undefined;
+  const usersById = useMemo(
+    () => new Map([...registeredUsers, currentUser].map((user) => [user.id, user])),
+    [currentUser, registeredUsers],
+  );
+  const usersByEmail = useMemo(
+    () => new Map([...registeredUsers, currentUser].map((user) => [user.email.toLocaleLowerCase(), user])),
+    [currentUser, registeredUsers],
+  );
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  useEffect(() => () => {
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+  }, []);
+
+  const closeWithAnimation = useCallback(() => {
+    if (isClosingRef.current) return;
+    isClosingRef.current = true;
+    setIsClosing(true);
+    closeTimerRef.current = window.setTimeout(() => onCloseRef.current(), 180);
+  }, []);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape" && !pendingDeleteCommentId) closeWithAnimation();
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  }, [closeWithAnimation, pendingDeleteCommentId]);
 
   useEffect(() => {
-    if (!isResolved) window.requestAnimationFrame(() => textareaRef.current?.focus());
-  }, [isResolved]);
+    if (canComment && !isResolved) window.requestAnimationFrame(() => textareaRef.current?.focus());
+  }, [canComment, isResolved]);
 
   useEffect(() => {
     const messageList = messageListRef.current;
     if (messageList) messageList.scrollTop = messageList.scrollHeight;
   }, [messageCount]);
 
+  useEffect(() => {
+    if (replyTargetId && !thread?.messages.some((message) => message.id === replyTargetId)) {
+      setReplyTargetId(null);
+    }
+  }, [replyTargetId, thread?.messages]);
+
+  const resolveMessageUser = (message: BlockCommentMessage): NodiUser => (
+    usersById.get(message.authorId)
+    ?? usersByEmail.get(message.authorEmail.toLocaleLowerCase())
+    ?? {
+      id: message.authorId,
+      name: message.authorName,
+      email: message.authorEmail,
+      avatarColor: "gray",
+    }
+  );
+
+  const beginReply = (message: BlockCommentMessage) => {
+    const rootId = message.parentId ?? message.id;
+    setReplyTargetId(rootId);
+    window.requestAnimationFrame(() => textareaRef.current?.focus());
+  };
+
   const submitComment = () => {
     const body = draft.trim();
     if (!body || !canSubmit) return;
-    onAddComment(body);
+    onAddComment(body, replyTargetId);
     setDraft("");
+    setReplyTargetId(null);
+  };
+
+  const renderMessage = (
+    message: BlockCommentMessage,
+    options: { isReply?: boolean; isThreadAuthor?: boolean } = {},
+  ) => {
+    const isOwnComment = message.authorId === currentUser.id;
+    const author = resolveMessageUser(message);
+    return (
+      <article className={`block-comment-message ${options.isReply ? "is-reply" : ""}`} key={message.id}>
+        <NodiUserAvatar
+          user={author}
+          className={`block-comment-avatar ${isOwnComment ? "is-profile-avatar" : ""}`}
+        />
+        <div>
+          <header>
+            <strong>{message.authorName}</strong>
+            {options.isThreadAuthor && <em>댓글 작성자</em>}
+            <time dateTime={message.createdAt}>{formatCommentTime(message.createdAt)}</time>
+            {isOwnComment && (
+              <button
+                type="button"
+                aria-label="댓글 삭제"
+                onClick={() => setPendingDeleteCommentId(message.id)}
+              >
+                <Trash2 size={13} />
+              </button>
+            )}
+          </header>
+          <p>{message.body}</p>
+          {!isResolved && canComment && (
+            <button
+              className="block-comment-reply-button"
+              type="button"
+              onClick={() => beginReply(message)}
+            >
+              <CornerDownRight size={13} /> 답글
+            </button>
+          )}
+        </div>
+      </article>
+    );
   };
 
   return (
-    <aside className="block-comment-panel" role="dialog" aria-label="블록 댓글">
+    <aside className={`block-comment-panel ${isClosing ? "is-closing" : ""}`} role="dialog" aria-label="블록 댓글">
       <header className="block-comment-header">
         <span><MessageCircle size={17} /> 댓글</span>
         <div>
-          {thread && messageCount > 0 && (
-            <button
-              className={isResolved ? "is-reopen" : ""}
-              type="button"
-              onClick={isResolved ? onReopen : onResolve}
-              aria-label={isResolved ? "댓글 다시 열기" : "댓글 해결"}
-            >
-              {isResolved ? <CornerDownRight size={15} /> : <Check size={15} />}
-              {isResolved ? "다시 열기" : "해결"}
-            </button>
-          )}
-          <button type="button" aria-label="댓글 닫기" onClick={onClose}><X size={17} /></button>
+          <button type="button" aria-label="댓글 닫기" onClick={closeWithAnimation}><X size={17} /></button>
         </div>
       </header>
 
@@ -126,33 +235,16 @@ export function BlockCommentPanel({
       )}
 
       <div ref={messageListRef} className="block-comment-messages">
-        {messageCount > 0 ? thread?.messages.map((message, index) => {
-          const isOwnComment = message.authorId === currentUser.id;
-          return (
-            <article className="block-comment-message" key={message.id}>
-              <span className="block-comment-avatar" aria-hidden="true">
-                {message.authorName.trim().charAt(0) || "N"}
-              </span>
-              <div>
-                <header>
-                  <strong>{message.authorName}</strong>
-                  {index === 0 && <em>댓글 작성자</em>}
-                  <time dateTime={message.createdAt}>{formatCommentTime(message.createdAt)}</time>
-                  {isOwnComment && (
-                    <button
-                      type="button"
-                      aria-label="댓글 삭제"
-                      onClick={() => onDeleteComment(message.id)}
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  )}
-                </header>
-                <p>{message.body}</p>
+        {messageCount > 0 ? rootMessages.map((message, index) => (
+          <div className="block-comment-thread" key={message.id}>
+            {renderMessage(message, { isThreadAuthor: index === 0 })}
+            {(repliesByParent.get(message.id)?.length ?? 0) > 0 && (
+              <div className="block-comment-replies">
+                {repliesByParent.get(message.id)?.map((reply) => renderMessage(reply, { isReply: true }))}
               </div>
-            </article>
-          );
-        }) : (
+            )}
+          </div>
+        )) : (
           <div className="block-comment-empty">
             <span><MessageCircle size={22} /></span>
             <strong>이 블록의 대화를 시작해 보세요.</strong>
@@ -162,28 +254,34 @@ export function BlockCommentPanel({
       </div>
 
       <footer className="block-comment-composer">
-        {!canComment ? (
-          <div className="block-comment-share-required">
-            <MessageCircle size={16} />
-            <span><strong>공유된 페이지에서 댓글을 사용할 수 있어요.</strong><small>오른쪽 위 공유 버튼에서 회원을 초대하거나 링크를 공개해 주세요.</small></span>
-          </div>
-        ) : isResolved ? (
+        {isResolved ? (
           <button className="block-comment-reopen-action" type="button" onClick={onReopen}>
             <CornerDownRight size={15} /> 댓글 다시 열기
           </button>
         ) : (
           <>
-            <label>
-              <span className="block-comment-avatar is-current" aria-hidden="true">
-                {currentUser.name.trim().charAt(0) || "N"}
-              </span>
+            {replyTarget && (
+              <div className="block-comment-reply-target">
+                <CornerDownRight size={14} />
+                <span><strong>{replyTarget.authorName}</strong>님에게 답글 작성 중</span>
+                <button type="button" aria-label="답글 취소" onClick={() => setReplyTargetId(null)}>
+                  <X size={13} />
+                </button>
+              </div>
+            )}
+            <label className={!canComment ? "is-disabled" : ""}>
+              <NodiUserAvatar
+                user={currentUser}
+                className="block-comment-avatar is-current is-profile-avatar"
+              />
               <textarea
                 ref={textareaRef}
                 value={draft}
                 rows={2}
                 maxLength={1000}
-                placeholder={messageCount > 0 ? "답글을 입력하세요…" : "댓글을 입력하세요…"}
-                aria-label={messageCount > 0 ? "답글 입력" : "댓글 입력"}
+                disabled={!canComment}
+                placeholder={replyTarget ? "답글을 입력하세요…" : "댓글을 입력하세요…"}
+                aria-label={replyTarget ? "답글 입력" : "댓글 입력"}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
@@ -197,12 +295,33 @@ export function BlockCommentPanel({
               </button>
             </label>
             <div>
-              <span>{participants > 0 ? `${participants}명이 대화 중` : "공유 멤버에게 표시됩니다"}</span>
-              <kbd>⌘/Ctrl ↵</kbd>
+              <span>
+                {!canComment
+                  ? disabledReason
+                  : participants > 0
+                    ? `${participants}명이 대화 중`
+                    : "공유 멤버에게 표시됩니다"}
+              </span>
+              {canComment && <kbd>⌘/Ctrl ↵</kbd>}
             </div>
           </>
         )}
       </footer>
+      {pendingDeleteComment && (
+        <ConfirmDialog
+          ariaLabel="댓글 삭제"
+          title="댓글을 삭제할까요?"
+          description={pendingDeleteReplyCount > 0
+            ? `이 댓글과 연결된 답글 ${pendingDeleteReplyCount}개가 함께 삭제됩니다. 삭제한 댓글은 복구할 수 없습니다.`
+            : "이 댓글이 대화에서 삭제됩니다. 삭제한 댓글은 복구할 수 없습니다."}
+          confirmLabel="댓글 삭제"
+          onCancel={() => setPendingDeleteCommentId(null)}
+          onConfirm={() => {
+            onDeleteComment(pendingDeleteComment.id);
+            setPendingDeleteCommentId(null);
+          }}
+        />
+      )}
     </aside>
   );
 }

@@ -3,6 +3,7 @@ export const BLOCK_COMMENTS_CHANGED_EVENT = "nodi:block-comments-changed";
 
 export type BlockCommentMessage = {
   id: string;
+  parentId: string | null;
   authorId: string;
   authorName: string;
   authorEmail: string;
