@@ -1,1 +1,9 @@
 .DS_Store
+api/.env
+api/data/
+api/bin/
+api/coverage.out
+api/dist/
+api/node_modules/
+ui/dist/
+ui/node_modules/
