@@ -3238,6 +3238,38 @@ html, body, #root { height: 100%; overflow: hidden; }
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
 }
+.bn-mantine .bn-formatting-toolbar,
+.bn-mantine .bn-formatting-toolbar .mantine-Button-root,
+.bn-mantine .bn-formatting-toolbar .mantine-ActionIcon-root,
+.bn-mantine .bn-color-picker-dropdown,
+.bn-mantine .bn-color-picker-dropdown .mantine-Menu-label,
+.bn-mantine .bn-color-picker-dropdown .mantine-Menu-item,
+.bn-mantine .bn-select,
+.bn-mantine .bn-select .mantine-Menu-item {
+  font-family: var(--nodi-font-family) !important;
+}
+.bn-mantine .bn-color-picker-dropdown,
+.bn-mantine .bn-select {
+  /* Keeping the menu below half a viewport lets Floating UI reliably flip it
+     above the selection whenever there is not enough room underneath. */
+  max-height: min(340px, calc(50dvh - 18px)) !important;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: auto;
+  scrollbar-width: none;
+}
+.bn-mantine .bn-color-picker-dropdown .mantine-Menu-itemSection[data-position="right"] svg,
+.bn-mantine .bn-select .bn-tick-icon {
+  width: 12px;
+  height: 12px;
+  padding: 1px;
+  border-radius: 999px;
+  color: #fff;
+  background: #655dc0;
+  box-shadow: 0 0 0 1px #fff;
+  flex: 0 0 auto;
+}
 .page-settings-scroll,
 .database-settings-popover,
 .database-property-popover,
@@ -3276,6 +3308,22 @@ html, body, #root { height: 100%; overflow: hidden; }
   border-radius: 999px;
   background: #aaa59d;
   background-clip: padding-box;
+}
+.bn-mantine .bn-color-picker-dropdown::-webkit-scrollbar,
+.bn-mantine .bn-select::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+.nodi-popover-scrollbar {
+  position: fixed;
+  z-index: 180;
+  right: auto;
+  bottom: auto;
+}
+.nodi-popover-scrollbar.is-visible,
+.nodi-popover-scrollbar:hover {
+  opacity: 1;
 }
 .database-settings-popover::-webkit-scrollbar-thumb:hover {
   background: #8f8981;
@@ -5207,18 +5255,18 @@ body:has(.settings-layer) [data-radix-popper-content-wrapper]:has(> .shadcn-date
   width: max-content;
   max-width: min(100%, 590px);
   margin: 0;
-  padding: 4px;
+  padding: 2px;
   position: fixed;
   z-index: 110;
   display: flex;
   align-items: center;
   gap: 2px;
-  border: 1px solid #dedbd5;
+  border: 1px solid #efefef;
   border-radius: 9px;
-  color: #5b5750;
-  background: #fffefdf5;
-  box-shadow: 0 10px 30px #2d281f1f;
-  backdrop-filter: blur(12px);
+  color: #3f3f3f;
+  background: #fff;
+  box-shadow: 0 8px 25px #4a455526;
+  font-family: var(--nodi-font-family) !important;
   animation: block-selection-toolbar-in .16s cubic-bezier(.22, 1, .36, 1) both;
   transform: translateX(-100%);
   visibility: hidden;
@@ -5229,8 +5277,8 @@ body:has(.settings-layer) [data-radix-popper-content-wrapper]:has(> .shadcn-date
 }
 
 .block-selection-count {
-  min-height: 27px;
-  padding: 0 7px;
+  min-height: 30px;
+  padding: 0 8px;
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -5248,26 +5296,27 @@ body:has(.settings-layer) [data-radix-popper-content-wrapper]:has(> .shadcn-date
 
 .block-selection-divider {
   width: 1px;
-  height: 20px;
+  height: 18px;
   margin: 0 2px;
-  background: #ebe8e3;
+  background: #efefef;
 }
 
 .block-selection-toolbar button {
-  width: 28px;
-  height: 28px;
+  width: 30px;
+  height: 30px;
   padding: 0;
   display: grid;
   place-items: center;
   border: 0;
-  border-radius: 5px;
-  color: #777169;
+  border-radius: 4px;
+  color: #3f3f3f;
   background: transparent;
+  font-family: var(--nodi-font-family) !important;
 }
 
 .block-selection-toolbar button:hover {
-  color: #413d37;
-  background: #f1f0ed;
+  color: #3f3f3f;
+  background: #efefef;
 }
 
 .block-selection-toolbar button:disabled {
@@ -5287,8 +5336,8 @@ body:has(.settings-layer) [data-radix-popper-content-wrapper]:has(> .shadcn-date
 }
 
 .block-selection-toolbar .block-selection-menu-button[aria-expanded="true"] {
-  color: #5149aa;
-  background: #f0effd;
+  color: #fff;
+  background: #3f3f3f;
 }
 
 .block-selection-menu-button span {
@@ -5298,6 +5347,15 @@ body:has(.settings-layer) [data-radix-popper-content-wrapper]:has(> .shadcn-date
 
 .block-selection-menu-button svg:last-child {
   color: #aaa59e;
+}
+
+.block-selection-toolbar .block-selection-menu-button[aria-expanded="true"] svg:last-child {
+  color: currentColor;
+}
+
+.block-selection-action-menu,
+.block-selection-action-menu button {
+  font-family: var(--nodi-font-family) !important;
 }
 
 .block-selection-action-menu {
@@ -6652,9 +6710,9 @@ html.is-nodi-block-dragging * {
 }
 :root[data-theme="dark"] .block-selection-toolbar {
   color: #c9c6c0;
-  border-color: #3b3b3b;
-  background: #252525;
-  box-shadow: 0 10px 30px #0006;
+  border-color: #3a3a3a;
+  background: #262626;
+  box-shadow: 0 8px 25px #0008;
 }
 
 :root[data-theme="dark"] .template-dock,
@@ -7187,11 +7245,11 @@ html.is-nodi-block-dragging * {
   background: var(--nodi-dark-border);
 }
 :root[data-theme="dark"] .block-selection-toolbar button {
-  color: #aaa69f;
+  color: #dedbd5;
 }
 :root[data-theme="dark"] .block-selection-toolbar button:hover {
   color: #f0eeea;
-  background: var(--nodi-dark-hover);
+  background: #343434;
 }
 :root[data-theme="dark"] .block-selection-toolbar button.is-danger {
   color: var(--nodi-dark-danger);
@@ -7201,11 +7259,14 @@ html.is-nodi-block-dragging * {
   background: var(--nodi-dark-danger-surface);
 }
 :root[data-theme="dark"] .block-selection-toolbar .block-selection-menu-button[aria-expanded="true"] {
-  color: #d4ceff;
-  background: var(--nodi-dark-purple-surface);
+  color: #f0efed;
+  background: #3b365f;
 }
 :root[data-theme="dark"] .block-selection-menu-button svg:last-child {
   color: #817c75;
+}
+:root[data-theme="dark"] .block-selection-toolbar .block-selection-menu-button[aria-expanded="true"] svg:last-child {
+  color: currentColor;
 }
 :root[data-theme="dark"] .block-selection-action-menu {
   color: var(--nodi-dark-text);
@@ -7238,6 +7299,12 @@ html.is-nodi-block-dragging * {
   color: #aaa1f2;
 }
 :root[data-theme="dark"] .block-color-section button > svg:last-child {
+  color: #fff;
+  background: #7770d5;
+  box-shadow: 0 0 0 1px #242424;
+}
+:root[data-theme="dark"] .bn-mantine .bn-color-picker-dropdown .mantine-Menu-itemSection[data-position="right"] svg,
+:root[data-theme="dark"] .bn-mantine .bn-select .bn-tick-icon {
   color: #fff;
   background: #7770d5;
   box-shadow: 0 0 0 1px #242424;

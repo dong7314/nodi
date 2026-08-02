@@ -15,6 +15,7 @@ import { BlockNoteView } from "@blocknote/mantine";
 import { createReactBlockSpec, getDefaultReactSlashMenuItems, SuggestionMenuController, useCreateBlockNote, type DefaultReactSuggestionItem } from "@blocknote/react";
 import { createHighlighter } from "shiki";
 import { BlockCommentPanel } from "./BlockCommentPanel";
+import { BlockNotePopoverScrollOverlays } from "./BlockNotePopoverScrollOverlays";
 import { AuthDialog, type AuthDialogMode } from "./AuthDialog";
 import { InlineDatabase } from "./InlineDatabase";
 import { PageSharePanel } from "./PageSharePanel";
@@ -129,6 +130,17 @@ import {
   Users,
   X,
 } from "lucide-react";
+
+const NODI_DICTIONARY = {
+  ...ko,
+  color_picker: {
+    ...ko.color_picker,
+    colors: {
+      ...ko.color_picker.colors,
+      default: "기본",
+    },
+  },
+};
 
 const CONTENT_STORAGE_KEY = "nodi:quick-note:content";
 const TITLE_STORAGE_KEY = "nodi:quick-note:title";
@@ -1128,7 +1140,7 @@ function App() {
   const editor = useCreateBlockNote({
     schema: editorSchema,
     initialContent: rootPage.blocks as never,
-    dictionary: ko,
+    dictionary: NODI_DICTIONARY,
     uploadFile: uploadNodiAttachment,
   });
   const [pages, setPages] = useState<StoredPages>(initialPages);
@@ -3496,24 +3508,6 @@ function App() {
       duplicateBlocks(selectedBlockIds);
       return;
     }
-    if (hasPrimaryModifier && event.key === "/") {
-      event.preventDefault();
-      event.stopPropagation();
-      const targetId = selectedBlockIds[0];
-      const target = editorContextRef.current?.querySelector<HTMLElement>(
-        `[data-node-type='blockContainer'][data-id="${CSS.escape(targetId)}"]`,
-      );
-      const rect = target?.getBoundingClientRect();
-      if (rect) {
-        setContextMenu({
-          kind: "block",
-          blockId: targetId,
-          x: Math.min(rect.left + 24, window.innerWidth - 228),
-          y: Math.min(rect.top + 24, window.innerHeight - 260),
-        });
-      }
-      return;
-    }
     if (hasPrimaryModifier && event.shiftKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
       event.preventDefault();
       event.stopPropagation();
@@ -3791,18 +3785,20 @@ function App() {
       openContextMenu(event, "page");
       return;
     }
+
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu(null);
+    setBlockSelectionActionMenu(null);
+    setRightPanel(null);
+    window.getSelection()?.removeAllRanges();
+
     const clickedInsideSelection = blockSelectionModeRef.current && selectedBlockIds.includes(blockId);
     if (!clickedInsideSelection) {
-      try {
-        editor.setTextCursorPosition(blockId, "end");
-        clearBlockSelection();
-        setFocusedBlockId(blockId);
-      } catch {
-        // The selected block may have been replaced between pointer events.
-      }
+      selectSingleBlock(blockId);
+    } else {
+      setFocusedBlockId(blockId);
     }
-    event.stopPropagation();
-    openContextMenu(event, "block", blockId);
   };
 
   const addBlockAfter = () => {
@@ -5297,6 +5293,7 @@ function App() {
         </div>
       )}
 
+      <BlockNotePopoverScrollOverlays />
       <NodiTooltipLayer />
       {isAuthenticated && workspaceSearchOpen && (
         <WorkspaceSearchDialog

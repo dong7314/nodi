@@ -61,6 +61,7 @@ export function BlockCommentPanel({
   const [replyTargetId, setReplyTargetId] = useState<string | null>(null);
   const [pendingDeleteCommentId, setPendingDeleteCommentId] = useState<string | null>(null);
   const [isClosing, setIsClosing] = useState(false);
+  const panelRef = useRef<HTMLElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const messageListRef = useRef<HTMLDivElement>(null);
   const isClosingRef = useRef(false);
@@ -125,6 +126,24 @@ export function BlockCommentPanel({
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [closeWithAnimation, pendingDeleteCommentId]);
+
+  useEffect(() => {
+    if (pendingDeleteCommentId) return;
+
+    const handleOutsidePointerDown = (event: PointerEvent) => {
+      if (
+        isClosingRef.current
+        || !(event.target instanceof Node)
+        || panelRef.current?.contains(event.target)
+      ) {
+        return;
+      }
+      closeWithAnimation();
+    };
+
+    document.addEventListener("pointerdown", handleOutsidePointerDown, true);
+    return () => document.removeEventListener("pointerdown", handleOutsidePointerDown, true);
   }, [closeWithAnimation, pendingDeleteCommentId]);
 
   useEffect(() => {
@@ -210,7 +229,7 @@ export function BlockCommentPanel({
   };
 
   return (
-    <aside className={`block-comment-panel ${isClosing ? "is-closing" : ""}`} role="dialog" aria-label="블록 댓글">
+    <aside ref={panelRef} className={`block-comment-panel ${isClosing ? "is-closing" : ""}`} role="dialog" aria-label="블록 댓글">
       <header className="block-comment-header">
         <span><MessageCircle size={17} /> 댓글</span>
         <div>
