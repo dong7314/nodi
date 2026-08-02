@@ -1,0 +1,94 @@
+package api
+
+import (
+	"encoding/json"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/nodi-app/nodi/api/internal/config"
+)
+
+func TestValidResourceID(t *testing.T) {
+	for _, value := range []string{"page-123", "folder-한글", "quick-note"} {
+		if !validResourceID(value) {
+			t.Fatalf("expected %q to be valid", value)
+		}
+	}
+	for _, value := range []string{"", "has space", "../escape", "folder\\escape"} {
+		if validResourceID(value) {
+			t.Fatalf("expected %q to be invalid", value)
+		}
+	}
+}
+
+func TestOptionalStringDistinguishesMissingAndNull(t *testing.T) {
+	var input struct {
+		Parent optionalString `json:"parent"`
+	}
+	if err := json.Unmarshal([]byte(`{}`), &input); err != nil {
+		t.Fatal(err)
+	}
+	if input.Parent.Set {
+		t.Fatal("missing property must remain unset")
+	}
+	if err := json.Unmarshal([]byte(`{"parent":null}`), &input); err != nil {
+		t.Fatal(err)
+	}
+	if !input.Parent.Set || input.Parent.Value != nil {
+		t.Fatal("explicit null must be represented")
+	}
+}
+
+func TestPageCursorRoundTrip(t *testing.T) {
+	encoded := encodePageCursor(42, "page-123")
+	order, id, err := decodePageCursor(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if order != int64(42) || id != "page-123" {
+		t.Fatalf("unexpected cursor values: %#v %#v", order, id)
+	}
+}
+
+func TestIPLimiterResetsWindow(t *testing.T) {
+	limiter := newIPLimiter(2, 2)
+	start := time.Unix(100, 0)
+	if !limiter.allow("127.0.0.1", start) || !limiter.allow("127.0.0.1", start) {
+		t.Fatal("requests inside limit should pass")
+	}
+	if limiter.allow("127.0.0.1", start) {
+		t.Fatal("request above limit should be rejected")
+	}
+	if !limiter.allow("127.0.0.1", start.Add(time.Minute)) {
+		t.Fatal("new window should reset the bucket")
+	}
+}
+
+func TestAttachmentPathStaysInsideUploadRoot(t *testing.T) {
+	root := t.TempDir()
+	server := &Server{config: config.Config{UploadDir: root}}
+	path, err := server.attachmentPath("owner/attachment")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(filepath.Dir(path)) != filepath.Clean(root) {
+		t.Fatalf("attachment path escaped root: %s", path)
+	}
+	if _, err := server.attachmentPath("../escape"); err == nil {
+		t.Fatal("expected traversal path to be rejected")
+	}
+}
+
+func TestAttachmentTokensAreHashed(t *testing.T) {
+	token, hash, err := randomToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" || len(hash) != 32 || !equalBytes(hash, tokenHash(token)) {
+		t.Fatal("token and hash did not match")
+	}
+	if equalBytes(hash, tokenHash(token+"changed")) {
+		t.Fatal("different token matched the stored hash")
+	}
+}
