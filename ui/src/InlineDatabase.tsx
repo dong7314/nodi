@@ -5,6 +5,10 @@ import { DatePicker } from "./components/ui/date-picker";
 import { Select } from "./components/ui/select";
 import { ConfirmDialog } from "./components/ui/confirm-dialog";
 import { makeId, TAG_COLORS, toDateInput, type TagColor } from "./types";
+import { NodiApiError } from "./api-client";
+import { workspaceApi, type ServerInlineDatabase } from "./server-api";
+
+export const INLINE_DATABASE_REALTIME_EVENT = "nodi:inline-database-realtime";
 
 type PropertyType = "text" | "select" | "multi_select" | "status" | "date" | "number" | "checkbox" | "url" | "email" | "phone";
 type ViewType = "table" | "timeline";
@@ -40,6 +44,25 @@ type DatabaseState = {
   views: DatabaseView[];
   activeViewId: string | null;
 };
+
+type InlineDatabaseSyncContextValue = {
+  enabled: boolean;
+  pageId: string | null;
+  collaborative?: boolean;
+  readOnly?: boolean;
+};
+
+const InlineDatabaseSyncContext = createContext<InlineDatabaseSyncContextValue>({ enabled: false, pageId: null, collaborative: false, readOnly: false });
+
+export function InlineDatabaseSyncProvider({
+  enabled,
+  pageId,
+  collaborative = false,
+  readOnly = false,
+  children,
+}: InlineDatabaseSyncContextValue & { children: ReactNode }) {
+  return <InlineDatabaseSyncContext.Provider value={{ enabled, pageId, collaborative, readOnly }}>{children}</InlineDatabaseSyncContext.Provider>;
+}
 
 type DatabasePopoverController = { openPopoverId: string | null; setOpenPopoverId: Dispatch<SetStateAction<string | null>> };
 const DatabasePopoverContext = createContext<DatabasePopoverController | null>(null);
@@ -246,17 +269,130 @@ function recordsForView(records: DatabaseRecord[], properties: DatabaseProperty[
   return next;
 }
 
-export function InlineDatabase({ databaseId, locked, onNotice, onRemove }: { databaseId: string; locked: boolean; onNotice: (message: string) => void; onRemove: () => void }) {
+export function InlineDatabase({ databaseId, locked: editorLocked, onNotice, onRemove }: { databaseId: string; locked: boolean; onNotice: (message: string) => void; onRemove: () => void }) {
+  const serverSync = useContext(InlineDatabaseSyncContext);
+  const locked = editorLocked || Boolean(serverSync.readOnly);
   const [database, setDatabase] = useState<DatabaseState>(() => loadDatabase(databaseId));
   const [pendingDeletion, setPendingDeletion] = useState<DatabaseRecord | null>(null);
   const [pendingDatabaseRemoval, setPendingDatabaseRemoval] = useState(false);
   const [timelineStart, setTimelineStart] = useState(() => beginningOfWeek(new Date()));
   const [openPopoverId, setOpenPopoverId] = useState<string | null>(null);
   const [searchQueries, setSearchQueries] = useState<Record<string, string>>({});
+  const databaseRef = useRef(database);
+  const serverRevisionRef = useRef<number | undefined>(undefined);
+  const serverReadyRef = useRef(!serverSync.enabled);
+  const serverSaveTimerRef = useRef<number | null>(null);
+  const applyingRealtimeStateRef = useRef(false);
+  const noticeRef = useRef(onNotice);
+
+  useEffect(() => {
+    databaseRef.current = database;
+  }, [database]);
+
+  useEffect(() => {
+    noticeRef.current = onNotice;
+  }, [onNotice]);
+
+  useEffect(() => {
+    if (!locked) return;
+    setOpenPopoverId(null);
+    setPendingDeletion(null);
+    setPendingDatabaseRemoval(false);
+    if (serverSaveTimerRef.current) {
+      window.clearTimeout(serverSaveTimerRef.current);
+      serverSaveTimerRef.current = null;
+    }
+  }, [locked]);
+
+  useEffect(() => {
+    if (!serverSync.enabled) {
+      serverReadyRef.current = true;
+      serverRevisionRef.current = undefined;
+      return;
+    }
+
+    let active = true;
+    serverReadyRef.current = false;
+    serverRevisionRef.current = undefined;
+    void workspaceApi.getDatabase<DatabaseState>(databaseId).then((value) => {
+      if (!active) return;
+      serverRevisionRef.current = value.revision;
+      serverReadyRef.current = true;
+      setDatabase(value.state);
+    }).catch(async (error) => {
+      if (!active) return;
+      if (error instanceof NodiApiError && error.status === 404 && !locked) {
+        try {
+          const created = await workspaceApi.putDatabase(databaseId, {
+            pageId: serverSync.pageId,
+            state: databaseRef.current,
+          });
+          if (!active) return;
+          serverRevisionRef.current = created.revision;
+          serverReadyRef.current = true;
+          return;
+        } catch (createError) {
+          if (!active) return;
+          noticeRef.current(createError instanceof Error ? createError.message : "데이터베이스를 서버에 저장하지 못했어요");
+        }
+      } else {
+        noticeRef.current(error instanceof Error ? error.message : "데이터베이스를 서버에서 불러오지 못했어요");
+      }
+      serverReadyRef.current = false;
+    });
+
+    return () => {
+      active = false;
+      if (serverSaveTimerRef.current) window.clearTimeout(serverSaveTimerRef.current);
+    };
+  }, [databaseId, locked, serverSync.enabled, serverSync.pageId]);
+
+  useEffect(() => {
+    if (!serverSync.enabled) return;
+    const applyRealtimeState = (event: Event) => {
+      const value = (event as CustomEvent<ServerInlineDatabase<DatabaseState>>).detail;
+      if (!value || value.id !== databaseId || value.revision <= (serverRevisionRef.current ?? 0)) return;
+      serverRevisionRef.current = value.revision;
+      applyingRealtimeStateRef.current = true;
+      setDatabase(value.state);
+    };
+    window.addEventListener(INLINE_DATABASE_REALTIME_EVENT, applyRealtimeState);
+    return () => window.removeEventListener(INLINE_DATABASE_REALTIME_EVENT, applyRealtimeState);
+  }, [databaseId, serverSync.enabled]);
 
   useEffect(() => {
     window.localStorage.setItem(databaseStorageKey(databaseId), JSON.stringify(database));
-  }, [database, databaseId]);
+    if (applyingRealtimeStateRef.current) {
+      applyingRealtimeStateRef.current = false;
+      return;
+    }
+    if (locked || !serverSync.enabled || !serverReadyRef.current) return;
+    if (serverSaveTimerRef.current) window.clearTimeout(serverSaveTimerRef.current);
+    serverSaveTimerRef.current = window.setTimeout(() => {
+      void workspaceApi.putDatabase(databaseId, {
+        pageId: serverSync.pageId,
+        state: database,
+        revision: serverSync.collaborative ? undefined : serverRevisionRef.current,
+      }).then((value) => {
+        serverRevisionRef.current = value.revision;
+      }).catch((error) => {
+        if (error instanceof NodiApiError && error.status === 409) {
+          void workspaceApi.getDatabase<DatabaseState>(databaseId).then((latest) => {
+            serverRevisionRef.current = latest.revision;
+            setDatabase(latest.state);
+            noticeRef.current("다른 위치에서 변경된 최신 데이터베이스를 불러왔어요");
+          }).catch((reloadError) => {
+            noticeRef.current(reloadError instanceof Error ? reloadError.message : "최신 데이터베이스를 불러오지 못했어요");
+          });
+          return;
+        }
+        noticeRef.current(error instanceof Error ? error.message : "데이터베이스를 서버에 저장하지 못했어요");
+      });
+    }, 500);
+    return () => {
+      if (serverSaveTimerRef.current) window.clearTimeout(serverSaveTimerRef.current);
+    };
+  }, [database, databaseId, locked, serverSync.collaborative, serverSync.enabled, serverSync.pageId]);
 
   useEffect(() => {
     if (!openPopoverId) return;
@@ -277,7 +413,10 @@ export function InlineDatabase({ databaseId, locked, onNotice, onRemove }: { dat
   }, [openPopoverId]);
 
   const activeView = database.views.find((view) => view.id === database.activeViewId) ?? database.views[0];
-  const updateDatabase = (updater: (current: DatabaseState) => DatabaseState) => setDatabase(updater);
+  const updateDatabase = (updater: (current: DatabaseState) => DatabaseState) => {
+    if (locked) return;
+    setDatabase(updater);
+  };
 
   const addView = (type: ViewType) => {
     const baseName = type === "table" ? "테이블" : "타임라인";
@@ -425,7 +564,17 @@ export function InlineDatabase({ databaseId, locked, onNotice, onRemove }: { dat
       {activeView.type === "table" ? <DatabaseTable records={visibleRecords} properties={visibleProperties} disabled={locked} hasHiddenProperties={(activeView.hiddenPropertyIds?.length ?? 0) > 0} isFiltered={Boolean(activeSearchQuery || activeView.filter)} columnWidths={activeView.columnWidths ?? {}} onColumnWidthsChange={(columnWidths) => updateView(activeView.id, { columnWidths })} onAddRecord={addRecord} onAddProperty={addProperty} onUpdateProperty={updateProperty} onRemoveProperty={removeProperty} onAddSelectOption={addSelectOption} onRemoveSelectOption={removeSelectOption} onUpdate={updateRecord} onDuplicate={duplicateRecord} onDelete={setPendingDeletion} /> : <DatabaseTimeline view={activeView} records={visibleRecords} properties={database.properties} disabled={locked} start={timelineStart} onAddDateProperty={addDateProperty} onChangeView={(patch) => updateView(activeView.id, patch)} onUpdateRecord={updateRecord} onPrevious={(days) => setTimelineStart((date) => new Date(date.getFullYear(), date.getMonth(), date.getDate() - days))} onNext={(days) => setTimelineStart((date) => new Date(date.getFullYear(), date.getMonth(), date.getDate() + days))} onToday={() => setTimelineStart(beginningOfWeek(new Date()))} />}
     </>}
     {pendingDeletion && <RecordDeleteConfirm recordName={recordLabel(pendingDeletion, database.properties, Math.max(0, database.records.findIndex((record) => record.id === pendingDeletion.id)))} onCancel={() => setPendingDeletion(null)} onConfirm={moveToTrash} />}
-    {pendingDatabaseRemoval && <DatabaseDeleteConfirm databaseName={database.name} onCancel={() => setPendingDatabaseRemoval(false)} onConfirm={() => { onNotice("데이터베이스를 삭제했어요"); onRemove(); }} />}
+    {pendingDatabaseRemoval && <DatabaseDeleteConfirm databaseName={database.name} onCancel={() => setPendingDatabaseRemoval(false)} onConfirm={() => {
+      if (serverSync.enabled) {
+        void workspaceApi.deleteDatabase(databaseId).catch((error) => {
+          if (!(error instanceof NodiApiError && error.status === 404)) {
+            noticeRef.current(error instanceof Error ? error.message : "데이터베이스를 서버에서 삭제하지 못했어요");
+          }
+        });
+      }
+      onNotice("데이터베이스를 삭제했어요");
+      onRemove();
+    }} />}
   </section></DatabasePopoverContext.Provider>;
 }
 
