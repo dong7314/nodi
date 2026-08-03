@@ -180,7 +180,7 @@ export function WorkspaceSearchDialog({
 
   const records = useMemo<WorkspaceSearchRecord[]>(() => (
     Object.values(pages)
-      .filter((page) => !page.archived)
+      .filter((page) => !page.archived && (page.permission ?? "owner") === "owner")
       .map((page) => {
         const lines = getPageTextLines(page);
         return {

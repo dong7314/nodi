@@ -265,7 +265,7 @@ export function PageSharePanel({
             <Copy size={15} /> 공유 링크 복사
           </button>
           <small className="share-note">
-            회원 공유는 현재 기기의 Nodi 공유 저장소에 반영됩니다. 인증 서버 연결 후 동일한 UI에서 실제 초대로 전환됩니다.
+            회원 공유와 권한 변경은 Nodi 서버에 안전하게 저장됩니다.
           </small>
         </section>
       </div>

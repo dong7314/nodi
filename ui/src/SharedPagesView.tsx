@@ -1,5 +1,5 @@
 import {
-  ArrowRight,
+  ArrowUpRight,
   Eye,
   FileText,
   Inbox,
@@ -101,7 +101,9 @@ export function SharedPagesView({
                     <strong>{page.title || "제목 없음"}</strong>
                     <small>{members.length}명의 Nodi 회원과 공유 중</small>
                   </span>
-                  <ArrowRight size={17} />
+                  <span className="shared-page-open-affordance" aria-hidden="true">
+                    <span>열기</span><ArrowUpRight size={15} />
+                  </span>
                 </button>
                 <div className="shared-page-members">
                   <div className="shared-page-avatars" aria-label={`공유 회원 ${members.length}명`}>
@@ -144,6 +146,7 @@ export function SharedPagesView({
               key={record.pageId}
               record={record}
               page={page}
+              owner={registeredUsers.find((user) => user.id === record.ownerId)}
               permission={permission}
               commentCount={commentCounts[record.pageId] ?? 0}
               onOpenPage={onOpenPage}
@@ -164,6 +167,7 @@ export function SharedPagesView({
 type ReceivedSharedPageCardProps = {
   record: PageShareRecord;
   page: StoredPages[string];
+  owner?: NodiUser;
   permission: SharePermission;
   commentCount: number;
   onOpenPage: (pageId: string) => void;
@@ -172,6 +176,7 @@ type ReceivedSharedPageCardProps = {
 function ReceivedSharedPageCard({
   record,
   page,
+  owner,
   permission,
   commentCount,
   onOpenPage,
@@ -182,16 +187,27 @@ function ReceivedSharedPageCard({
         <span className="shared-page-icon">{page.settings.icon || <FileText size={18} />}</span>
         <span className="shared-page-copy">
           <strong>{page.title || "제목 없음"}</strong>
-          <small>{record.ownerName || "Nodi 회원"}님이 공유</small>
+          <small>공유받은 페이지</small>
         </span>
-        <ArrowRight size={17} />
+        <span className="shared-page-open-affordance" aria-hidden="true">
+          <span>열기</span><ArrowUpRight size={15} />
+        </span>
       </button>
       <div className="shared-page-members">
+        <span className="shared-page-owner">
+          {owner ? (
+            <NodiUserAvatar user={owner} className="shared-page-owner-avatar" />
+          ) : (
+            <i className="shared-page-owner-avatar is-fallback" aria-hidden="true">
+              {(record.ownerName || "N").trim().slice(0, 1)}
+            </i>
+          )}
+          <span>{record.ownerName || "Nodi 회원"}님이 공유</span>
+        </span>
         <span className={`shared-page-permission is-${permission}`}>
           {permission === "edit" ? <PencilLine size={13} /> : <Eye size={13} />}
           {permission === "edit" ? "편집 가능" : "보기 전용"}
         </span>
-        <span className="shared-page-owner">{record.ownerName || "Nodi 회원"} 소유</span>
         {commentCount > 0 && (
           <span className="shared-page-comment-count">
             <MessageCircle size={13} /> 댓글 {commentCount}

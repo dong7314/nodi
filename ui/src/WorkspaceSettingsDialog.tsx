@@ -21,7 +21,6 @@ import {
 } from "lucide-react";
 import type { PartialBlock } from "@blocknote/core";
 import {
-  changeLocalPassword,
   persistRegistrationRequests,
   readRegistrationRequests,
   REGISTRATION_REQUESTS_CHANGED_EVENT,
@@ -33,6 +32,7 @@ import { ConfirmDialog } from "./components/ui/confirm-dialog";
 import { NODI_INITIAL_AVATAR_ICON, NodiUserAvatar } from "./NodiUserAvatar";
 import { isPageIcon, PAGE_ICONS } from "./page-icons";
 import type { NodiAvatarColor, NodiUser } from "./sharing-store";
+import { authApi } from "./server-api";
 import {
   cloneStarterPresets,
   createStarterPreset,
@@ -170,25 +170,34 @@ export function WorkspaceSettingsDialog({
       return;
     }
     setPasswordSaving(true);
-    const result = await changeLocalPassword(currentPassword, nextPassword);
-    setPasswordSaving(false);
-    setPasswordFeedback({ kind: result.ok ? "success" : "error", text: result.message });
-    if (result.ok) {
+    try {
+      await authApi.changePassword(currentPassword, nextPassword);
+      setPasswordFeedback({ kind: "success", text: "비밀번호를 변경했어요." });
       setCurrentPassword("");
       setNextPassword("");
       setPasswordConfirmation("");
+    } catch (error) {
+      setPasswordFeedback({ kind: "error", text: error instanceof Error ? error.message : "비밀번호를 변경하지 못했어요." });
     }
+    setPasswordSaving(false);
   };
 
-  const decideRegistration = (requestId: string, status: Exclude<RegistrationRequestStatus, "pending">) => {
-    const decidedAt = new Date().toISOString();
+  const decideRegistration = async (requestId: string, status: Exclude<RegistrationRequestStatus, "pending">) => {
     const targetRequest = registrationRequests.find((request) => request.id === requestId);
+    if (!targetRequest) return;
+    let decidedAt = new Date().toISOString();
+    try {
+      const result = await authApi.decideRegistration(requestId, status);
+      decidedAt = result.decidedAt;
+    } catch {
+      return;
+    }
     const nextRequests = registrationRequests.map((request) => (
       request.id === requestId ? { ...request, status, decidedAt } : request
     ));
     setRegistrationRequests(nextRequests);
     persistRegistrationRequests(nextRequests);
-    if (targetRequest) updateLocalAccountRegistrationStatus(targetRequest.email, status);
+    updateLocalAccountRegistrationStatus(targetRequest.email, status);
   };
 
   const saveStarterPresets = () => {
@@ -224,6 +233,17 @@ export function WorkspaceSettingsDialog({
       window.removeEventListener(REGISTRATION_REQUESTS_CHANGED_EVENT, syncRegistrationRequests);
     };
   }, []);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    let active = true;
+    void authApi.registrationRequests().then((requests) => {
+      if (active) setRegistrationRequests(requests);
+    }).catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [isAdmin]);
 
   return createPortal(
     <div

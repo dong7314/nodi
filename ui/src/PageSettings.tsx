@@ -3,7 +3,7 @@ import { CalendarDays, Check, CircleDotDashed, Columns3, Eye, EyeOff, Lock, Pale
 import { DatePicker } from "./components/ui/date-picker";
 import { Select } from "./components/ui/select";
 import { TagPicker } from "./TagPicker";
-import { DEFAULT_TAG_OPTIONS } from "./types";
+import { DEFAULT_TAG_OPTIONS, type TagOption } from "./types";
 import { PAGE_ICONS } from "./page-icons";
 
 export type CoverTheme = "aurora" | "sunset" | "ocean" | "paper";
@@ -23,6 +23,7 @@ export type PageSettings = {
 
 type PageSettingsPanelProps = {
   settings: PageSettings;
+  tagOptions?: TagOption[];
   onChange: (settings: PageSettings) => void;
   onClose: () => void;
 };
@@ -39,7 +40,7 @@ const pageStatusOptions = [
   { value: "완료", label: "완료", className: "status-done" },
 ];
 
-export function PageSettingsPanel({ settings, onChange, onClose }: PageSettingsPanelProps) {
+export function PageSettingsPanel({ settings, tagOptions = DEFAULT_TAG_OPTIONS, onChange, onClose }: PageSettingsPanelProps) {
   const [isClosing, setIsClosing] = useState(false);
   const [openPropertyMenu, setOpenPropertyMenu] = useState<"status" | "tags" | "date" | null>(null);
   const isClosingRef = useRef(false);
@@ -103,7 +104,7 @@ export function PageSettingsPanel({ settings, onChange, onClose }: PageSettingsP
           <section className="setting-section">
             <label>페이지 속성</label>
             <div className="page-setting-field" data-page-property-menu="status"><span><CircleDotDashed size={14} /> 상태</span><Select open={openPropertyMenu === "status"} onOpenChange={(open) => changePropertyMenu("status", open)} value={settings.status} onValueChange={(value) => update("status", value as PageSettings["status"])} options={pageStatusOptions} ariaLabel="페이지 상태" side="bottom" align="end" collisionPadding={16} contentClassName="page-settings-status-menu" className={`status-select page-settings-status-trigger ${settings.status === "초안" ? "status-waiting" : settings.status === "진행 중" ? "status-progress" : "status-done"}`} /></div>
-            <div className="page-setting-field is-tags" data-page-property-menu="tags"><span><Tags size={14} /> 태그</span><TagPicker open={openPropertyMenu === "tags"} onOpenChange={(open) => changePropertyMenu("tags", open)} value={settings.tags} options={DEFAULT_TAG_OPTIONS} onChange={(tags) => update("tags", tags)} compact align="end" collisionPadding={16} /></div>
+            <div className="page-setting-field is-tags" data-page-property-menu="tags"><span><Tags size={14} /> 태그</span><TagPicker open={openPropertyMenu === "tags"} onOpenChange={(open) => changePropertyMenu("tags", open)} value={settings.tags} options={tagOptions} onChange={(tags) => update("tags", tags)} compact align="end" collisionPadding={16} /></div>
             <div className="page-setting-field" data-page-property-menu="date"><span><CalendarDays size={14} /> 날짜</span><DatePicker open={openPropertyMenu === "date"} onOpenChange={(open) => changePropertyMenu("date", open)} compact side="left" align="center" collisionPadding={16} value={settings.date} onChange={(date) => update("date", date)} ariaLabel="페이지 날짜" /></div>
           </section>
 
