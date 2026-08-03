@@ -20,6 +20,9 @@ export type StoredPage = {
   favoritedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  ownerId?: string;
+  permission?: "owner" | "view" | "edit";
+  revision?: number;
 };
 
 export type StoredPages = Record<string, StoredPage>;
@@ -31,6 +34,7 @@ export type StoredFolder = {
   order: number;
   collapsed: boolean;
   createdAt: string;
+  updatedAt?: string;
 };
 
 export type StoredFolders = Record<string, StoredFolder>;

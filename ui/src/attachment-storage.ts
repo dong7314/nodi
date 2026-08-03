@@ -1,3 +1,5 @@
+import { API_BASE_URL } from "./api-client";
+
 export const APP_NOTICE_EVENT = "nodi:notice";
 
 const LOCAL_IMAGE_UPLOAD_LIMIT = 1_250_000;
@@ -6,6 +8,10 @@ const DEFAULT_REMOTE_IMAGE_LIMIT_MB = 20;
 const DEFAULT_REMOTE_FILE_LIMIT_MB = 100;
 
 type AttachmentKind = "image" | "file";
+export type NodiAttachmentContext = {
+  authenticated?: boolean;
+  pageId?: string | null;
+};
 
 type PresignedUploadResponse = {
   uploadUrl: string;
@@ -79,7 +85,19 @@ function getStableAssetUrl(payload: CompleteUploadResponse) {
   return payload.assetUrl ?? payload.fileUrl;
 }
 
-async function uploadToMinio(file: File) {
+function getAuthenticatedApiUrl(value: string) {
+  try {
+    const url = new URL(value, window.location.href);
+    if (url.pathname.startsWith("/v1/")) {
+      return `${API_BASE_URL}${url.pathname.slice(3)}${url.search}`;
+    }
+  } catch {
+    // Keep custom deployment URLs intact when they cannot be parsed here.
+  }
+  return value;
+}
+
+async function uploadToMinio(file: File, pageId?: string | null) {
   const kind = getAttachmentKind(file);
   const sizeLimit = getRemoteSizeLimit(kind);
   if (file.size > sizeLimit) {
@@ -87,10 +105,8 @@ async function uploadToMinio(file: File) {
     throw new Error(`${limitLabel} 이하의 ${kind === "image" ? "이미지" : "파일"}만 첨부할 수 있습니다.`);
   }
 
-  const presignEndpoint = import.meta.env.VITE_ATTACHMENT_PRESIGN_ENDPOINT?.trim();
-  if (!presignEndpoint) {
-    throw new Error("MinIO 업로드 주소 발급 API가 설정되지 않았습니다.");
-  }
+  const presignEndpoint = import.meta.env.VITE_ATTACHMENT_PRESIGN_ENDPOINT?.trim()
+    || `${API_BASE_URL}/attachments/presign`;
 
   const contentType = file.type || "application/octet-stream";
   const presignResponse = await fetch(presignEndpoint, {
@@ -98,6 +114,7 @@ async function uploadToMinio(file: File) {
     credentials: "include",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
+      pageId: pageId ?? null,
       fileName: file.name,
       contentType,
       size: file.size,
@@ -127,7 +144,7 @@ async function uploadToMinio(file: File) {
 
   let assetUrl = getStableAssetUrl(presigned);
   if (presigned.completeUrl) {
-    const completeResponse = await fetch(presigned.completeUrl, {
+    const completeResponse = await fetch(getAuthenticatedApiUrl(presigned.completeUrl), {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
@@ -150,7 +167,7 @@ async function uploadToMinio(file: File) {
   if (!assetUrl) {
     throw new Error("파일을 다시 불러올 수 있는 주소가 없습니다.");
   }
-  return assetUrl;
+  return getAuthenticatedApiUrl(assetUrl);
 }
 
 async function uploadToLocalStorage(file: File) {
@@ -163,12 +180,13 @@ async function uploadToLocalStorage(file: File) {
   return readFileAsDataUrl(file);
 }
 
-export async function uploadNodiAttachment(file: File) {
-  const storageMode = import.meta.env.VITE_ATTACHMENT_STORAGE_MODE?.trim().toLowerCase();
+export async function uploadNodiAttachment(file: File, context: NodiAttachmentContext = {}) {
+  const configuredStorageMode = import.meta.env.VITE_ATTACHMENT_STORAGE_MODE?.trim().toLowerCase();
+  const storageMode = configuredStorageMode || (context.authenticated === true ? "minio" : "local");
 
   try {
-    const assetUrl = storageMode === "minio"
-      ? await uploadToMinio(file)
+    const assetUrl = storageMode === "minio" && context.authenticated === true
+      ? await uploadToMinio(file, context.pageId)
       : await uploadToLocalStorage(file);
     notify(`${file.name}을(를) 첨부했어요`);
     return assetUrl;
