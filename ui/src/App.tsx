@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
   ClipboardEvent as ReactClipboardEvent,
   FocusEvent as ReactFocusEvent,
@@ -17,17 +17,30 @@ import { createHighlighter } from "shiki";
 import { BlockCommentPanel } from "./BlockCommentPanel";
 import { BlockNotePopoverScrollOverlays } from "./BlockNotePopoverScrollOverlays";
 import { AuthDialog, type AuthDialogMode } from "./AuthDialog";
-import { InlineDatabase } from "./InlineDatabase";
+import { INLINE_DATABASE_REALTIME_EVENT, InlineDatabase, InlineDatabaseSyncProvider } from "./InlineDatabase";
 import { PageSharePanel } from "./PageSharePanel";
 import { PageSettingsPanel, type PageSettings } from "./PageSettings";
 import { SharedPagesView } from "./SharedPagesView";
+import { TrashView } from "./TrashView";
 import { SidebarScrollOverlay } from "./SidebarScrollOverlay";
 import { TagPicker } from "./TagPicker";
 import { NodiUserAvatar } from "./NodiUserAvatar";
 import { WorkspaceSettingsDialog } from "./WorkspaceSettingsDialog";
 import { WorkspaceSearchDialog } from "./WorkspaceSearchDialog";
+import {
+  authApi,
+  workspaceApi,
+  type ServerCommentThread,
+  type ServerFolder,
+  type ServerHome,
+  type ServerNotification,
+  type ServerPage,
+  type ServerPageRealtimeEvent,
+  type ServerRealtimeParticipant,
+  type ServerShare,
+} from "./server-api";
 import { APP_NOTICE_EVENT, uploadNodiAttachment } from "./attachment-storage";
-import { DEFAULT_TAG_OPTIONS, toDateInput } from "./types";
+import { DEFAULT_TAG_OPTIONS, toDateInput, type TagOption } from "./types";
 import { makeId } from "./types";
 import { DatePicker } from "./components/ui/date-picker";
 import { Select } from "./components/ui/select";
@@ -36,6 +49,7 @@ import { ChildPageBlock } from "./ChildPageBlock";
 import {
   persistStoredBlockComments,
   readStoredBlockComments,
+  type BlockCommentThread,
   type StoredBlockComments,
 } from "./comment-store";
 import {
@@ -45,6 +59,7 @@ import {
   readLocalAuthUser,
   readRegistrationRequests,
   REGISTRATION_REQUESTS_CHANGED_EVENT,
+  restoreServerAuth,
   updateLocalAccountProfile,
   type LocalAuthUser,
 } from "./account-store";
@@ -66,6 +81,7 @@ import {
   persistStoredPageShares,
   readStoredPageShares,
   type NodiAvatarColor,
+  type PageShareRecord,
   type SharePermission,
   type StoredPageShares,
 } from "./sharing-store";
@@ -90,9 +106,11 @@ import {
   Clock3,
   Command,
   Download,
+  Eye,
   Database,
   FileText,
   FolderPlus,
+  Globe2,
   GripVertical,
   HardDrive,
   Hash,
@@ -149,7 +167,6 @@ const PAGE_ARCHIVED_STORAGE_KEY = "nodi:quick-note:archived";
 const PAGE_TRASH_STORAGE_KEY = "nodi:quick-note:trash";
 const PAGE_DRAWER_WIDTH_STORAGE_KEY = "nodi:page-drawer-width";
 const APP_THEME_STORAGE_KEY = "nodi:app-theme";
-const INBOX_READ_STORAGE_KEY = "nodi:inbox-read";
 const HOME_PAGE_TITLE_STORAGE_KEY = "nodi:home-title-v2";
 const USER_NAME_STORAGE_KEY = "nodi:user:name";
 const USER_PROFILE_STORAGE_KEYS = ["nodi:user:profile", "nodi:auth:user"];
@@ -157,7 +174,11 @@ const DEFAULT_USER_NAME = "Lee";
 const USER_PROFILE_CHANGED_EVENT = "nodi:user-profile-changed";
 type AppTheme = "light" | "dark";
 type LocalSaveState = "saving" | "saved" | "error";
-type WorkspaceSection = "pages" | "shared";
+type NodiPreferences = {
+  theme?: AppTheme;
+  [key: string]: unknown;
+};
+type WorkspaceSection = "pages" | "shared" | "shared-page" | "trash";
 type InboxNotification = {
   id: string;
   kind: "share" | "comment" | "mention";
@@ -165,46 +186,8 @@ type InboxNotification = {
   description: string;
   time: string;
   unread: boolean;
+  pageId?: string | null;
 };
-
-const INITIAL_INBOX_NOTIFICATIONS: InboxNotification[] = [
-  {
-    id: "shared-project-notes",
-    kind: "share",
-    title: "민지님이 ‘프로젝트 회의록’을 공유했어요",
-    description: "공유 페이지에 편집 권한으로 초대했습니다.",
-    time: "방금 전",
-    unread: true,
-  },
-  {
-    id: "comment-next-schedule",
-    kind: "comment",
-    title: "서준님이 댓글을 남겼어요",
-    description: "“다음 일정은 금요일로 정리할까요?”",
-    time: "12분 전",
-    unread: true,
-  },
-  {
-    id: "mention-planning-draft",
-    kind: "mention",
-    title: "지우님이 회원님을 언급했어요",
-    description: "‘기획 초안’의 할 일 블록에서 언급했습니다.",
-    time: "1시간 전",
-    unread: true,
-  },
-];
-
-function getInitialInboxNotifications() {
-  try {
-    const readIds = new Set(JSON.parse(window.localStorage.getItem(INBOX_READ_STORAGE_KEY) ?? "[]") as string[]);
-    return INITIAL_INBOX_NOTIFICATIONS.map((notification) => ({
-      ...notification,
-      unread: !readIds.has(notification.id),
-    }));
-  } catch {
-    return INITIAL_INBOX_NOTIFICATIONS;
-  }
-}
 
 function getPrimaryShortcutLabel() {
   if (typeof navigator === "undefined") return "Ctrl";
@@ -512,7 +495,12 @@ function getSidebarOrderedItems(
   parentId: string | null,
 ): SidebarOrderedItem[] {
   const pageItems: SidebarOrderedItem[] = Object.values(pages)
-    .filter((page) => page.id !== ROOT_PAGE_ID && getPageSidebarParentId(page, folders) === parentId)
+    .filter((page) => (
+      page.id !== ROOT_PAGE_ID
+      && !page.archived
+      && (page.permission ?? "owner") === "owner"
+      && getPageSidebarParentId(page, folders) === parentId
+    ))
     .sort((first, second) => first.order - second.order || first.createdAt.localeCompare(second.createdAt))
     .map((page) => ({ kind: "page", id: page.id, order: page.order, createdAt: page.createdAt, page }));
   const folderItems: SidebarOrderedItem[] = Object.values(folders)
@@ -1130,23 +1118,263 @@ function getInitialPages(): StoredPages {
   return pages;
 }
 
+function sameServerValue(left: unknown, right: unknown) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+type PageServerPatch = Partial<Pick<
+  StoredPage,
+  "parentId" | "folderId" | "order" | "title" | "settings" | "blocks" | "archived" | "revision"
+>>;
+
+function getPageServerPatch(previous: StoredPage, next: StoredPage): PageServerPatch {
+  const permission = previous.permission ?? next.permission ?? "owner";
+  const patch: PageServerPatch = {};
+  if (permission === "owner") {
+    if (previous.parentId !== next.parentId) patch.parentId = next.parentId;
+    if (previous.folderId !== next.folderId) patch.folderId = next.folderId;
+    if (previous.order !== next.order) patch.order = next.order;
+    if (previous.archived !== next.archived) patch.archived = next.archived;
+  }
+  if (permission !== "view") {
+    if (previous.title !== next.title) patch.title = next.title;
+    if (!sameServerValue(previous.settings, next.settings)) patch.settings = next.settings;
+    if (!sameServerValue(previous.blocks, next.blocks)) patch.blocks = next.blocks;
+  }
+  return patch;
+}
+
+function getPageEditableSnapshot(page: StoredPage) {
+  return {
+    parentId: page.parentId,
+    folderId: page.folderId,
+    order: page.order,
+    title: page.title,
+    settings: page.settings,
+    blocks: page.blocks,
+    archived: page.archived,
+  };
+}
+
+type RealtimeBlockPatch = {
+  blocks: PartialBlock[];
+  changedBlockIds: string[];
+  deletedBlockIds: string[];
+  structural: boolean;
+};
+
+function realtimeBlockId(block: PartialBlock): string {
+  return String((block as PartialBlock & { id?: string }).id ?? "");
+}
+
+function cloneRealtimeBlocks(blocks: PartialBlock[]): PartialBlock[] {
+  return JSON.parse(JSON.stringify(blocks)) as PartialBlock[];
+}
+
+function buildRealtimeBlockPatch(previous: PartialBlock[], next: PartialBlock[]): RealtimeBlockPatch | null {
+  const previousById = new Map(previous.map((block) => [realtimeBlockId(block), block]));
+  const nextById = new Map(next.map((block) => [realtimeBlockId(block), block]));
+  const previousIds = previous.map(realtimeBlockId).filter(Boolean);
+  const nextIds = next.map(realtimeBlockId).filter(Boolean);
+  if (nextIds.length !== next.length) return null;
+
+  const changedBlockIds = nextIds.filter((id) => {
+    const previousBlock = previousById.get(id);
+    const nextBlock = nextById.get(id);
+    return !previousBlock || !sameServerValue(previousBlock, nextBlock);
+  });
+  const deletedBlockIds = previousIds.filter((id) => !nextById.has(id));
+  const structural = previousIds.length !== nextIds.length
+    || previousIds.some((id, index) => nextIds[index] !== id);
+  if (!structural && changedBlockIds.length === 0 && deletedBlockIds.length === 0) return null;
+  return {
+    blocks: cloneRealtimeBlocks(next),
+    changedBlockIds,
+    deletedBlockIds,
+    structural,
+  };
+}
+
+function storedPageFromServer(page: ServerPage): StoredPage {
+  return {
+    id: page.id,
+    parentId: page.parentId,
+    folderId: page.folderId,
+    order: page.order,
+    title: page.title,
+    settings: { ...defaultPageSettings, ...page.settings },
+    blocks: page.blocks?.length ? page.blocks : [{ type: "paragraph", content: "" }],
+    archived: page.archived,
+    favoritedAt: page.favoritedAt,
+    createdAt: page.createdAt,
+    updatedAt: page.updatedAt,
+    ownerId: page.ownerId,
+    permission: page.permission,
+    revision: page.revision,
+  };
+}
+
+function storedHomeFromServer(home: ServerHome): StoredPage {
+  return {
+    id: ROOT_PAGE_ID,
+    parentId: null,
+    folderId: null,
+    order: 0,
+    title: home.title,
+    settings: { ...defaultPageSettings, ...home.settings, publicAccess: false },
+    blocks: home.blocks?.length ? home.blocks : [{ type: "paragraph", content: "" }],
+    archived: false,
+    favoritedAt: null,
+    createdAt: home.createdAt,
+    updatedAt: home.updatedAt,
+    ownerId: home.ownerId,
+    permission: "owner",
+    revision: home.revision,
+  };
+}
+
+function storedFolderFromServer(folder: ServerFolder): StoredFolder {
+  return {
+    id: folder.id,
+    parentId: folder.parentId,
+    title: folder.title,
+    order: folder.order,
+    collapsed: folder.collapsed,
+    createdAt: folder.createdAt,
+    updatedAt: folder.updatedAt,
+  };
+}
+
+function storedShareFromServer(share: ServerShare): PageShareRecord {
+  return {
+    pageId: share.pageId,
+    ownerId: share.owner.id,
+    ownerName: share.owner.name,
+    members: share.members.map((member) => ({
+      userId: member.user.id,
+      permission: member.permission,
+      sharedAt: member.sharedAt,
+    })),
+    updatedAt: share.updatedAt,
+  };
+}
+
+function storedCommentFromServer(thread: ServerCommentThread): BlockCommentThread {
+  return {
+    id: thread.id,
+    pageId: thread.pageId,
+    blockId: thread.blockId,
+    blockPreview: thread.blockPreview,
+    resolvedAt: thread.resolvedAt,
+    resolvedBy: thread.resolvedBy,
+    updatedAt: thread.updatedAt,
+    messages: thread.messages.map((message) => ({
+      id: message.id,
+      parentId: message.parentId,
+      authorId: message.authorId,
+      authorName: message.authorName,
+      authorEmail: message.authorEmail,
+      body: message.body,
+      createdAt: message.createdAt,
+    })),
+  };
+}
+
+function notificationTimeLabel(createdAt: string) {
+  const elapsed = Math.max(0, Date.now() - new Date(createdAt).getTime());
+  const minutes = Math.floor(elapsed / 60_000);
+  if (minutes < 1) return "방금 전";
+  if (minutes < 60) return `${minutes}분 전`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}시간 전`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}일 전`;
+  return new Intl.DateTimeFormat("ko-KR", { month: "short", day: "numeric" }).format(new Date(createdAt));
+}
+
+function inboxNotificationFromServer(notification: ServerNotification): InboxNotification {
+  return {
+    id: notification.id,
+    kind: notification.kind,
+    title: notification.title,
+    description: notification.description,
+    time: notificationTimeLabel(notification.createdAt),
+    unread: notification.readAt === null,
+    pageId: notification.pageId,
+  };
+}
+
+function pageDepth(pages: StoredPages, page: StoredPage) {
+  let depth = 0;
+  let parentId = page.parentId;
+  const seen = new Set([page.id]);
+  while (parentId && pages[parentId] && !seen.has(parentId)) {
+    seen.add(parentId);
+    depth += 1;
+    parentId = pages[parentId].parentId;
+  }
+  return depth;
+}
+
+function folderDepth(folders: StoredFolders, folder: StoredFolder) {
+  let depth = 0;
+  let parentId = folder.parentId;
+  const seen = new Set([folder.id]);
+  while (parentId && folders[parentId] && !seen.has(parentId)) {
+    seen.add(parentId);
+    depth += 1;
+    parentId = folders[parentId].parentId;
+  }
+  return depth;
+}
+
+function getPageLink(pageId: string, isPublic: boolean) {
+  const url = new URL(window.location.href);
+  url.hash = "";
+  url.search = "";
+  url.searchParams.set(isPublic ? "publicPage" : "page", pageId);
+  return url.toString();
+}
+
 function App() {
+  const publicPageId = useMemo(() => new URLSearchParams(window.location.search).get("publicPage"), []);
+  const linkedPageId = useMemo(() => new URLSearchParams(window.location.search).get("page"), []);
   const initialAuthUser = useMemo(bootstrapLocalAuth, []);
   const initialPages = useMemo(getInitialPages, []);
   const initialFolders = useMemo(readStoredFolders, []);
   const initialPageShares = useMemo(readStoredPageShares, []);
   const initialBlockComments = useMemo(readStoredBlockComments, []);
+  const initialPageId = linkedPageId && initialPages[linkedPageId] ? linkedPageId : ROOT_PAGE_ID;
   const rootPage = initialPages[ROOT_PAGE_ID];
+  const initialPage = initialPages[initialPageId] ?? rootPage;
+  const removeFailedUploadBlockRef = useRef<(blockId?: string) => void>(() => undefined);
   const editor = useCreateBlockNote({
     schema: editorSchema,
-    initialContent: rootPage.blocks as never,
+    initialContent: initialPage.blocks as never,
     dictionary: NODI_DICTIONARY,
-    uploadFile: uploadNodiAttachment,
+    uploadFile: async (file, blockId) => {
+      try {
+        return await uploadNodiAttachment(file, {
+          authenticated: Boolean(readLocalAuthUser()),
+          pageId: currentPageIdRef.current === ROOT_PAGE_ID ? null : currentPageIdRef.current,
+        });
+      } catch {
+        // BlockNote's clipboard upload path does not catch a rejected upload.
+        // Resolve with an empty value, then discard the temporary media block
+        // after BlockNote has completed its own update cycle.
+        window.setTimeout(() => removeFailedUploadBlockRef.current(blockId), 0);
+        return { props: { name: file.name, url: "" } };
+      }
+    },
   });
+  removeFailedUploadBlockRef.current = (blockId) => {
+    if (!blockId || !editor.getBlock(blockId)) return;
+    editor.removeBlocks([blockId]);
+  };
   const [pages, setPages] = useState<StoredPages>(initialPages);
   const [folders, setFolders] = useState<StoredFolders>(initialFolders);
-  const [currentPageId, setCurrentPageId] = useState(ROOT_PAGE_ID);
-  const [title, setTitle] = useState(rootPage.title);
+  const [currentPageId, setCurrentPageId] = useState(initialPageId);
+  const [title, setTitle] = useState(initialPage.title);
   const [authUser, setAuthUser] = useState<LocalAuthUser | null>(initialAuthUser);
   const [authDialogMode, setAuthDialogMode] = useState<AuthDialogMode | null>(null);
   const [userName, setUserName] = useState(() => initialAuthUser?.name ?? "게스트");
@@ -1159,12 +1387,14 @@ function App() {
   const [localSaveState, setLocalSaveState] = useState<LocalSaveState>("saved");
   const [notice, setNotice] = useState<string | null>(null);
   const [noticeClosing, setNoticeClosing] = useState(false);
-  const [pageSettings, setPageSettings] = useState<PageSettings>(rootPage.settings);
+  const [pageSettings, setPageSettings] = useState<PageSettings>(initialPage.settings);
   const [pageSettingsOpen, setPageSettingsOpen] = useState(false);
   const [drawerPageId, setDrawerPageId] = useState<string | null>(null);
   const [rightPanel, setRightPanel] = useState<"draft" | "link" | "share" | null>(null);
-  const [isArchived, setIsArchived] = useState(rootPage.archived);
+  const [isArchived, setIsArchived] = useState(initialPage.archived);
   const [pendingPageDeletion, setPendingPageDeletion] = useState<string | null>(null);
+  const [pendingPermanentPageDeletion, setPendingPermanentPageDeletion] = useState<string | "all" | null>(null);
+  const [trashBusyPageId, setTrashBusyPageId] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [sidebarContextMenu, setSidebarContextMenu] = useState<SidebarContextMenuState | null>(null);
   const [sidebarCreateMenuOpen, setSidebarCreateMenuOpen] = useState(false);
@@ -1176,13 +1406,16 @@ function App() {
   const [workspaceSearchOpen, setWorkspaceSearchOpen] = useState(false);
   const [workspaceSettingsOpen, setWorkspaceSettingsOpen] = useState(false);
   const [inboxOpen, setInboxOpen] = useState(false);
-  const [inboxNotifications, setInboxNotifications] = useState(getInitialInboxNotifications);
+  const [inboxNotifications, setInboxNotifications] = useState<InboxNotification[]>([]);
+  const [serverDirectoryUsers, setServerDirectoryUsers] = useState<LocalAuthUser[]>([]);
   const [starterPresets, setStarterPresets] = useState<StarterPreset[]>(readStarterPresets);
+  const [tagOptions, setTagOptions] = useState<TagOption[]>(DEFAULT_TAG_OPTIONS);
   const [starterDockPageId, setStarterDockPageId] = useState<string | null>(null);
   const [selectedStarterPreset, setSelectedStarterPreset] = useState<string | null>(null);
   const [pendingBlockDeletion, setPendingBlockDeletion] = useState<string[] | null>(null);
   const [activeCommentBlockId, setActiveCommentBlockId] = useState<string | null>(null);
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
+  const [realtimeParticipants, setRealtimeParticipants] = useState<ServerRealtimeParticipant[]>([]);
   const [selectedBlockIds, setSelectedBlockIds] = useState<string[]>([]);
   const selectedBlockIdsRef = useRef<string[]>([]);
   const [isBlockSelectionMode, setIsBlockSelectionMode] = useState(false);
@@ -1199,9 +1432,33 @@ function App() {
   const blockSelectionActionMenuRef = useRef<HTMLDivElement>(null);
   const blockSelectionOverlayRefs = useRef(new Map<string, HTMLDivElement>());
   const blockCommentMarkerRefs = useRef(new Map<string, HTMLButtonElement>());
+  const blockPresenceMarkerRefs = useRef(new Map<string, HTMLSpanElement>());
   const localSaveStateTimerRef = useRef<number | null>(null);
+  const inboxRefreshPromiseRef = useRef<Promise<void> | null>(null);
+  const inboxLastRefreshAtRef = useRef(0);
   const pagesRef = useRef(initialPages);
   const foldersRef = useRef(initialFolders);
+  const serverWorkspaceReadyRef = useRef(false);
+  const serverPagesSnapshotRef = useRef<StoredPages>(initialPages);
+  const pageSharesRef = useRef<StoredPageShares>(initialPageShares);
+  const realtimeSocketRef = useRef<WebSocket | null>(null);
+  const realtimeConnectedPageIdRef = useRef<string | null>(null);
+  const realtimeReconnectTimerRef = useRef<number | null>(null);
+  const realtimeBlocksTimerRef = useRef<number | null>(null);
+  const realtimeLocalBlocksRef = useRef<PartialBlock[]>(cloneRealtimeBlocks(initialPage.blocks));
+  const realtimePendingBlocksRef = useRef<{ base: PartialBlock[]; next: PartialBlock[] } | null>(null);
+  const realtimeProtectedBlockIdsRef = useRef(new Set<string>());
+  const realtimeProtectedDeletedBlockIdsRef = useRef(new Set<string>());
+  const realtimePresenceBlockRef = useRef<string | null>(null);
+  const serverFoldersSnapshotRef = useRef<StoredFolders>(initialFolders);
+  const serverPresetsSnapshotRef = useRef<StarterPreset[]>([]);
+  const serverPreferencesRef = useRef<NodiPreferences>({});
+  const serverPreferencesRevisionRef = useRef<number | undefined>(undefined);
+  const serverPreferencesReadyRef = useRef(false);
+  const serverThemeSnapshotRef = useRef<AppTheme | null>(null);
+  const serverMutationQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const serverPagesTimerRef = useRef<number | null>(null);
+  const serverFoldersTimerRef = useRef<number | null>(null);
   const sidebarDraggedPageIdRef = useRef<string | null>(null);
   const sidebarPageDropTargetRef = useRef<SidebarPageDropTarget | null>(null);
   const sidebarDraggedFolderIdRef = useRef<string | null>(null);
@@ -1221,7 +1478,7 @@ function App() {
     dragging: boolean;
   } | null>(null);
   const sidebarSuppressClickRef = useRef(false);
-  const currentPageIdRef = useRef(ROOT_PAGE_ID);
+  const currentPageIdRef = useRef(initialPageId);
   const loadingPageRef = useRef(false);
   const blockSelectionModeRef = useRef(false);
   const blockSelectionAnchorRef = useRef<string | null>(null);
@@ -1273,7 +1530,59 @@ function App() {
 
   useEffect(() => () => {
     if (localSaveStateTimerRef.current) window.clearTimeout(localSaveStateTimerRef.current);
+    if (realtimeBlocksTimerRef.current) window.clearTimeout(realtimeBlocksTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    void restoreServerAuth().then((user) => {
+      if (!active) return;
+      setAuthUser(user);
+      setUserName(user?.name ?? "게스트");
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!publicPageId) return;
+    let active = true;
+    setLocalSaveState("saving");
+    void workspaceApi.getPublicPage(publicPageId)
+      .then((serverPage) => {
+        if (!active) return;
+        const publicPage = storedPageFromServer({ ...serverPage, permission: "view" });
+        const nextPages = { [publicPage.id]: publicPage };
+        loadingPageRef.current = true;
+        pagesRef.current = nextPages;
+        foldersRef.current = {};
+        currentPageIdRef.current = publicPage.id;
+        setPages(nextPages);
+        setFolders({});
+        setPageShares({});
+        setBlockComments({});
+        setCurrentPageId(publicPage.id);
+        setTitle(publicPage.title);
+        setPageSettings(publicPage.settings);
+        setIsArchived(false);
+        setWorkspaceSection("pages");
+        setSidebarOpen(false);
+        editor.replaceBlocks(editor.document, publicPage.blocks as never);
+        setLocalSaveState("saved");
+        window.requestAnimationFrame(() => {
+          loadingPageRef.current = false;
+        });
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setLocalSaveState("error");
+        setNotice(error instanceof Error ? error.message : "공개 페이지를 불러오지 못했어요");
+      });
+    return () => {
+      active = false;
+    };
+  }, [editor, publicPageId]);
 
   useEffect(() => {
     if (!sidebarOpen) setInboxOpen(false);
@@ -1293,10 +1602,12 @@ function App() {
     }
     try {
       persistStoredPages(nextPages);
-      localSaveStateTimerRef.current = window.setTimeout(() => {
-        localSaveStateTimerRef.current = null;
-        setLocalSaveState("saved");
-      }, 320);
+      if (!authUser || !serverWorkspaceReadyRef.current) {
+        localSaveStateTimerRef.current = window.setTimeout(() => {
+          localSaveStateTimerRef.current = null;
+          setLocalSaveState("saved");
+        }, 320);
+      }
       return true;
     } catch {
       setLocalSaveState("error");
@@ -1327,13 +1638,465 @@ function App() {
     });
   };
 
+  const enqueueServerMutation = (task: () => Promise<void>) => {
+    serverMutationQueueRef.current = serverMutationQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          await task();
+          setLocalSaveState("saved");
+        } catch (error) {
+          setLocalSaveState("error");
+          setNotice(error instanceof Error ? error.message : "서버에 변경 사항을 저장하지 못했어요");
+        }
+      });
+  };
+
+  const realtimeSocketIsReady = (pageId: string) => (
+    realtimeConnectedPageIdRef.current === pageId
+    && realtimeSocketRef.current?.readyState === WebSocket.OPEN
+  );
+
+  const currentPageIsEditable = () => {
+    const page = pagesRef.current[currentPageIdRef.current];
+    return Boolean(
+      page
+      && page.permission !== "view"
+      && !page.settings.lockPage
+      && !publicPageId,
+    );
+  };
+
+  const flushRealtimeBlockPatch = () => {
+    if (realtimeBlocksTimerRef.current) {
+      window.clearTimeout(realtimeBlocksTimerRef.current);
+      realtimeBlocksTimerRef.current = null;
+    }
+    const pending = realtimePendingBlocksRef.current;
+    realtimePendingBlocksRef.current = null;
+    const pageId = currentPageIdRef.current;
+    if (!pending || !realtimeSocketIsReady(pageId)) return false;
+    const patch = buildRealtimeBlockPatch(pending.base, pending.next);
+    if (!patch) return true;
+    patch.changedBlockIds.forEach((id) => realtimeProtectedBlockIdsRef.current.add(id));
+    patch.deletedBlockIds.forEach((id) => {
+      realtimeProtectedBlockIdsRef.current.delete(id);
+      realtimeProtectedDeletedBlockIdsRef.current.add(id);
+    });
+    realtimeSocketRef.current?.send(JSON.stringify({
+      type: "page.blocks.patch",
+      ...patch,
+    }));
+    setLocalSaveState("saving");
+    return true;
+  };
+
+  const queueRealtimeBlockPatch = (blocks: PartialBlock[]) => {
+    if (!currentPageIsEditable()) return false;
+    const pageId = currentPageIdRef.current;
+    if (!realtimeSocketIsReady(pageId)) return false;
+    const nextBlocks = cloneRealtimeBlocks(blocks);
+    const pending = realtimePendingBlocksRef.current;
+    realtimePendingBlocksRef.current = pending
+      ? { ...pending, next: nextBlocks }
+      : { base: cloneRealtimeBlocks(realtimeLocalBlocksRef.current), next: nextBlocks };
+    realtimeLocalBlocksRef.current = nextBlocks;
+    if (!realtimeBlocksTimerRef.current) {
+      realtimeBlocksTimerRef.current = window.setTimeout(flushRealtimeBlockPatch, 70);
+    }
+    return true;
+  };
+
+  const sendRealtimePresence = (activeBlockId: string | null) => {
+    const pageId = currentPageIdRef.current;
+    const normalizedBlockId = activeBlockId && currentPageIsEditable() ? activeBlockId : null;
+    if (realtimePresenceBlockRef.current === normalizedBlockId) return;
+    realtimePresenceBlockRef.current = normalizedBlockId;
+    if (!realtimeSocketIsReady(pageId)) return;
+    realtimeSocketRef.current?.send(JSON.stringify({
+      type: "presence.update",
+      activeBlockId: normalizedBlockId ?? "",
+    }));
+  };
+
+  useEffect(() => {
+    if (!authUser || publicPageId) {
+      serverWorkspaceReadyRef.current = false;
+      setInboxNotifications([]);
+      return;
+    }
+    let active = true;
+    serverWorkspaceReadyRef.current = false;
+    setInboxNotifications([]);
+
+    // The sidebar share badge should not wait for the rest of the workspace
+    // bootstrap (guest migration, presets, tags, directory, and comments).
+    // Reuse this request in the full bootstrap below so signing in does not
+    // issue a duplicate /shares request.
+    const serverSharesPromise = workspaceApi.listAllShares();
+    void serverSharesPromise
+      .then((serverShares) => {
+        if (!active) return;
+        const nextPageShares = Object.fromEntries(serverShares.map((share) => [
+          share.pageId,
+          storedShareFromServer(share),
+        ])) as StoredPageShares;
+        persistStoredPageShares(nextPageShares);
+        setPageShares(nextPageShares);
+      })
+      .catch(() => {
+        // The full bootstrap reports the request failure through its existing
+        // error path. Keep the cached badge visible in the meantime.
+      });
+
+    void (async () => {
+      try {
+        const migrationKey = `nodi:guest-workspace-migrated:${authUser.id}:v1`;
+        if (!window.localStorage.getItem(migrationKey)) {
+          const localPages = pagesRef.current;
+          const localFolders = foldersRef.current;
+          const guestPages = Object.values(localPages).filter((page) => page.id !== ROOT_PAGE_ID && !page.ownerId);
+          const requiredFolderIds = new Set<string>();
+          guestPages.forEach((page) => {
+            let folderId = page.folderId;
+            while (folderId && localFolders[folderId] && !requiredFolderIds.has(folderId)) {
+              requiredFolderIds.add(folderId);
+              folderId = localFolders[folderId].parentId;
+            }
+          });
+          const folderIdMap = new Map(Array.from(requiredFolderIds).map((folderId) => [folderId, makeId("folder-import")]));
+          const pageIdMap = new Map(guestPages.map((page) => [page.id, makeId("page-import")]));
+          const foldersToImport = Array.from(requiredFolderIds)
+            .map((folderId) => localFolders[folderId])
+            .filter(Boolean)
+            .sort((left, right) => folderDepth(localFolders, left) - folderDepth(localFolders, right));
+          for (const folder of foldersToImport) {
+            await workspaceApi.createFolder({
+              ...folder,
+              id: folderIdMap.get(folder.id)!,
+              parentId: folder.parentId ? folderIdMap.get(folder.parentId) ?? null : null,
+            });
+          }
+          const pagesToImport = [...guestPages].sort((left, right) => pageDepth(localPages, left) - pageDepth(localPages, right));
+          for (const page of pagesToImport) {
+            await workspaceApi.createPage({
+              ...page,
+              id: pageIdMap.get(page.id)!,
+              parentId: page.parentId ? pageIdMap.get(page.parentId) ?? null : null,
+              folderId: page.folderId ? folderIdMap.get(page.folderId) ?? null : null,
+              title: page.title || "가져온 게스트 페이지",
+              archived: false,
+              favoritedAt: null,
+              ownerId: undefined,
+              permission: undefined,
+              revision: undefined,
+            });
+          }
+          const guestHome = localPages[ROOT_PAGE_ID];
+          if (guestHome && !guestHome.ownerId && !sameServerValue(guestHome.blocks, defaultBlocks)) {
+            await workspaceApi.createPage({
+              ...guestHome,
+              id: makeId("page-import"),
+              parentId: null,
+              folderId: null,
+              order: Math.max(0, ...guestPages.map((page) => page.order)) + 1,
+              title: "가져온 게스트 메모",
+              settings: { ...guestHome.settings, publicAccess: false },
+              archived: false,
+              favoritedAt: null,
+              ownerId: undefined,
+              permission: undefined,
+              revision: undefined,
+            });
+          }
+          window.localStorage.setItem(migrationKey, new Date().toISOString());
+        }
+
+        const [home, details, serverFolders, directoryUsers, serverNotifications, serverPreferences, existingServerPresets, existingServerTags, serverShares, serverComments] = await Promise.all([
+          workspaceApi.getHome(),
+          workspaceApi.listPages(true, true),
+          workspaceApi.listFolders(),
+          authApi.searchUsers(""),
+          workspaceApi.notifications(),
+          workspaceApi.getPreferences<NodiPreferences>(),
+          workspaceApi.listPresets(),
+          workspaceApi.listTags(),
+          serverSharesPromise,
+          workspaceApi.listAllComments(),
+        ]);
+        const serverPresets = existingServerPresets.length > 0
+          ? existingServerPresets
+          : await Promise.all(readStarterPresets().map((preset, index) => workspaceApi.createPreset(preset, index)));
+        const serverTags = existingServerTags.length > 0
+          ? existingServerTags
+          : await Promise.all(DEFAULT_TAG_OPTIONS.map((tag, index) => workspaceApi.createTag(tag, index)));
+        if (!active) return;
+
+        const backupKey = `nodi:local-workspace-backup:${authUser.id}`;
+        if (!window.localStorage.getItem(backupKey)) {
+          window.localStorage.setItem(backupKey, JSON.stringify({
+            pages: pagesRef.current,
+            folders: foldersRef.current,
+            savedAt: new Date().toISOString(),
+          }));
+        }
+
+        const nextPages: StoredPages = {
+          [ROOT_PAGE_ID]: storedHomeFromServer(home),
+        };
+        details.forEach((page) => {
+          nextPages[page.id] = storedPageFromServer(page);
+        });
+        const nextFolders = Object.fromEntries(serverFolders.map((folder) => [
+          folder.id,
+          storedFolderFromServer(folder),
+        ])) as StoredFolders;
+
+        serverPagesSnapshotRef.current = nextPages;
+        serverFoldersSnapshotRef.current = nextFolders;
+        pagesRef.current = nextPages;
+        foldersRef.current = nextFolders;
+        persistStoredPages(nextPages);
+        persistStoredFolders(nextFolders);
+        const nextPageShares = Object.fromEntries(serverShares.map((share) => [
+          share.pageId,
+          storedShareFromServer(share),
+        ])) as StoredPageShares;
+        const nextBlockComments = Object.fromEntries(serverComments.map((thread) => [
+          thread.id,
+          storedCommentFromServer(thread),
+        ])) as StoredBlockComments;
+        persistStoredPageShares(nextPageShares);
+        persistStoredBlockComments(nextBlockComments);
+        setPages(nextPages);
+        setFolders(nextFolders);
+        setPageShares(nextPageShares);
+        setBlockComments(nextBlockComments);
+        setServerDirectoryUsers(directoryUsers);
+        setInboxNotifications(serverNotifications.map(inboxNotificationFromServer));
+        const nextPresets = serverPresets.map(({ id, name, icon, pageTitle, blocks, sourceFileName }) => ({
+          id,
+          name,
+          icon,
+          pageTitle,
+          blocks,
+          sourceFileName,
+        }));
+        serverPresetsSnapshotRef.current = nextPresets;
+        setStarterPresets(nextPresets);
+        persistStarterPresets(nextPresets);
+        setTagOptions(serverTags.map(({ id, name, color }) => ({ id, name, color })));
+        serverPreferencesRef.current = serverPreferences.preferences;
+        serverPreferencesRevisionRef.current = serverPreferences.revision;
+        const preferredTheme = serverPreferences.preferences.theme;
+        if (preferredTheme === "light" || preferredTheme === "dark") {
+          serverThemeSnapshotRef.current = preferredTheme;
+          setAppTheme(preferredTheme);
+        } else {
+          serverThemeSnapshotRef.current = appTheme;
+        }
+        serverPreferencesReadyRef.current = true;
+
+        const requestedPageId = linkedPageId ?? currentPageIdRef.current;
+        const nextPageId = nextPages[requestedPageId] ? requestedPageId : ROOT_PAGE_ID;
+        const nextPage = nextPages[nextPageId];
+        loadingPageRef.current = true;
+        currentPageIdRef.current = nextPageId;
+        setCurrentPageId(nextPageId);
+        setWorkspaceSection(nextPageId !== ROOT_PAGE_ID && (nextPage.permission ?? "owner") !== "owner" ? "shared-page" : "pages");
+        setTitle(nextPage.title);
+        setPageSettings(nextPage.settings);
+        setIsArchived(nextPage.archived);
+        editor.replaceBlocks(editor.document, nextPage.blocks as never);
+        window.requestAnimationFrame(() => {
+          loadingPageRef.current = false;
+        });
+        serverWorkspaceReadyRef.current = true;
+        setLocalSaveState("saved");
+      } catch (error) {
+        if (!active) return;
+        serverWorkspaceReadyRef.current = false;
+        serverPreferencesReadyRef.current = false;
+        setNotice(error instanceof Error ? error.message : "서버 작업 공간을 불러오지 못했어요");
+      }
+    })();
+
+    return () => {
+      active = false;
+      serverWorkspaceReadyRef.current = false;
+      serverPreferencesReadyRef.current = false;
+    };
+  }, [authUser?.id, linkedPageId, publicPageId]);
+
+  useEffect(() => {
+    pageSharesRef.current = pageShares;
+  }, [pageShares]);
+
+  const refreshInbox = useCallback((options: { force?: boolean; reportError?: boolean } = {}) => {
+    if (!authUser || publicPageId) return Promise.resolve();
+    if (inboxRefreshPromiseRef.current) return inboxRefreshPromiseRef.current;
+    if (!options.force && Date.now() - inboxLastRefreshAtRef.current < 5_000) return Promise.resolve();
+
+    const request = Promise.all([
+      workspaceApi.notifications(),
+      workspaceApi.listAllShares(),
+    ])
+      .then(([serverNotifications, serverShares]) => {
+        const nextPageShares = Object.fromEntries(serverShares.map((share) => [
+          share.pageId,
+          storedShareFromServer(share),
+        ])) as StoredPageShares;
+        pageSharesRef.current = nextPageShares;
+        persistStoredPageShares(nextPageShares);
+        setPageShares(nextPageShares);
+        setInboxNotifications(serverNotifications.map(inboxNotificationFromServer));
+        inboxLastRefreshAtRef.current = Date.now();
+      })
+      .catch((error: unknown) => {
+        if (options.reportError) {
+          setNotice(error instanceof Error ? error.message : "받은 편지함을 불러오지 못했어요");
+        }
+      })
+      .finally(() => {
+        if (inboxRefreshPromiseRef.current === request) inboxRefreshPromiseRef.current = null;
+      });
+    inboxRefreshPromiseRef.current = request;
+    return request;
+  }, [authUser?.id, publicPageId]);
+
+  useEffect(() => {
+    if (!authUser || publicPageId) return;
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") void refreshInbox();
+    };
+    const timer = window.setInterval(refreshWhenVisible, 15_000);
+    window.addEventListener("focus", refreshWhenVisible);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshWhenVisible);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [authUser?.id, publicPageId, refreshInbox]);
+
+  useEffect(() => {
+    if (!authUser || !serverPreferencesReadyRef.current || serverThemeSnapshotRef.current === appTheme) return;
+    const nextPreferences = { ...serverPreferencesRef.current, theme: appTheme };
+    enqueueServerMutation(async () => {
+      const value = await workspaceApi.updatePreferences(nextPreferences, serverPreferencesRevisionRef.current);
+      serverPreferencesRevisionRef.current = value.revision;
+      serverPreferencesRef.current = value.preferences;
+      serverThemeSnapshotRef.current = appTheme;
+    });
+  }, [appTheme, authUser?.id]);
+
+  useEffect(() => {
+    if (!authUser || !serverWorkspaceReadyRef.current) return;
+    if (serverFoldersTimerRef.current) window.clearTimeout(serverFoldersTimerRef.current);
+    serverFoldersTimerRef.current = window.setTimeout(() => {
+      serverFoldersTimerRef.current = null;
+      const after = folders;
+      enqueueServerMutation(async () => {
+        const before = serverFoldersSnapshotRef.current;
+        if (sameServerValue(before, after)) return;
+        const created = Object.values(after)
+          .filter((folder) => !before[folder.id])
+          .sort((left, right) => folderDepth(after, left) - folderDepth(after, right));
+        for (const folder of created) await workspaceApi.createFolder(folder);
+
+        for (const folder of Object.values(after)) {
+          const previous = before[folder.id];
+          if (!previous || sameServerValue(previous, folder)) continue;
+          await workspaceApi.updateFolder(folder);
+        }
+        for (const folder of Object.values(before)) {
+          if (!after[folder.id]) await workspaceApi.deleteFolder(folder.id);
+        }
+        serverFoldersSnapshotRef.current = after;
+      });
+    }, 350);
+    return () => {
+      if (serverFoldersTimerRef.current) window.clearTimeout(serverFoldersTimerRef.current);
+    };
+  }, [folders, authUser?.id]);
+
+  useEffect(() => {
+    if (!authUser || !serverWorkspaceReadyRef.current) return;
+    if (serverPagesTimerRef.current) window.clearTimeout(serverPagesTimerRef.current);
+    serverPagesTimerRef.current = window.setTimeout(() => {
+      serverPagesTimerRef.current = null;
+      const after = pages;
+      enqueueServerMutation(async () => {
+        const before = serverPagesSnapshotRef.current;
+        if (sameServerValue(before, after)) return;
+        const synchronized = Object.fromEntries(Object.entries(after).map(([pageId, page]) => [
+          pageId,
+          { ...page, revision: before[pageId]?.revision ?? page.revision },
+        ])) as StoredPages;
+        const previousHome = before[ROOT_PAGE_ID];
+        const nextHome = after[ROOT_PAGE_ID];
+        if (previousHome && nextHome) {
+          const homePatch: Partial<Pick<StoredPage, "title" | "settings" | "blocks" | "revision">> = {};
+          if (previousHome.title !== nextHome.title) homePatch.title = nextHome.title;
+          if (!sameServerValue(previousHome.settings, nextHome.settings)) homePatch.settings = nextHome.settings;
+          if (!sameServerValue(previousHome.blocks, nextHome.blocks)) homePatch.blocks = nextHome.blocks;
+          if (Object.keys(homePatch).length) {
+            homePatch.revision = previousHome.revision;
+            const savedHome = await workspaceApi.updateHome(homePatch);
+            synchronized[ROOT_PAGE_ID] = { ...synchronized[ROOT_PAGE_ID], revision: savedHome.revision };
+          }
+        }
+
+        const created = Object.values(after)
+          .filter((page) => page.id !== ROOT_PAGE_ID && !before[page.id])
+          .sort((left, right) => pageDepth(after, left) - pageDepth(after, right));
+        for (const page of created) {
+          const savedPage = await workspaceApi.createPage(page);
+          synchronized[page.id] = { ...synchronized[page.id], revision: savedPage.revision };
+        }
+
+        for (const page of Object.values(after)) {
+          if (page.id === ROOT_PAGE_ID) continue;
+          const previous = before[page.id];
+          if (!previous) continue;
+          const patch = getPageServerPatch(previous, page);
+          const isCollaborative = (page.permission ?? "owner") !== "owner"
+            || (pageSharesRef.current[page.id]?.members.length ?? 0) > 0
+            || realtimeSocketIsReady(page.id);
+          // While the realtime room is connected, block mutations travel only
+          // through the socket. Sending the same document through the HTTP
+          // autosave path created duplicate revisions and stale conflicts.
+          if (isCollaborative && realtimeSocketIsReady(page.id)) delete patch.blocks;
+          if (Object.keys(patch).length) {
+            if (!isCollaborative) patch.revision = previous.revision;
+            const savedPage = await workspaceApi.updatePage(page.id, patch);
+            synchronized[page.id] = { ...synchronized[page.id], revision: savedPage.revision };
+          }
+          if (Boolean(previous.favoritedAt) !== Boolean(page.favoritedAt)) {
+            await workspaceApi.favoritePage(page.id, Boolean(page.favoritedAt));
+          }
+        }
+
+        for (const page of Object.values(before)) {
+          if (page.id !== ROOT_PAGE_ID && !after[page.id] && (page.permission ?? "owner") === "owner") {
+            await workspaceApi.archivePage(page.id);
+          }
+        }
+        serverPagesSnapshotRef.current = synchronized;
+      });
+    }, 700);
+    return () => {
+      if (serverPagesTimerRef.current) window.clearTimeout(serverPagesTimerRef.current);
+    };
+  }, [pages, authUser?.id]);
+
   const updatePage = (
     pageId: string,
     patch: Partial<StoredPage>,
     options: { preserveUpdatedAt?: boolean } = {},
-  ) => {
+  ): StoredPage | null => {
     const page = pagesRef.current[pageId];
-    if (!page) return;
+    if (!page || page.permission === "view") return null;
     const safePatch = pageId === ROOT_PAGE_ID
       ? {
           ...patch,
@@ -1359,6 +2122,98 @@ function App() {
         // legacy keys only keep older local workspaces compatible.
       }
     }
+    return pageSaved ? nextPage : null;
+  };
+
+  const syncPageImmediately = (
+    pageId: string,
+    page: StoredPage,
+    options: { notify?: boolean } = {},
+  ) => {
+    if (!authUser || !serverWorkspaceReadyRef.current) {
+      if (options.notify) setNotice("메모를 저장했어요");
+      return;
+    }
+    if (serverPagesTimerRef.current) {
+      window.clearTimeout(serverPagesTimerRef.current);
+      serverPagesTimerRef.current = null;
+    }
+    if (localSaveStateTimerRef.current) {
+      window.clearTimeout(localSaveStateTimerRef.current);
+      localSaveStateTimerRef.current = null;
+    }
+    setLocalSaveState("saving");
+    enqueueServerMutation(async () => {
+      const previous = serverPagesSnapshotRef.current[pageId];
+      if (!previous) return;
+
+      if (pageId === ROOT_PAGE_ID) {
+        const homePatch: Partial<Pick<StoredPage, "title" | "settings" | "blocks" | "revision">> = {};
+        if (previous.title !== page.title) homePatch.title = page.title;
+        if (!sameServerValue(previous.settings, page.settings)) homePatch.settings = page.settings;
+        if (!sameServerValue(previous.blocks, page.blocks)) homePatch.blocks = page.blocks;
+        if (!Object.keys(homePatch).length) {
+          if (options.notify) setNotice("메모를 서버에 저장했어요");
+          return;
+        }
+        homePatch.revision = previous.revision;
+        const savedHome = await workspaceApi.updateHome(homePatch);
+        serverPagesSnapshotRef.current = {
+          ...serverPagesSnapshotRef.current,
+          [ROOT_PAGE_ID]: storedHomeFromServer(savedHome),
+        };
+        const latestLocalPage = pagesRef.current[ROOT_PAGE_ID];
+        if (latestLocalPage) {
+          const nextPages = {
+            ...pagesRef.current,
+            [ROOT_PAGE_ID]: {
+              ...latestLocalPage,
+              revision: savedHome.revision,
+              updatedAt: savedHome.updatedAt,
+            },
+          };
+          pagesRef.current = nextPages;
+          persistStoredPages(nextPages);
+          setPages(nextPages);
+        }
+        if (options.notify) setNotice("메모를 서버에 저장했어요");
+        return;
+      }
+
+      const patch = getPageServerPatch(previous, page);
+      const isCollaborative = (page.permission ?? "owner") !== "owner"
+        || (pageSharesRef.current[page.id]?.members.length ?? 0) > 0
+        || realtimeSocketIsReady(page.id);
+      if (isCollaborative && realtimeSocketIsReady(page.id)) {
+        flushRealtimeBlockPatch();
+        delete patch.blocks;
+      }
+      if (!Object.keys(patch).length) {
+        if (options.notify) setNotice("메모를 서버에 저장했어요");
+        return;
+      }
+      if (!isCollaborative) patch.revision = previous.revision;
+      const savedPage = await workspaceApi.updatePage(pageId, patch);
+      serverPagesSnapshotRef.current = {
+        ...serverPagesSnapshotRef.current,
+        [pageId]: storedPageFromServer(savedPage),
+      };
+      const latestLocalPage = pagesRef.current[pageId];
+      if (latestLocalPage) {
+        const nextPages = {
+          ...pagesRef.current,
+          [pageId]: {
+            ...latestLocalPage,
+            revision: savedPage.revision,
+            updatedAt: savedPage.updatedAt,
+          },
+        };
+        pagesRef.current = nextPages;
+        persistStoredPages(nextPages);
+        setPages(nextPages);
+      }
+      if (options.notify) setNotice("메모를 서버에 저장했어요");
+    });
   };
 
   useEffect(() => {
@@ -1406,7 +2261,7 @@ function App() {
     };
   }, []);
 
-  const saveDocument = () => {
+  const saveDocument = (options: { notify?: boolean } = {}) => {
     const currentPage = pagesRef.current[currentPageIdRef.current];
     const nextTitle = title.trim() || "제목 없음";
     const hasMetadataChanges = Boolean(
@@ -1417,12 +2272,13 @@ function App() {
         || currentPage.archived !== isArchived
       )
     );
-    updatePage(currentPageIdRef.current, {
+    const savedPage = updatePage(currentPageIdRef.current, {
       blocks: editor.document as unknown as PartialBlock[],
       title: nextTitle,
       settings: pageSettings,
       archived: isArchived,
     }, { preserveUpdatedAt: !hasMetadataChanges });
+    if (savedPage) syncPageImmediately(currentPageIdRef.current, savedPage, options);
   };
 
   const updateUserProfile = ({
@@ -1448,7 +2304,7 @@ function App() {
       avatarColor,
       avatarIcon,
     }));
-    updateLocalAccountProfile({
+    void updateLocalAccountProfile({
       name: nextUserName,
       avatarColor,
       avatarIcon,
@@ -1461,11 +2317,22 @@ function App() {
     } : current);
     window.dispatchEvent(new CustomEvent(USER_PROFILE_CHANGED_EVENT));
     setNotice("계정 프로필을 변경했어요");
+    if (authUser) {
+      void authApi.updateProfile({ name: nextUserName, avatarColor, avatarIcon })
+        .then((user) => setAuthUser(user))
+        .catch((error) => setNotice(error instanceof Error ? error.message : "프로필을 서버에 저장하지 못했어요"));
+    }
   };
 
-  const logout = () => {
+  const logout = async () => {
     saveDocument();
-    logoutLocalAccount();
+    await serverMutationQueueRef.current;
+    try {
+      await authApi.logout();
+    } catch {
+      // The local session is still cleared when the server is temporarily unavailable.
+    }
+    await logoutLocalAccount();
     setWorkspaceSettingsOpen(false);
     setAuthDialogMode(null);
     window.location.reload();
@@ -1506,11 +2373,16 @@ function App() {
     updatePage(currentPageIdRef.current, { archived: isArchived });
   }, [isArchived, currentPageId]);
 
-  const openPage = (pageId: string) => {
+  const openPage = (pageId: string, options: { skipCurrentPageSave?: boolean } = {}) => {
     setStarterDockPageId(null);
     setSelectedStarterPreset(null);
-    if (pageId === currentPageIdRef.current) {
-      setWorkspaceSection("pages");
+    const isCurrentPage = pageId === currentPageIdRef.current;
+    const existingPage = pagesRef.current[pageId];
+    const targetSection: WorkspaceSection = pageId !== ROOT_PAGE_ID && (existingPage?.permission ?? "owner") !== "owner"
+      ? "shared-page"
+      : "pages";
+    if (isCurrentPage && workspaceSection === targetSection) {
+      setWorkspaceSection(targetSection);
       setInboxOpen(false);
       setRightPanel(null);
       setActiveCommentBlockId(null);
@@ -1518,7 +2390,10 @@ function App() {
       return;
     }
 
-    saveDocument();
+    // When returning from the shared-pages workspace, `refreshSharedPages`
+    // may already hold a newer server copy of the currently selected page.
+    // Saving the stale editor again here would overwrite that remote change.
+    if (!isCurrentPage && !options.skipCurrentPageSave) saveDocument();
 
     const targetPage = pagesRef.current[pageId];
     if (!targetPage) {
@@ -1527,8 +2402,15 @@ function App() {
     }
 
     loadingPageRef.current = true;
+    if (!publicPageId) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("publicPage");
+      if (pageId === ROOT_PAGE_ID) url.searchParams.delete("page");
+      else url.searchParams.set("page", pageId);
+      window.history.replaceState(null, "", url);
+    }
     currentPageIdRef.current = pageId;
-    setWorkspaceSection("pages");
+    setWorkspaceSection(targetSection);
     setCurrentPageId(pageId);
     setTitle(targetPage.title);
     setPageSettings(targetPage.settings);
@@ -1549,6 +2431,444 @@ function App() {
     });
   };
 
+  useEffect(() => {
+    if (!authUser || publicPageId) return;
+    let active = true;
+    let refreshing = false;
+
+    const refreshCurrentPage = async () => {
+      const pageId = currentPageIdRef.current;
+      if (
+        refreshing
+        || !serverWorkspaceReadyRef.current
+        || pageId === ROOT_PAGE_ID
+        || serverPagesTimerRef.current
+      ) return;
+
+      refreshing = true;
+      try {
+        await serverMutationQueueRef.current;
+        if (!active || pageId !== currentPageIdRef.current || serverPagesTimerRef.current) return;
+
+        const previous = serverPagesSnapshotRef.current[pageId];
+        const localPage = pagesRef.current[pageId];
+        if (
+          previous
+          && localPage
+          && !sameServerValue(getPageEditableSnapshot(previous), getPageEditableSnapshot(localPage))
+        ) return;
+
+        const serverPage = await workspaceApi.getPage(pageId);
+        if (!active || pageId !== currentPageIdRef.current) return;
+        if (previous?.revision !== undefined && serverPage.revision <= previous.revision) return;
+
+        const latestPage = storedPageFromServer(serverPage);
+        const nextPages = { ...pagesRef.current, [pageId]: latestPage };
+        serverPagesSnapshotRef.current = {
+          ...serverPagesSnapshotRef.current,
+          [pageId]: latestPage,
+        };
+        pagesRef.current = nextPages;
+        persistStoredPages(nextPages);
+        setPages(nextPages);
+
+        loadingPageRef.current = true;
+        setTitle(latestPage.title);
+        setPageSettings(latestPage.settings);
+        setIsArchived(latestPage.archived);
+        editor.replaceBlocks(
+          editor.document,
+          (latestPage.blocks.length ? latestPage.blocks : [{ type: "paragraph", content: "" }]) as never,
+        );
+        window.requestAnimationFrame(() => {
+          loadingPageRef.current = false;
+        });
+        setNotice("다른 위치의 최신 변경 내용을 불러왔어요");
+      } catch {
+        // Background revalidation should not interrupt the editor. Explicit
+        // saves still surface their server error through the mutation queue.
+      } finally {
+        refreshing = false;
+      }
+    };
+
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") void refreshCurrentPage();
+    };
+    const initialTimer = window.setTimeout(() => void refreshCurrentPage(), 900);
+    window.addEventListener("focus", refreshWhenVisible);
+    window.addEventListener("pageshow", refreshWhenVisible);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      active = false;
+      window.clearTimeout(initialTimer);
+      window.removeEventListener("focus", refreshWhenVisible);
+      window.removeEventListener("pageshow", refreshWhenVisible);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [authUser?.id, currentPageId, editor, publicPageId]);
+
+  useEffect(() => {
+    flushRealtimeBlockPatch();
+    if (realtimeReconnectTimerRef.current) {
+      window.clearTimeout(realtimeReconnectTimerRef.current);
+      realtimeReconnectTimerRef.current = null;
+    }
+    realtimeSocketRef.current?.close();
+    realtimeSocketRef.current = null;
+    realtimeConnectedPageIdRef.current = null;
+    realtimePresenceBlockRef.current = null;
+    realtimePendingBlocksRef.current = null;
+    realtimeProtectedBlockIdsRef.current.clear();
+    realtimeProtectedDeletedBlockIdsRef.current.clear();
+    setRealtimeParticipants([]);
+
+    const pageId = currentPageIdRef.current;
+    const localPage = pagesRef.current[pageId];
+    const isCollaborative = Boolean(
+      authUser
+      && !publicPageId
+      && pageId !== ROOT_PAGE_ID
+      && (workspaceSection === "pages" || workspaceSection === "shared-page")
+      && (
+        (localPage?.permission ?? "owner") !== "owner"
+        || (pageSharesRef.current[pageId]?.members.length ?? 0) > 0
+      ),
+    );
+    if (!isCollaborative || !authUser || !localPage) return;
+
+    realtimeLocalBlocksRef.current = cloneRealtimeBlocks(localPage.blocks);
+
+    let disposed = false;
+    let reconnectAttempt = 0;
+    let heartbeatTimer: number | null = null;
+
+    const replaceCurrentPage = (nextPage: StoredPage, preservePendingBlocks = false) => {
+      if (disposed || currentPageIdRef.current !== pageId) return;
+      let editorBlocks = nextPage.blocks;
+      if (preservePendingBlocks && (
+        realtimeProtectedBlockIdsRef.current.size > 0
+        || realtimeProtectedDeletedBlockIdsRef.current.size > 0
+      )) {
+        const liveBlocks = editor.document as unknown as PartialBlock[];
+        const liveById = new Map(liveBlocks.map((block) => [realtimeBlockId(block), block]));
+        const included = new Set<string>();
+        editorBlocks = nextPage.blocks
+          .filter((block) => !realtimeProtectedDeletedBlockIdsRef.current.has(realtimeBlockId(block)))
+          .map((block) => {
+            const id = realtimeBlockId(block);
+            included.add(id);
+            return realtimeProtectedBlockIdsRef.current.has(id) ? liveById.get(id) ?? block : block;
+          });
+        liveBlocks.forEach((block) => {
+          const id = realtimeBlockId(block);
+          if (realtimeProtectedBlockIdsRef.current.has(id) && !included.has(id)) editorBlocks.push(block);
+        });
+      }
+      const localNextPage = { ...nextPage, blocks: editorBlocks };
+      const nextPages = { ...pagesRef.current, [pageId]: localNextPage };
+      serverPagesSnapshotRef.current = {
+        ...serverPagesSnapshotRef.current,
+        [pageId]: nextPage,
+      };
+      pagesRef.current = nextPages;
+      persistStoredPages(nextPages);
+      setPages(nextPages);
+
+      loadingPageRef.current = true;
+      setTitle(nextPage.title);
+      setPageSettings(nextPage.settings);
+      setIsArchived(nextPage.archived);
+      editor.replaceBlocks(
+        editor.document,
+        (editorBlocks.length ? editorBlocks : [{ type: "paragraph", content: "" }]) as never,
+      );
+      realtimeLocalBlocksRef.current = cloneRealtimeBlocks(editorBlocks);
+      window.requestAnimationFrame(() => {
+        loadingPageRef.current = false;
+      });
+    };
+
+    const applyServerPage = (serverPage: ServerPage, message: ServerPageRealtimeEvent) => {
+      if (disposed || serverPage.id !== pageId || currentPageIdRef.current !== pageId) return;
+      const currentLocalPage = pagesRef.current[pageId];
+      const currentSnapshot = serverPagesSnapshotRef.current[pageId];
+      if (!currentLocalPage) return;
+
+      // A no-op patch can legitimately echo the same revision (for example,
+      // when the canonical block already contains the submitted value). Clear
+      // the optimistic protection before the revision guard so later remote
+      // edits are not hidden behind a stale local protection marker.
+      if (message.actorId === authUser.id) {
+        (message.changedBlockIds ?? []).forEach((id) => realtimeProtectedBlockIdsRef.current.delete(id));
+        (message.deletedBlockIds ?? []).forEach((id) => realtimeProtectedDeletedBlockIdsRef.current.delete(id));
+        if ((currentSnapshot?.revision ?? 0) >= serverPage.revision) {
+          setLocalSaveState("saved");
+          return;
+        }
+      } else if ((currentSnapshot?.revision ?? 0) >= serverPage.revision) {
+        return;
+      }
+
+      const nextPage = storedPageFromServer({
+        ...serverPage,
+        permission: currentLocalPage.permission ?? serverPage.permission,
+        favoritedAt: currentLocalPage.favoritedAt,
+      });
+
+      // Own echoes confirm persistence without replacing the editor selection.
+      // The canonical snapshot still advances so later metadata saves never
+      // submit a stale revision.
+      if (message.actorId === authUser.id) {
+        serverPagesSnapshotRef.current = {
+          ...serverPagesSnapshotRef.current,
+          [pageId]: nextPage,
+        };
+        const localBlocks = editor.document as unknown as PartialBlock[];
+        const localPage = {
+          ...currentLocalPage,
+          revision: nextPage.revision,
+          updatedAt: nextPage.updatedAt,
+          blocks: localBlocks,
+        };
+        const nextPages = { ...pagesRef.current, [pageId]: localPage };
+        pagesRef.current = nextPages;
+        persistStoredPages(nextPages);
+        setPages(nextPages);
+        realtimeLocalBlocksRef.current = cloneRealtimeBlocks(localBlocks);
+        setLocalSaveState("saved");
+        return;
+      }
+
+      if (message.type === "page.updated" && message.changedBlockIds?.length && !message.structural) {
+        // Apply remote text/property edits one top-level block at a time. This
+        // preserves the local caret and any unsent work in all other blocks.
+        loadingPageRef.current = true;
+        const nextById = new Map(nextPage.blocks.map((block) => [realtimeBlockId(block), block]));
+        const liveIds = new Set(editor.document.map((block) => block.id));
+        try {
+          const removable = (message.deletedBlockIds ?? []).filter((id) => (
+            liveIds.has(id) && !realtimeProtectedBlockIdsRef.current.has(id)
+          ));
+          if (removable.length) editor.removeBlocks(removable);
+          message.changedBlockIds.forEach((blockId) => {
+            if (realtimeProtectedBlockIdsRef.current.has(blockId)) return;
+            const block = nextById.get(blockId);
+            if (block && liveIds.has(blockId)) editor.updateBlock(blockId, block as never);
+          });
+        } catch {
+          editor.replaceBlocks(
+            editor.document,
+            (nextPage.blocks.length ? nextPage.blocks : [{ type: "paragraph", content: "" }]) as never,
+          );
+        }
+        const localBlocks = editor.document as unknown as PartialBlock[];
+        realtimeLocalBlocksRef.current = cloneRealtimeBlocks(localBlocks);
+        const mergedLocalPage = { ...nextPage, blocks: localBlocks };
+        const nextPages = { ...pagesRef.current, [pageId]: mergedLocalPage };
+        serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [pageId]: nextPage };
+        pagesRef.current = nextPages;
+        persistStoredPages(nextPages);
+        setPages(nextPages);
+        setTitle(nextPage.title);
+        setPageSettings(nextPage.settings);
+        setIsArchived(nextPage.archived);
+        window.requestAnimationFrame(() => {
+          loadingPageRef.current = false;
+        });
+        return;
+      }
+
+      const blocksChanged = !currentSnapshot || !sameServerValue(currentSnapshot.blocks, nextPage.blocks);
+      if (message.type === "page.snapshot" || message.structural || blocksChanged) {
+        replaceCurrentPage(nextPage, message.type === "page.updated");
+        return;
+      }
+
+      // Metadata-only updates should not disturb the current editing surface.
+      const localPage = { ...nextPage, blocks: currentLocalPage.blocks };
+      const nextPages = { ...pagesRef.current, [pageId]: localPage };
+      serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [pageId]: nextPage };
+      pagesRef.current = nextPages;
+      persistStoredPages(nextPages);
+      setPages(nextPages);
+      setTitle(nextPage.title);
+      setPageSettings(nextPage.settings);
+      setIsArchived(nextPage.archived);
+    };
+
+    const leaveUnavailablePage = (message: string) => {
+      const current = pagesRef.current[pageId];
+      if ((current?.permission ?? "owner") !== "owner") {
+        const nextPages = { ...pagesRef.current };
+        const nextSnapshot = { ...serverPagesSnapshotRef.current };
+        delete nextPages[pageId];
+        delete nextSnapshot[pageId];
+        pagesRef.current = nextPages;
+        serverPagesSnapshotRef.current = nextSnapshot;
+        persistStoredPages(nextPages);
+        setPages(nextPages);
+      }
+      const homePage = pagesRef.current[ROOT_PAGE_ID];
+      currentPageIdRef.current = ROOT_PAGE_ID;
+      setCurrentPageId(ROOT_PAGE_ID);
+      setWorkspaceSection("shared");
+      if (homePage) {
+        setTitle(homePage.title);
+        setPageSettings(homePage.settings);
+        setIsArchived(homePage.archived);
+      }
+      const url = new URL(window.location.href);
+      url.searchParams.delete("page");
+      window.history.replaceState(null, "", url);
+      setNotice(message);
+    };
+
+    const connect = () => {
+      if (disposed) return;
+      const socket = new WebSocket(workspaceApi.pageRealtimeURL(pageId));
+      realtimeSocketRef.current = socket;
+      socket.addEventListener("open", () => {
+        reconnectAttempt = 0;
+        realtimeConnectedPageIdRef.current = pageId;
+        realtimeLocalBlocksRef.current = cloneRealtimeBlocks(
+          editor.document as unknown as PartialBlock[],
+        );
+        let activeBlockId = realtimePresenceBlockRef.current;
+        try {
+          activeBlockId = editor.getTextCursorPosition().block.id;
+        } catch {
+          activeBlockId = null;
+        }
+        realtimePresenceBlockRef.current = activeBlockId;
+        socket.send(JSON.stringify({
+          type: "presence.update",
+          activeBlockId: activeBlockId ?? "",
+        }));
+        heartbeatTimer = window.setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "ping" }));
+        }, 25_000);
+      });
+      socket.addEventListener("message", (event) => {
+        let message: ServerPageRealtimeEvent;
+        try {
+          message = JSON.parse(String(event.data)) as ServerPageRealtimeEvent;
+        } catch {
+          return;
+        }
+        if ((message.type === "page.snapshot" || message.type === "page.updated") && message.page) {
+          if (message.actorId && message.actorId !== authUser.id) flushRealtimeBlockPatch();
+          applyServerPage(message.page, message);
+          return;
+        }
+        if (message.type === "presence.updated") {
+          setRealtimeParticipants(message.participants ?? []);
+          return;
+        }
+        if (message.type === "page.error") {
+          setLocalSaveState("error");
+          setNotice(message.message || "실시간 변경을 저장하지 못했어요");
+          return;
+        }
+        if (message.type === "database.updated" && message.database && message.actorId !== authUser.id) {
+          window.dispatchEvent(new CustomEvent(INLINE_DATABASE_REALTIME_EVENT, { detail: message.database }));
+          return;
+        }
+        if (message.type === "permission.updated" && message.permission) {
+          const current = pagesRef.current[pageId];
+          if (!current || (current.permission ?? "owner") === "owner") return;
+          const nextPage = { ...current, permission: message.permission };
+          const nextPages = { ...pagesRef.current, [pageId]: nextPage };
+          pagesRef.current = nextPages;
+          serverPagesSnapshotRef.current = {
+            ...serverPagesSnapshotRef.current,
+            [pageId]: nextPage,
+          };
+          persistStoredPages(nextPages);
+          setPages(nextPages);
+          setNotice(message.permission === "edit" ? "이 페이지를 편집할 수 있어요" : "이 페이지가 보기 전용으로 변경되었습니다.");
+          return;
+        }
+        if (message.type === "access.revoked") {
+          leaveUnavailablePage(message.message || "이 페이지의 공유 권한이 해제되었습니다.");
+          socket.close();
+          return;
+        }
+        if (message.type === "page.archived" || message.type === "page.deleted") {
+          leaveUnavailablePage(message.type === "page.deleted" ? "공유 페이지가 삭제되었습니다." : "공유 페이지가 휴지통으로 이동되었습니다.");
+          socket.close();
+        }
+      });
+      socket.addEventListener("close", () => {
+        if (heartbeatTimer) window.clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+        if (realtimeSocketRef.current === socket) {
+          realtimeConnectedPageIdRef.current = null;
+          setRealtimeParticipants([]);
+        }
+        if (disposed || currentPageIdRef.current !== pageId) return;
+        const delay = Math.min(8_000, 1_000 * 2 ** reconnectAttempt);
+        reconnectAttempt += 1;
+        realtimeReconnectTimerRef.current = window.setTimeout(connect, delay);
+      });
+    };
+
+    connect();
+    return () => {
+      disposed = true;
+      flushRealtimeBlockPatch();
+      if (heartbeatTimer) window.clearInterval(heartbeatTimer);
+      if (realtimeReconnectTimerRef.current) window.clearTimeout(realtimeReconnectTimerRef.current);
+      realtimeReconnectTimerRef.current = null;
+      realtimeSocketRef.current?.close();
+      realtimeSocketRef.current = null;
+      realtimeConnectedPageIdRef.current = null;
+      realtimePresenceBlockRef.current = null;
+      realtimePendingBlocksRef.current = null;
+      realtimeProtectedBlockIdsRef.current.clear();
+      realtimeProtectedDeletedBlockIdsRef.current.clear();
+      setRealtimeParticipants([]);
+    };
+  }, [authUser?.id, currentPageId, editor, pageShares, publicPageId, workspaceSection]);
+
+  const refreshSharedPages = async () => {
+    if (!authUser) return;
+    try {
+      const [serverPages, serverShares, serverComments] = await Promise.all([
+        workspaceApi.listPages(true, true),
+        workspaceApi.listAllShares(),
+        workspaceApi.listAllComments(),
+      ]);
+      const currentPages = pagesRef.current;
+      const nextPages: StoredPages = {};
+      if (currentPages[ROOT_PAGE_ID]) nextPages[ROOT_PAGE_ID] = currentPages[ROOT_PAGE_ID];
+      serverPages.forEach((page) => {
+        nextPages[page.id] = storedPageFromServer(page);
+      });
+      const nextPageShares = Object.fromEntries(serverShares.map((share) => [
+        share.pageId,
+        storedShareFromServer(share),
+      ])) as StoredPageShares;
+      const nextBlockComments = Object.fromEntries(serverComments.map((thread) => [
+        thread.id,
+        storedCommentFromServer(thread),
+      ])) as StoredBlockComments;
+
+      serverPagesSnapshotRef.current = nextPages;
+      pagesRef.current = nextPages;
+      persistStoredPages(nextPages);
+      persistStoredPageShares(nextPageShares);
+      persistStoredBlockComments(nextBlockComments);
+      setPages(nextPages);
+      setPageShares(nextPageShares);
+      setBlockComments(nextBlockComments);
+      setLocalSaveState("saved");
+    } catch (error) {
+      setLocalSaveState("error");
+      setNotice(error instanceof Error ? error.message : "공유 페이지 목록을 불러오지 못했어요");
+    }
+  };
+
   const openSharedPages = () => {
     if (!authUser) {
       setAuthDialogMode("login");
@@ -1564,6 +2884,93 @@ function App() {
     setContextMenu(null);
     setSidebarContextMenu(null);
     editorStageRef.current?.scrollTo({ top: 0 });
+    void serverMutationQueueRef.current.then(refreshSharedPages);
+  };
+
+  const openTrash = () => {
+    if (!authUser) return;
+    saveDocument();
+    setWorkspaceSection("trash");
+    setInboxOpen(false);
+    setPageSettingsOpen(false);
+    setDrawerPageId(null);
+    setRightPanel(null);
+    setActiveCommentBlockId(null);
+    setContextMenu(null);
+    setSidebarContextMenu(null);
+    editorStageRef.current?.scrollTo({ top: 0 });
+  };
+
+  const restoreTrashPage = async (pageId: string) => {
+    const page = pagesRef.current[pageId];
+    if (!authUser || !page?.archived || (page.permission ?? "owner") !== "owner" || trashBusyPageId) return;
+    setTrashBusyPageId(pageId);
+    setLocalSaveState("saving");
+    try {
+      await serverMutationQueueRef.current;
+      const parentIsAvailable = !page.parentId || (pagesRef.current[page.parentId] && !pagesRef.current[page.parentId].archived);
+      const folderIsAvailable = !page.folderId || Boolean(foldersRef.current[page.folderId]);
+      const patch: Partial<Pick<StoredPage, "parentId" | "folderId" | "archived" | "revision">> = {
+        archived: false,
+        revision: page.revision,
+      };
+      if (!parentIsAvailable) patch.parentId = null;
+      if (!folderIsAvailable) patch.folderId = null;
+      const savedPage = storedPageFromServer(await workspaceApi.updatePage(pageId, patch));
+      const nextPages = { ...pagesRef.current, [pageId]: savedPage };
+      serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [pageId]: savedPage };
+      pagesRef.current = nextPages;
+      persistStoredPages(nextPages);
+      setPages(nextPages);
+      setLocalSaveState("saved");
+      setNotice(`“${savedPage.title || "제목 없음"}” 페이지를 복원했어요`);
+    } catch (error) {
+      setLocalSaveState("error");
+      setNotice(error instanceof Error ? error.message : "페이지를 복원하지 못했어요");
+    } finally {
+      setTrashBusyPageId(null);
+    }
+  };
+
+  const permanentlyDeleteTrashPages = async (target: string | "all") => {
+    if (!authUser || trashBusyPageId) return;
+    const pageIds = target === "all"
+      ? Object.values(pagesRef.current)
+        .filter((page) => page.archived && (page.permission ?? "owner") === "owner")
+        .map((page) => page.id)
+      : [target];
+    if (pageIds.length === 0) {
+      setPendingPermanentPageDeletion(null);
+      return;
+    }
+
+    setPendingPermanentPageDeletion(null);
+    setTrashBusyPageId(target);
+    setLocalSaveState("saving");
+    try {
+      await serverMutationQueueRef.current;
+      for (const pageId of pageIds) await workspaceApi.archivePage(pageId, true);
+      const deletedPageIds = new Set(pageIds);
+      const nextPages = Object.fromEntries(Object.entries(pagesRef.current)
+        .filter(([pageId]) => !deletedPageIds.has(pageId))) as StoredPages;
+      const nextSnapshot = Object.fromEntries(Object.entries(serverPagesSnapshotRef.current)
+        .filter(([pageId]) => !deletedPageIds.has(pageId))) as StoredPages;
+      serverPagesSnapshotRef.current = nextSnapshot;
+      pagesRef.current = nextPages;
+      persistStoredPages(nextPages);
+      setPages(nextPages);
+      commitPageShares((current) => Object.fromEntries(Object.entries(current)
+        .filter(([pageId]) => !deletedPageIds.has(pageId))) as StoredPageShares);
+      commitBlockComments((current) => Object.fromEntries(Object.entries(current)
+        .filter(([, thread]) => !deletedPageIds.has(thread.pageId))));
+      setLocalSaveState("saved");
+      setNotice(pageIds.length > 1 ? `${pageIds.length}개 페이지를 영구 삭제했어요` : "페이지를 영구 삭제했어요");
+    } catch (error) {
+      setLocalSaveState("error");
+      setNotice(error instanceof Error ? error.message : "페이지를 영구 삭제하지 못했어요");
+    } finally {
+      setTrashBusyPageId(null);
+    }
   };
 
   const openPageSettingsPanel = () => {
@@ -1581,6 +2988,10 @@ function App() {
       setAuthDialogMode("login");
       return;
     }
+    if ((pagesRef.current[currentPageIdRef.current]?.permission ?? "owner") !== "owner") {
+      setNotice("페이지 소유자만 공유 설정을 변경할 수 있어요");
+      return;
+    }
     setPageSettingsOpen(false);
     setActiveCommentBlockId(null);
     setRightPanel("share");
@@ -1596,64 +3007,61 @@ function App() {
     const targetUser = registeredNodiUsers.find((user) => user.id === userId);
     const targetPage = pagesRef.current[pageId];
     if (!targetUser || !targetPage) return;
-    const owner = authUser;
-    const now = new Date().toISOString();
-    commitPageShares((current) => {
-      const previous = current[pageId];
-      const members = previous?.members.some((member) => member.userId === userId)
-        ? previous.members.map((member) => member.userId === userId ? { ...member, permission } : member)
-        : [...(previous?.members ?? []), { userId, permission, sharedAt: now }];
-      return {
-        ...current,
-        [pageId]: {
-          pageId,
-          ownerId: owner.id,
-          ownerName: owner.name,
-          members,
-          updatedAt: now,
-        },
-      };
-    });
-    setNotice(`${targetUser.name}님에게 “${targetPage.title || "제목 없음"}” 페이지를 공유했어요`);
+    void (async () => {
+      try {
+        await workspaceApi.setShare(pageId, userId, permission);
+        const refreshed = await workspaceApi.listShares(pageId);
+        commitPageShares((current) => ({
+          ...current,
+          [pageId]: storedShareFromServer(refreshed),
+        }));
+        setLocalSaveState("saved");
+        setNotice(`${targetUser.name}님에게 “${targetPage.title || "제목 없음"}” 페이지를 공유했어요`);
+      } catch (error) {
+        setLocalSaveState("error");
+        setNotice(error instanceof Error ? error.message : "페이지를 공유하지 못했어요");
+      }
+    })();
   };
 
   const updatePageSharePermission = (pageId: string, userId: string, permission: SharePermission) => {
-    if (pageId === ROOT_PAGE_ID) return;
-    commitPageShares((current) => {
-      const record = current[pageId];
-      if (!record) return current;
-      return {
-        ...current,
-        [pageId]: {
-          ...record,
-          members: record.members.map((member) => member.userId === userId ? { ...member, permission } : member),
-          updatedAt: new Date().toISOString(),
-        },
-      };
-    });
+    if (pageId === ROOT_PAGE_ID || !authUser) return;
+    void (async () => {
+      try {
+        await workspaceApi.setShare(pageId, userId, permission);
+        const refreshed = await workspaceApi.listShares(pageId);
+        commitPageShares((current) => ({
+          ...current,
+          [pageId]: storedShareFromServer(refreshed),
+        }));
+        setLocalSaveState("saved");
+      } catch (error) {
+        setLocalSaveState("error");
+        setNotice(error instanceof Error ? error.message : "공유 권한을 변경하지 못했어요");
+      }
+    })();
   };
 
   const removePageShareMember = (pageId: string, userId: string) => {
     const targetUser = registeredNodiUsers.find((user) => user.id === userId);
-    commitPageShares((current) => {
-      const record = current[pageId];
-      if (!record) return current;
-      const members = record.members.filter((member) => member.userId !== userId);
-      if (members.length === 0) {
-        const nextPageShares = { ...current };
-        delete nextPageShares[pageId];
-        return nextPageShares;
+    if (!authUser) return;
+    void (async () => {
+      try {
+        await workspaceApi.removeShare(pageId, userId);
+        const refreshed = await workspaceApi.listShares(pageId);
+        commitPageShares((current) => {
+          const next = { ...current };
+          if (refreshed.members.length === 0) delete next[pageId];
+          else next[pageId] = storedShareFromServer(refreshed);
+          return next;
+        });
+        setLocalSaveState("saved");
+        if (targetUser) setNotice(`${targetUser.name}님의 페이지 접근 권한을 제거했어요`);
+      } catch (error) {
+        setLocalSaveState("error");
+        setNotice(error instanceof Error ? error.message : "공유 권한을 제거하지 못했어요");
       }
-      return {
-        ...current,
-        [pageId]: {
-          ...record,
-          members,
-          updatedAt: new Date().toISOString(),
-        },
-      };
-    });
-    if (targetUser) setNotice(`${targetUser.name}님의 페이지 접근 권한을 제거했어요`);
+    })();
   };
 
   const createPage = (source: "slash" | "sidebar" = "slash", requestedFolderId?: string | null) => {
@@ -1749,8 +3157,7 @@ function App() {
       }
       if (hasPrimaryModifier && event.key.toLowerCase() === "s") {
         event.preventDefault();
-        saveDocument();
-        setNotice("메모를 저장했어요");
+        saveDocument({ notify: true });
       }
     };
 
@@ -1835,17 +3242,6 @@ function App() {
     };
   }, [inboxOpen]);
 
-  useEffect(() => {
-    try {
-      const readIds = inboxNotifications
-        .filter((notification) => !notification.unread)
-        .map((notification) => notification.id);
-      window.localStorage.setItem(INBOX_READ_STORAGE_KEY, JSON.stringify(readIds));
-    } catch {
-      // Read state remains available for the current session.
-    }
-  }, [inboxNotifications]);
-
   const dismissStarterDock = () => {
     setStarterDockPageId(null);
     setSelectedStarterPreset(null);
@@ -1913,7 +3309,8 @@ function App() {
       return;
     }
     try {
-      await navigator.clipboard.writeText(window.location.href);
+      const page = pagesRef.current[currentPageIdRef.current];
+      await navigator.clipboard.writeText(getPageLink(currentPageIdRef.current, Boolean(page?.settings.publicAccess)));
       setNotice("이 페이지의 링크를 복사했어요");
     } catch {
       setNotice("링크 복사를 지원하지 않는 환경입니다");
@@ -2662,9 +4059,18 @@ function App() {
       deletedAt: new Date().toISOString(),
     }));
 
+    const deletedAt = new Date().toISOString();
     const nextPages: StoredPages = {};
     Object.values(pagesRef.current).forEach((candidate) => {
-      if (pageIdsToDelete.has(candidate.id)) return;
+      if (pageIdsToDelete.has(candidate.id)) {
+        nextPages[candidate.id] = {
+          ...candidate,
+          archived: true,
+          favoritedAt: null,
+          updatedAt: deletedAt,
+        };
+        return;
+      }
       const blocks = candidate.blocks.filter((block) => {
         const childBlock = block as unknown as { type?: string; props?: { pageId?: string } };
         return !(childBlock.type === "childPage" && childBlock.props?.pageId && pageIdsToDelete.has(childBlock.props.pageId));
@@ -2681,7 +4087,9 @@ function App() {
     }
 
     const currentPageWasDeleted = pageIdsToDelete.has(currentPageIdRef.current);
-    const fallbackPageId = page.parentId && nextPages[page.parentId] ? page.parentId : ROOT_PAGE_ID;
+    const fallbackPageId = page.parentId && nextPages[page.parentId] && !nextPages[page.parentId].archived
+      ? page.parentId
+      : ROOT_PAGE_ID;
     commitPages(nextPages);
     commitPageShares((current) => {
       const nextPageShares = { ...current };
@@ -2695,7 +4103,11 @@ function App() {
     if (currentPageWasDeleted) setActiveCommentBlockId(null);
     setPendingPageDeletion(null);
     setSidebarContextMenu(null);
-    if (currentPageWasDeleted) openPage(fallbackPageId);
+    // `commitPages` has already archived the current page. Saving the still
+    // mounted editor once more while navigating would write the stale
+    // `isArchived === false` view state back and make the deleted page reappear
+    // in the sidebar.
+    if (currentPageWasDeleted) openPage(fallbackPageId, { skipCurrentPageSave: true });
     setNotice(pageIdsToDelete.size > 1 ? `${pageIdsToDelete.size}개 페이지를 휴지통으로 옮겼어요` : "페이지를 휴지통으로 옮겼어요");
   };
 
@@ -3025,6 +4437,7 @@ function App() {
     targetBlockId: string,
     placement: "before" | "after",
   ) => {
+    if (!currentPageIsEditable()) return;
     const selected = new Set(normalizeBlockIds(blockIds));
     if (selected.size === 0 || selected.has(targetBlockId)) return;
 
@@ -3057,7 +4470,7 @@ function App() {
   };
 
   const handleEditorPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (pageSettings.lockPage || event.button !== 0) return;
+    if (!currentPageIsEditable() || event.button !== 0) return;
     const target = event.target as HTMLElement;
     const dragHandle = target.closest<HTMLElement>(".bn-side-menu button[draggable='true']");
     if (dragHandle) {
@@ -3223,8 +4636,17 @@ function App() {
       ?.dataset.id;
     if (blockId) {
       setFocusedBlockId(blockId);
+      sendRealtimePresence(blockId);
       if (!blockSelectionModeRef.current) blockSelectionAnchorRef.current = blockId;
     }
+  };
+
+  const handleEditorBlur = () => {
+    window.requestAnimationFrame(() => {
+      if (!editorContextRef.current?.contains(document.activeElement)) {
+        sendRealtimePresence(null);
+      }
+    });
   };
 
   const handleEditorClick = (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -3273,7 +4695,10 @@ function App() {
     } catch {
       cursorBlockId = null;
     }
-    if (cursorBlockId) setFocusedBlockId(cursorBlockId);
+    if (cursorBlockId) {
+      setFocusedBlockId(cursorBlockId);
+      sendRealtimePresence(cursorBlockId);
+    }
 
     const selection = editor.getSelection();
     const selectionType = editor.prosemirrorView.state.selection.constructor.name;
@@ -3392,6 +4817,7 @@ function App() {
   };
 
   const handleEditorCut = (event: ReactClipboardEvent<HTMLDivElement>) => {
+    if (!currentPageIsEditable()) return;
     // 텍스트를 드래그해 선택한 상태에서는 BlockNote/브라우저의 기본
     // 잘라내기를 그대로 사용한다. 이전 블록 선택 상태가 남아 있더라도
     // 네이티브 텍스트 선택을 우선해야 현재 문장만 정확히 잘린다.
@@ -3454,6 +4880,7 @@ function App() {
   };
 
   const handleEditorKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!currentPageIsEditable()) return;
     const target = event.target as HTMLElement;
     const isEditorEvent = Boolean(target.closest(".bn-editor"));
     if (pageSettings.lockPage || (!isEditorEvent && !blockSelectionModeRef.current)) return;
@@ -3594,6 +5021,9 @@ function App() {
         .filter((rect): rect is BlockSelectionMarquee => Boolean(rect));
 
       const toolbar = blockSelectionToolbarRef.current;
+      const activeRealtimeParticipants = realtimeParticipants.filter((participant) => (
+        participant.activeBlockId && participant.user.id !== authUser?.id
+      ));
       Object.values(blockComments)
         .filter((thread) => (
           thread.pageId === currentPageId
@@ -3628,10 +5058,46 @@ function App() {
           const markerWidth = marker.offsetWidth || 36;
           const markerCenter = rect.top + Math.min(rect.height / 2, 18);
           const markerOffset = 13;
-          marker.style.left = `${Math.min(window.innerWidth - markerWidth - 10, rect.right + markerOffset)}px`;
+          const activeEditorCount = activeRealtimeParticipants
+            .filter((participant) => participant.activeBlockId === thread.blockId)
+            .length;
+          const presenceWidth = activeEditorCount > 0 ? 26 + (activeEditorCount - 1) * 17 + 5 : 0;
+          marker.style.left = `${Math.min(window.innerWidth - markerWidth - 10, rect.right + markerOffset + presenceWidth)}px`;
           marker.style.top = `${Math.max(visibleTop + 16, Math.min(visibleBottom - 16, markerCenter))}px`;
           marker.dataset.positioned = "true";
         });
+
+      activeRealtimeParticipants.forEach((participant) => {
+        const marker = blockPresenceMarkerRefs.current.get(participant.user.id);
+        const blockId = participant.activeBlockId;
+        const element = blockId
+          ? root.querySelector<HTMLElement>(
+            `[data-node-type='blockContainer'][data-id="${CSS.escape(blockId)}"]`,
+          )
+          : null;
+        const content = element?.querySelector<HTMLElement>(":scope > .bn-block-content")
+          ?? element?.querySelector<HTMLElement>(".bn-block-content");
+        if (!marker || !content) {
+          marker?.removeAttribute("data-positioned");
+          return;
+        }
+        const rect = content.getBoundingClientRect();
+        const scrollRect = scrollArea?.getBoundingClientRect();
+        const topbarBottom = document.querySelector<HTMLElement>(".topbar")?.getBoundingClientRect().bottom ?? 0;
+        const visibleTop = Math.max(0, scrollRect?.top ?? 0, topbarBottom);
+        const visibleBottom = Math.min(window.innerHeight, scrollRect?.bottom ?? window.innerHeight);
+        if (rect.width <= 0 || rect.height <= 0 || rect.bottom <= visibleTop || rect.top >= visibleBottom) {
+          marker.removeAttribute("data-positioned");
+          return;
+        }
+        const sameBlock = activeRealtimeParticipants.filter((candidate) => candidate.activeBlockId === blockId);
+        const participantIndex = Math.max(0, sameBlock.findIndex((candidate) => candidate.user.id === participant.user.id));
+        const markerCenter = rect.top + Math.min(rect.height / 2, 18);
+        marker.style.left = `${Math.min(window.innerWidth - 30, rect.right + 13 + participantIndex * 17)}px`;
+        marker.style.top = `${Math.max(visibleTop + 16, Math.min(visibleBottom - 16, markerCenter))}px`;
+        marker.style.zIndex = String(76 + sameBlock.length - participantIndex);
+        marker.dataset.positioned = "true";
+      });
 
       if (!toolbar || rects.length === 0) {
         toolbar?.removeAttribute("data-positioned");
@@ -3665,7 +5131,7 @@ function App() {
       scrollArea?.removeEventListener("scroll", updatePosition);
       window.removeEventListener("resize", schedulePosition);
     };
-  }, [blockComments, currentPageId, selectedBlockIds]);
+  }, [authUser?.id, blockComments, currentPageId, realtimeParticipants, selectedBlockIds]);
 
   useLayoutEffect(() => {
     const menuState = blockSelectionActionMenu;
@@ -3867,6 +5333,30 @@ function App() {
   };
 
   const currentPage = pages[currentPageId] ?? rootPage;
+  const canEditCurrentPage = currentPage.permission !== "view" && !pageSettings.lockPage && !publicPageId;
+
+  useLayoutEffect(() => {
+    // BlockNoteView normally mirrors the `editable` prop into the editor, but
+    // permission changes can arrive while the same editor instance is already
+    // mounted. Apply it synchronously as well so a viewer never gets a brief
+    // editable window before React remounts the contentEditable surface.
+    editor.isEditable = canEditCurrentPage;
+    if (canEditCurrentPage) return;
+    if (realtimeBlocksTimerRef.current) {
+      window.clearTimeout(realtimeBlocksTimerRef.current);
+      realtimeBlocksTimerRef.current = null;
+    }
+    realtimePendingBlocksRef.current = null;
+    realtimeProtectedBlockIdsRef.current.clear();
+    realtimeProtectedDeletedBlockIdsRef.current.clear();
+    clearBlockSelection();
+    setContextMenu(null);
+    setBlockSelectionActionMenu(null);
+    setFocusedBlockId(null);
+    sendRealtimePresence(null);
+  }, [canEditCurrentPage, currentPageId, editor]);
+
+  const currentPageLink = getPageLink(currentPageId, Boolean(pageSettings.publicAccess));
   const localSaveLabel = localSaveState === "saving"
     ? "저장 중"
     : localSaveState === "error"
@@ -3885,6 +5375,12 @@ function App() {
     role: "member" as const,
   }, [authUser]);
   const registeredNodiUsers = useMemo(() => {
+    if (authUser) {
+      return serverDirectoryUsers.map((user) => ({
+        ...user,
+        avatarColor: user.avatarColor as NodiAvatarColor,
+      }));
+    }
     const approvedUsers = readRegistrationRequests()
       .filter((request) => request.status === "approved")
       .map((request) => ({
@@ -3914,7 +5410,7 @@ function App() {
         || candidate.email.toLocaleLowerCase() === user.email.toLocaleLowerCase()
       )) === index
     ));
-  }, [registrationDirectoryRevision]);
+  }, [authUser, registrationDirectoryRevision, serverDirectoryUsers]);
   const currentPageShare = pageShares[currentPageId];
   const isCurrentPageOwner = !currentPageShare || currentPageShare.ownerId === currentNodiUser.id;
   const isInvitedNodiMember = Boolean(currentPageShare?.members.some((member) => (
@@ -3967,25 +5463,27 @@ function App() {
       return;
     }
     const now = new Date().toISOString();
-    commitBlockComments((current) => {
-      const previous = Object.values(current).find((thread) => (
-        thread.pageId === currentPageId && thread.blockId === blockId
-      ));
-      const requestedParent = parentId
-        ? previous?.messages.find((message) => message.id === parentId)
-        : undefined;
-      const normalizedParentId = requestedParent
-        ? requestedParent.parentId ?? requestedParent.id
-        : null;
-      const message = {
-        id: makeId("comment"),
-        parentId: normalizedParentId,
-        authorId: currentNodiUser.id,
-        authorName: currentNodiUser.name,
-        authorEmail: currentNodiUser.email,
-        body,
-        createdAt: now,
-      };
+    const previous = Object.values(blockComments).find((thread) => (
+      thread.pageId === currentPageId && thread.blockId === blockId
+    ));
+    const requestedParent = parentId
+      ? previous?.messages.find((message) => message.id === parentId)
+      : undefined;
+    const normalizedParentId = requestedParent
+      ? requestedParent.parentId ?? requestedParent.id
+      : null;
+    const messageId = makeId("comment");
+    const threadId = previous?.id ?? makeId("comment-thread");
+    const message = {
+      id: messageId,
+      parentId: normalizedParentId,
+      authorId: currentNodiUser.id,
+      authorName: currentNodiUser.name,
+      authorEmail: currentNodiUser.email,
+      body,
+      createdAt: now,
+    };
+    const commitLocalComment = () => commitBlockComments((current) => {
       if (previous) {
         return {
           ...current,
@@ -3999,7 +5497,6 @@ function App() {
           },
         };
       }
-      const threadId = makeId("comment-thread");
       return {
         ...current,
         [threadId]: {
@@ -4014,11 +5511,43 @@ function App() {
         },
       };
     });
-    setNotice("블록에 댓글을 남겼어요");
+    if (authUser) {
+      void (async () => {
+        try {
+          const serverThread = previous
+            ? await workspaceApi.addCommentMessage(threadId, {
+                id: messageId,
+                parentId: normalizedParentId,
+                body,
+              })
+            : await workspaceApi.createComment(currentPageId, {
+                id: threadId,
+                blockId,
+                blockPreview: getBlockPreview(block),
+                body,
+              });
+          commitBlockComments((current) => ({
+            ...current,
+            [serverThread.id]: storedCommentFromServer(serverThread),
+          }));
+          setLocalSaveState("saved");
+          setNotice("블록에 댓글을 남겼어요");
+        } catch (error) {
+          setLocalSaveState("error");
+          setNotice(error instanceof Error ? error.message : "댓글을 서버에 저장하지 못했어요");
+        }
+      })();
+    } else {
+      commitLocalComment();
+      setNotice("블록에 댓글을 남겼어요");
+    }
   };
 
   const deleteBlockComment = (threadId: string, commentId: string) => {
-    commitBlockComments((current) => {
+    const thread = blockComments[threadId];
+    const targetComment = thread?.messages.find((message) => message.id === commentId);
+    if (!thread || !targetComment || targetComment.authorId !== currentNodiUser.id) return;
+    const commitLocalDelete = () => commitBlockComments((current) => {
       const thread = current[threadId];
       if (!thread) return current;
       const targetComment = thread.messages.find((message) => message.id === commentId);
@@ -4041,10 +5570,41 @@ function App() {
         },
       };
     });
-    setNotice("댓글을 삭제했어요");
+    if (authUser) {
+      void (async () => {
+        try {
+          await workspaceApi.deleteCommentMessage(threadId, commentId);
+          commitLocalDelete();
+          setLocalSaveState("saved");
+          setNotice("댓글을 삭제했어요");
+        } catch (error) {
+          setLocalSaveState("error");
+          setNotice(error instanceof Error ? error.message : "댓글을 삭제하지 못했어요");
+        }
+      })();
+    } else {
+      commitLocalDelete();
+      setNotice("댓글을 삭제했어요");
+    }
   };
 
   const setBlockCommentResolved = (threadId: string, resolved: boolean) => {
+    if (authUser) {
+      void workspaceApi.resolveComment(threadId, resolved)
+        .then((serverThread) => {
+          commitBlockComments((current) => ({
+            ...current,
+            [threadId]: storedCommentFromServer(serverThread),
+          }));
+          setLocalSaveState("saved");
+          setNotice(resolved ? "댓글을 해결로 표시했어요" : "댓글을 다시 열었어요");
+        })
+        .catch((error: unknown) => {
+          setLocalSaveState("error");
+          setNotice(error instanceof Error ? error.message : "댓글 상태를 저장하지 못했어요");
+        });
+      return;
+    }
     commitBlockComments((current) => {
       const thread = current[threadId];
       if (!thread) return current;
@@ -4063,7 +5623,50 @@ function App() {
 
   const isHomePage = isAuthenticated && currentPageId === ROOT_PAGE_ID;
   const isFavorite = !isHomePage && Boolean(currentPage.favoritedAt);
+  const canManageCurrentPageShares = !isHomePage && (currentPage.permission ?? "owner") === "owner";
   const unreadInboxCount = inboxNotifications.filter((notification) => notification.unread).length;
+  const markAllInboxNotificationsRead = () => {
+    setInboxNotifications((notifications) => notifications.map((notification) => ({ ...notification, unread: false })));
+    if (authUser) {
+      void workspaceApi.readAllNotifications().catch((error: unknown) => {
+        setNotice(error instanceof Error ? error.message : "알림 읽음 상태를 저장하지 못했어요");
+      });
+    }
+  };
+  const openInboxNotification = (notification: InboxNotification) => {
+    setInboxNotifications((notifications) => notifications.map((candidate) => (
+      candidate.id === notification.id ? { ...candidate, unread: false } : candidate
+    )));
+    if (authUser && notification.unread) {
+      void workspaceApi.readNotification(notification.id).catch((error: unknown) => {
+        setNotice(error instanceof Error ? error.message : "알림 읽음 상태를 저장하지 못했어요");
+      });
+    }
+    if (!notification.pageId) return;
+    const openNotificationPage = async () => {
+      if (!pagesRef.current[notification.pageId!]) {
+        if (!authUser) return;
+        try {
+          const serverPage = await workspaceApi.getPage(notification.pageId!);
+          const sharedPage = storedPageFromServer(serverPage);
+          const nextPages = { ...pagesRef.current, [sharedPage.id]: sharedPage };
+          pagesRef.current = nextPages;
+          serverPagesSnapshotRef.current = {
+            ...serverPagesSnapshotRef.current,
+            [sharedPage.id]: sharedPage,
+          };
+          persistStoredPages(nextPages);
+          setPages(nextPages);
+        } catch (error) {
+          setNotice(error instanceof Error ? error.message : "공유 페이지를 불러오지 못했어요");
+          return;
+        }
+      }
+      setInboxOpen(false);
+      openPage(notification.pageId!);
+    };
+    void openNotificationPage();
+  };
   const sharedPageCount = Object.values(pageShares).filter((record) => (
     (
       (record.ownerId === currentNodiUser.id && record.members.length > 0)
@@ -4072,14 +5675,16 @@ function App() {
         && record.members.some((member) => member.userId === currentNodiUser.id)
       )
     )
-    && Boolean(pages[record.pageId])
-    && !pages[record.pageId]?.archived
+    // Share metadata can arrive before the heavier page bootstrap. An absent
+    // local page must not hide the badge; only an explicitly archived page is
+    // excluded.
+    && pages[record.pageId]?.archived !== true
   )).length;
   const favoritePages = Object.values(pages)
-    .filter((page) => page.id !== ROOT_PAGE_ID && Boolean(page.favoritedAt))
+    .filter((page) => page.id !== ROOT_PAGE_ID && !page.archived && (page.permission ?? "owner") === "owner" && Boolean(page.favoritedAt))
     .sort((first, second) => (second.favoritedAt ?? "").localeCompare(first.favoritedAt ?? ""));
   const homeRecentPages = Object.values(pages)
-    .filter((page) => page.id !== ROOT_PAGE_ID && !page.archived)
+    .filter((page) => page.id !== ROOT_PAGE_ID && !page.archived && (page.permission ?? "owner") === "owner")
     .sort((first, second) => second.updatedAt.localeCompare(first.updatedAt))
     .slice(0, 4);
   const homeFavoritePages = favoritePages
@@ -4103,7 +5708,7 @@ function App() {
     .filter((folder) => folder.parentId === parentId)
     .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
   const folderPages = (folderId: string) => Object.values(pages)
-    .filter((page) => page.id !== ROOT_PAGE_ID && page.folderId === folderId)
+    .filter((page) => page.id !== ROOT_PAGE_ID && !page.archived && (page.permission ?? "owner") === "owner" && page.folderId === folderId)
     .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
   const sidebarItems = (parentId: string | null) => getSidebarOrderedItems(pages, folders, parentId);
   const rootSidebarItems = sidebarItems(null);
@@ -4116,7 +5721,10 @@ function App() {
         0,
       );
   };
-  const personalPageCount = Object.keys(pages).length - 1;
+  const personalPageCount = Object.values(pages)
+    .filter((page) => page.id !== ROOT_PAGE_ID && !page.archived && (page.permission ?? "owner") === "owner").length;
+  const trashPageCount = Object.values(pages)
+    .filter((page) => page.id !== ROOT_PAGE_ID && page.archived && (page.permission ?? "owner") === "owner").length;
   const liveSelectedBlockIds = getLiveSelectedBlockIds();
   const selectedCommentThread = liveSelectedBlockIds.length === 1
     ? currentPageCommentThreads.find((thread) => thread.blockId === liveSelectedBlockIds[0])
@@ -4390,7 +5998,9 @@ function App() {
               onClick={() => {
                 setSidebarContextMenu(null);
                 setSidebarCreateMenuOpen(false);
-                setInboxOpen((open) => !open);
+                const nextOpen = !inboxOpen;
+                setInboxOpen(nextOpen);
+                if (nextOpen) void refreshInbox({ force: true, reportError: true });
               }}
             />
             {inboxOpen && (
@@ -4408,40 +6018,42 @@ function App() {
                   {unreadInboxCount > 0 && (
                     <button
                       type="button"
-                      onClick={() => setInboxNotifications((notifications) => (
-                        notifications.map((notification) => ({ ...notification, unread: false }))
-                      ))}
+                      onClick={markAllInboxNotificationsRead}
                     >
                       모두 읽음
                     </button>
                   )}
                 </header>
                 <ul className="sidebar-inbox-list">
-                  {inboxNotifications.map((notification) => (
-                    <li key={notification.id}>
-                      <button
-                        className={`sidebar-inbox-notification ${notification.unread ? "is-unread" : ""}`}
-                        type="button"
-                        onClick={() => setInboxNotifications((notifications) => (
-                          notifications.map((candidate) => (
-                            candidate.id === notification.id ? { ...candidate, unread: false } : candidate
-                          ))
-                        ))}
-                      >
-                        <span className={`sidebar-inbox-icon is-${notification.kind}`}>
-                          {notification.kind === "share" && <UserPlus size={16} />}
-                          {notification.kind === "comment" && <MessageCircle size={16} />}
-                          {notification.kind === "mention" && <Bell size={16} />}
-                        </span>
-                        <span className="sidebar-inbox-copy">
-                          <strong>{notification.title}</strong>
-                          <span>{notification.description}</span>
-                          <small>{notification.time}</small>
-                        </span>
-                        {notification.unread && <i aria-label="읽지 않음" />}
-                      </button>
-                    </li>
-                  ))}
+                  {inboxNotifications.length === 0
+                    ? (
+                      <li className="sidebar-inbox-empty">
+                        <span><Inbox size={18} /></span>
+                        <strong>새 알림이 없습니다.</strong>
+                        <small>공유와 댓글 알림이 도착하면 여기에 표시됩니다.</small>
+                      </li>
+                    )
+                    : inboxNotifications.map((notification) => (
+                      <li key={notification.id}>
+                        <button
+                          className={`sidebar-inbox-notification ${notification.unread ? "is-unread" : ""}`}
+                          type="button"
+                          onClick={() => openInboxNotification(notification)}
+                        >
+                          <span className={`sidebar-inbox-icon is-${notification.kind}`}>
+                            {notification.kind === "share" && <UserPlus size={16} />}
+                            {notification.kind === "comment" && <MessageCircle size={16} />}
+                            {notification.kind === "mention" && <Bell size={16} />}
+                          </span>
+                          <span className="sidebar-inbox-copy">
+                            <strong>{notification.title}</strong>
+                            <span>{notification.description}</span>
+                            <small>{notification.time}</small>
+                          </span>
+                          {notification.unread && <i aria-label="읽지 않음" />}
+                        </button>
+                      </li>
+                    ))}
                 </ul>
                 <footer>공유, 댓글, 멘션 알림이 이곳에 모입니다.</footer>
               </section>
@@ -4451,7 +6063,7 @@ function App() {
             icon={<Share2 size={17} />}
             label="공유 페이지"
             count={sharedPageCount > 0 ? String(sharedPageCount) : undefined}
-            active={workspaceSection === "shared"}
+            active={workspaceSection === "shared" || workspaceSection === "shared-page"}
             onClick={openSharedPages}
           />
           </nav>
@@ -4538,6 +6150,16 @@ function App() {
           {isAuthenticated ? <>
             <button
               type="button"
+              className={`footer-nav trash-nav ${workspaceSection === "trash" ? "is-active" : ""}`}
+              aria-current={workspaceSection === "trash" ? "page" : undefined}
+              onClick={openTrash}
+            >
+              <Trash2 size={16} />
+              <span>휴지통</span>
+              {trashPageCount > 0 && <em className="nav-count-badge">{trashPageCount}</em>}
+            </button>
+            <button
+              type="button"
               className="footer-nav theme-toggle"
               role="switch"
               aria-checked={isDarkMode}
@@ -4577,7 +6199,7 @@ function App() {
       <main className="main-area">
         <header className="topbar">
           <div className="topbar-left">
-            {!sidebarOpen && (
+            {!sidebarOpen && !publicPageId && (
               <button
                 className="icon-button sidebar-reopen-button"
                 type="button"
@@ -4589,14 +6211,26 @@ function App() {
                 <PanelLeftOpen size={19} />
               </button>
             )}
-            {parentPage && (
+            {workspaceSection === "pages" && parentPage && (
               <button className="crumb-back" type="button" aria-label={`${parentPage.title} 페이지로 돌아가기`} onClick={() => openPage(parentPage.id)}>
                 <ChevronLeft size={17} />
               </button>
             )}
             <div className="crumb">
-              {workspaceSection === "shared" ? (
+              {publicPageId ? (
+                <span className="crumb-root" aria-current="page">공개 페이지</span>
+              ) : workspaceSection === "shared" ? (
                 <span className="crumb-root" aria-current="page">공유 페이지</span>
+              ) : workspaceSection === "shared-page" ? (
+                <>
+                  <button className="crumb-page" type="button" onClick={openSharedPages}>공유 페이지</button>
+                  <span className="crumb-segment">
+                    <span className="crumb-divider" aria-hidden="true">/</span>
+                    <span className="crumb-current" aria-current="page">{currentPage.title || "제목 없음"}</span>
+                  </span>
+                </>
+              ) : workspaceSection === "trash" ? (
+                <span className="crumb-root" aria-current="page">휴지통</span>
               ) : isHomePage ? (
                 <span className="crumb-root" aria-current="page">홈</span>
               ) : (
@@ -4624,10 +6258,31 @@ function App() {
           <div className="topbar-actions">
             {workspaceSection === "shared" ? (
               <span className="shared-topbar-status"><Users size={15} /> Nodi 회원 공유 관리</span>
+            ) : workspaceSection === "trash" ? (
+              <span className="trash-topbar-status"><Trash2 size={15} /> 삭제된 페이지 관리</span>
             ) : isHomePage ? (
               <span className="home-topbar-status"><Home size={15} /> 프라이빗 페이지</span>
             ) : (
               <>
+                {realtimeParticipants.length > 0 && (
+                  <div
+                    className="realtime-participants"
+                    aria-label={`${realtimeParticipants.length}명 접속 중`}
+                    data-nodi-tooltip={`${realtimeParticipants.length}명 접속 중`}
+                  >
+                    {realtimeParticipants.slice(0, 4).map((participant) => (
+                      <span key={participant.user.id} title={`${participant.user.name}${participant.user.id === authUser?.id ? " (나)" : ""}`}>
+                        <NodiUserAvatar
+                          user={{
+                            ...participant.user,
+                            avatarColor: participant.user.avatarColor as NodiAvatarColor,
+                          }}
+                        />
+                      </span>
+                    ))}
+                    {realtimeParticipants.length > 4 && <em>+{realtimeParticipants.length - 4}</em>}
+                  </div>
+                )}
                 <span
                   className={`save-state is-${localSaveState}`}
                   role="status"
@@ -4636,19 +6291,36 @@ function App() {
                 >
                   <LocalSaveIcon size={15} /> {localSaveLabel}
                 </span>
-                {isAuthenticated ? <>
-                  <button
-                    className={`icon-button ${isFavorite ? "is-favorite" : ""}`}
-                    type="button"
-                    aria-label={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
-                    aria-pressed={isFavorite}
-                    data-nodi-tooltip={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
-                    onClick={toggleFavorite}
-                  >
-                    <Star size={18} fill={isFavorite ? "currentColor" : "none"} />
-                  </button>
-                  <button className="icon-button" type="button" aria-label="공유" onClick={openSharePanel}><Share2 size={18} /></button>
-                  <button className="page-settings-trigger" type="button" aria-label="페이지 설정" onClick={openPageSettingsPanel}><Settings2 size={16} /> 설정</button>
+                {publicPageId ? (
+                  <span className="shared-topbar-status"><Globe2 size={15} /> 읽기 전용 공개 페이지</span>
+                ) : isAuthenticated ? <>
+                  {currentPage.permission === "view" && (
+                    <span className="shared-topbar-status"><Eye size={15} /> 보기 전용</span>
+                  )}
+                  {(currentPage.permission ?? "owner") === "owner" && (
+                    <button
+                      className={`icon-button ${isFavorite ? "is-favorite" : ""}`}
+                      type="button"
+                      aria-label={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
+                      aria-pressed={isFavorite}
+                      data-nodi-tooltip={isFavorite ? "즐겨찾기에서 제거" : "즐겨찾기에 추가"}
+                      onClick={toggleFavorite}
+                    >
+                      <Star size={18} fill={isFavorite ? "currentColor" : "none"} />
+                    </button>
+                  )}
+                  {canManageCurrentPageShares && (
+                    <button
+                      className="icon-button"
+                      type="button"
+                      aria-label="공유"
+                      data-nodi-tooltip="공유"
+                      onClick={openSharePanel}
+                    >
+                      <Share2 size={18} />
+                    </button>
+                  )}
+                  {canEditCurrentPage && <button className="page-settings-trigger" type="button" aria-label="페이지 설정" onClick={openPageSettingsPanel}><Settings2 size={16} /> 설정</button>}
                   <button className="more-button" type="button" aria-label="더 보기" onClick={exportJson}><Download size={16} /> 내보내기</button>
                 </> : (
                   <button className="guest-topbar-login" type="button" onClick={() => setAuthDialogMode("login")}>
@@ -4674,12 +6346,21 @@ function App() {
               openSharePanel();
             }}
           />
+        ) : workspaceSection === "trash" ? (
+          <TrashView
+            pages={pages}
+            folders={folders}
+            busyPageId={trashBusyPageId}
+            onRestore={(pageId) => void restoreTrashPage(pageId)}
+            onDeletePermanently={(pageId) => setPendingPermanentPageDeletion(pageId)}
+            onEmptyTrash={() => setPendingPermanentPageDeletion("all")}
+          />
         ) : (
         <>
         <section ref={editorStageRef} className={`editor-stage ${isHomePage ? "is-home" : ""} ${pageSettings.fullWidth ? "is-wide" : ""} ${pageSettings.smallText ? "uses-small-text" : ""}`} onPointerDownCapture={handleEditorStagePointerDown}>
           {isArchived && <div className="archive-banner"><Archive size={15} /> 이 페이지는 보관됨 상태입니다.<button type="button" onClick={toggleArchive}>복원</button></div>}
           {!isHomePage && <div className={`cover cover--${pageSettings.cover}`} aria-hidden="true"><div className="cover-orb orb-one" /><div className="cover-orb orb-two" /><div className="cover-grid" /></div>}
-          <article className={`note-page ${isHomePage ? "home-note-page" : ""} ${pageSettings.fullWidth ? "page-wide" : ""}`} onContextMenu={(event) => openContextMenu(event, "page")}>
+          <article className={`note-page ${isHomePage ? "home-note-page" : ""} ${pageSettings.fullWidth ? "page-wide" : ""}`} onContextMenu={canEditCurrentPage ? (event) => openContextMenu(event, "page") : undefined}>
             {isHomePage ? (
               <div className="home-dashboard">
                 <section className="home-welcome-card" aria-labelledby="home-title">
@@ -4692,7 +6373,7 @@ function App() {
                       value={title}
                       onChange={(event) => setTitle(event.target.value)}
                       aria-label="홈 제목"
-                      disabled={pageSettings.lockPage}
+                      disabled={!canEditCurrentPage}
                     />
                     <p>중요한 페이지를 한눈에 살펴보고, 오늘 필요한 생각을 바로 이어서 기록해보세요.</p>
                     <div className="home-welcome-actions">
@@ -4773,7 +6454,7 @@ function App() {
                     <span className="home-note-date"><Clock3 size={13} /> {formatHomeMemoDate()}</span>
                     <button
                       type="button"
-                      disabled={pageSettings.lockPage}
+                      disabled={!canEditCurrentPage}
                       onClick={() => {
                         editorContextRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
                         window.requestAnimationFrame(() => editor.focus());
@@ -4786,7 +6467,7 @@ function App() {
               </div>
             ) : (
               <>
-                {isAuthenticated
+                {isAuthenticated && canEditCurrentPage
                   ? <button className="page-emoji" type="button" aria-label="페이지 아이콘 설정" onClick={openPageSettingsPanel}>{pageSettings.icon}</button>
                   : <span className="page-emoji" aria-hidden="true">{pageSettings.icon}</span>}
                 <input
@@ -4799,15 +6480,15 @@ function App() {
                   }}
                   aria-label="페이지 제목"
                   placeholder="제목 없음"
-                  disabled={pageSettings.lockPage}
+                  disabled={!canEditCurrentPage}
                 />
                 {isAuthenticated && pageSettings.showProperties && <div className="page-properties" aria-label="페이지 속성">
                   <div className="property property-updated"><Clock3 size={14} /><span>수정</span><RelativeUpdatedAt value={currentPage.updatedAt} /></div>
-                  <div className="property property-status"><Hash size={14} /><span>상태</span><Select disabled={pageSettings.lockPage} value={pageSettings.status} onValueChange={(value) => setPageSettings({ ...pageSettings, status: value as PageSettings["status"] })} options={pageStatusOptions} ariaLabel="페이지 상태" className={`status-select ${pageSettings.status === "초안" ? "status-waiting" : pageSettings.status === "진행 중" ? "status-progress" : "status-done"}`} /></div>
-                  <div className="property property-tags"><Hash size={14} /><span>태그</span><TagPicker value={pageSettings.tags} options={DEFAULT_TAG_OPTIONS} disabled={pageSettings.lockPage} compact onChange={(tags) => setPageSettings({ ...pageSettings, tags })} /></div>
-                  <div className="property property-date"><Clock3 size={14} /><span>날짜</span><DatePicker compact disabled={pageSettings.lockPage} value={pageSettings.date} onChange={(date) => setPageSettings({ ...pageSettings, date })} ariaLabel="페이지 날짜" /></div>
+                  <div className="property property-status"><Hash size={14} /><span>상태</span><Select disabled={!canEditCurrentPage} value={pageSettings.status} onValueChange={(value) => setPageSettings({ ...pageSettings, status: value as PageSettings["status"] })} options={pageStatusOptions} ariaLabel="페이지 상태" className={`status-select ${pageSettings.status === "초안" ? "status-waiting" : pageSettings.status === "진행 중" ? "status-progress" : "status-done"}`} /></div>
+                  <div className="property property-tags"><Hash size={14} /><span>태그</span><TagPicker value={pageSettings.tags} options={tagOptions} disabled={!canEditCurrentPage} compact onChange={(tags) => setPageSettings({ ...pageSettings, tags })} /></div>
+                  <div className="property property-date"><Clock3 size={14} /><span>날짜</span><DatePicker compact disabled={!canEditCurrentPage} value={pageSettings.date} onChange={(date) => setPageSettings({ ...pageSettings, date })} ariaLabel="페이지 날짜" /></div>
                   <span className="page-property-separator" aria-hidden="true" />
-                  <button className="add-property" type="button" onClick={openPageSettingsPanel}><Plus size={14} /> 속성 설정</button>
+                  <button className="add-property" type="button" disabled={!canEditCurrentPage} onClick={openPageSettingsPanel}><Plus size={14} /> 속성 설정</button>
                 </div>}
               </>
             )}
@@ -4815,9 +6496,11 @@ function App() {
             <div
               ref={editorContextRef}
               tabIndex={-1}
-              className={`block-editor-context-target ${isBlockSelectionMode ? "has-block-selection" : ""} ${isBlockDragging ? "is-block-dragging" : ""} ${blockSelectionMarquee ? "is-block-marquee-selecting" : ""}`}
-              onContextMenu={openEditorContextMenu}
+              className={`block-editor-context-target ${canEditCurrentPage ? "" : "is-readonly"} ${isBlockSelectionMode ? "has-block-selection" : ""} ${isBlockDragging ? "is-block-dragging" : ""} ${blockSelectionMarquee ? "is-block-marquee-selecting" : ""}`}
+              aria-readonly={!canEditCurrentPage}
+              onContextMenu={canEditCurrentPage ? openEditorContextMenu : undefined}
               onFocusCapture={handleEditorFocus}
+              onBlurCapture={handleEditorBlur}
               onClickCapture={handleEditorClick}
               onPointerDownCapture={handleEditorPointerDown}
               onPointerMoveCapture={handleEditorPointerMove}
@@ -4867,6 +6550,27 @@ function App() {
                     <span>{thread.messages.length}</span>
                   </button>
                 ))}
+              {realtimeParticipants
+                .filter((participant) => participant.activeBlockId && participant.user.id !== authUser?.id)
+                .map((participant) => (
+                  <span
+                    key={participant.user.id}
+                    ref={(element) => {
+                      if (element) blockPresenceMarkerRefs.current.set(participant.user.id, element);
+                      else blockPresenceMarkerRefs.current.delete(participant.user.id);
+                    }}
+                    className="block-presence-marker"
+                    title={`${participant.user.name}님이 이 블록을 편집 중입니다`}
+                    aria-label={`${participant.user.name}님이 편집 중`}
+                  >
+                    <NodiUserAvatar
+                      user={{
+                        ...participant.user,
+                        avatarColor: participant.user.avatarColor as NodiAvatarColor,
+                      }}
+                    />
+                  </span>
+                ))}
               {blockDropIndicator && (
                 <div
                   className="block-drop-indicator"
@@ -4892,7 +6596,7 @@ function App() {
                   {liveSelectedBlockIds.length > 0 && <span>{liveSelectedBlockIds.length}개 블록</span>}
                 </div>
               )}
-              {isBlockSelectionMode
+              {canEditCurrentPage && isBlockSelectionMode
                 && liveSelectedBlockIds.length > 0
                 && !blockSelectionMarquee
                 && !isBlockDragging && (
@@ -5014,31 +6718,48 @@ function App() {
                   </button>
                 </div>
               )}
+              <InlineDatabaseSyncProvider
+                enabled={isAuthenticated}
+                pageId={isHomePage ? null : currentPageId}
+                readOnly={!canEditCurrentPage}
+                collaborative={!isHomePage && (
+                  (currentPage.permission ?? "owner") !== "owner"
+                  || (pageShares[currentPageId]?.members.length ?? 0) > 0
+                )}
+              >
               <BlockNoteView
                 editor={editor}
                 onChange={() => {
-                  if (loadingPageRef.current) return;
+                  if (!canEditCurrentPage || loadingPageRef.current) return;
                   dismissStarterDockForCurrentPage();
+                  const nextBlocks = editor.document as unknown as PartialBlock[];
                   updatePage(currentPageIdRef.current, {
-                    blocks: editor.document as unknown as PartialBlock[],
+                    blocks: nextBlocks,
                   });
+                  try {
+                    sendRealtimePresence(editor.getTextCursorPosition().block.id);
+                  } catch {
+                    // Non-text blocks can change without an active text cursor.
+                  }
+                  queueRealtimeBlockPatch(nextBlocks);
                 }}
                 onSelectionChange={syncEditorSelection}
                 theme={appTheme}
-                editable={!pageSettings.lockPage}
+                editable={canEditCurrentPage}
                 formattingToolbar={!isBlockSelectionMode}
                 linkToolbar={!isBlockSelectionMode}
                 slashMenu={false}
                 data-theming-css-variables-demo
               >
-                <SuggestionMenuController
+                {canEditCurrentPage && <SuggestionMenuController
                   triggerCharacter="/"
                   getItems={async (query) => filterSuggestionItems(
                     getNodiSlashMenuItems(editor, () => createPage("slash")),
                     query,
                   )}
-                />
+                />}
               </BlockNoteView>
+              </InlineDatabaseSyncProvider>
             </div>
 
             <div className="editor-hint">
@@ -5081,7 +6802,7 @@ function App() {
         !isHomePage ? (
           <PageSharePanel
             pageTitle={title}
-            pageLink={window.location.href}
+            pageLink={currentPageLink}
             isPublic={pageSettings.publicAccess}
             members={pageShares[currentPageId]?.members ?? []}
             registeredUsers={registeredNodiUsers}
@@ -5096,7 +6817,7 @@ function App() {
       ) : rightPanel ? (
         <QuickActionPanel
           type={rightPanel}
-          pageLink={window.location.href}
+          pageLink={currentPageLink}
           onClose={() => setRightPanel(null)}
           onCopy={copyPageLink}
           onDraft={addDraft}
@@ -5144,6 +6865,7 @@ function App() {
           page={pages[drawerPageId]}
           parentTitle={pages[pages[drawerPageId].parentId || ""]?.title}
           theme={appTheme}
+          serverEnabled={isAuthenticated}
           onClose={() => setDrawerPageId(null)}
           onOpenPage={() => openPage(drawerPageId)}
           onChange={(patch) => updatePage(drawerPageId, patch)}
@@ -5315,7 +7037,7 @@ function App() {
           <button type="button" onClick={() => setNoticeClosing(true)} aria-label="알림 닫기"><X size={14} /></button>
         </div>
       )}
-      {isAuthenticated && pageSettingsOpen && <PageSettingsPanel settings={pageSettings} onChange={setPageSettings} onClose={() => setPageSettingsOpen(false)} />}
+      {isAuthenticated && pageSettingsOpen && <PageSettingsPanel settings={pageSettings} tagOptions={tagOptions} onChange={setPageSettings} onClose={() => setPageSettingsOpen(false)} />}
       {isAuthenticated && workspaceSettingsOpen && (
         <WorkspaceSettingsDialog
           user={currentNodiUser}
@@ -5325,6 +7047,23 @@ function App() {
           onStarterPresetsChange={(presets) => {
             setStarterPresets(presets);
             persistStarterPresets(presets);
+            if (authUser) {
+              enqueueServerMutation(async () => {
+                const before = serverPresetsSnapshotRef.current;
+                for (const preset of before) {
+                  if (!presets.some((item) => item.id === preset.id)) await workspaceApi.deletePreset(preset.id);
+                }
+                for (let index = 0; index < presets.length; index += 1) {
+                  const preset = presets[index];
+                  const previous = before.find((item) => item.id === preset.id);
+                  if (!previous) await workspaceApi.createPreset(preset, index);
+                  else if (!sameServerValue(previous, preset) || before.indexOf(previous) !== index) {
+                    await workspaceApi.updatePreset(preset, index);
+                  }
+                }
+                serverPresetsSnapshotRef.current = presets;
+              });
+            }
             if (selectedStarterPreset && !presets.some((preset) => preset.id === selectedStarterPreset)) {
               setSelectedStarterPreset(null);
             }
@@ -5347,6 +7086,18 @@ function App() {
           title={pages[pendingPageDeletion].title}
           onCancel={() => setPendingPageDeletion(null)}
           onConfirm={() => deletePage(pendingPageDeletion)}
+        />
+      )}
+      {pendingPermanentPageDeletion && (pendingPermanentPageDeletion === "all" || pages[pendingPermanentPageDeletion]) && (
+        <ConfirmDialog
+          ariaLabel={pendingPermanentPageDeletion === "all" ? "휴지통 비우기" : "페이지 영구 삭제"}
+          title={pendingPermanentPageDeletion === "all" ? "휴지통을 비울까요?" : "페이지를 영구 삭제할까요?"}
+          description={pendingPermanentPageDeletion === "all"
+            ? `휴지통의 ${trashPageCount}개 페이지와 첨부 파일이 모두 삭제되며 복구할 수 없습니다.`
+            : `“${pages[pendingPermanentPageDeletion]?.title || "제목 없음"}” 페이지와 첨부 파일이 삭제되며 복구할 수 없습니다.`}
+          confirmLabel={pendingPermanentPageDeletion === "all" ? "휴지통 비우기" : "영구 삭제"}
+          onCancel={() => setPendingPermanentPageDeletion(null)}
+          onConfirm={() => void permanentlyDeleteTrashPages(pendingPermanentPageDeletion)}
         />
       )}
       {pendingBlockDeletion && <BlockDeleteConfirm count={pendingBlockDeletion.length} onCancel={() => setPendingBlockDeletion(null)} onConfirm={deleteBlock} />}
@@ -5945,6 +7696,7 @@ function PagePreviewDrawer({
   page,
   parentTitle,
   theme,
+  serverEnabled,
   onClose,
   onOpenPage,
   onChange,
@@ -5952,6 +7704,7 @@ function PagePreviewDrawer({
   page: StoredPage;
   parentTitle?: string;
   theme: AppTheme;
+  serverEnabled: boolean;
   onClose: () => void;
   onOpenPage: () => void;
   onChange: (patch: Partial<StoredPage>) => void;
@@ -5960,8 +7713,12 @@ function PagePreviewDrawer({
     schema: editorSchema,
     initialContent: (page.blocks.length ? page.blocks : [{ type: "paragraph", content: "" }]) as never,
     dictionary: ko,
-    uploadFile: uploadNodiAttachment,
+    uploadFile: (file) => uploadNodiAttachment(file, {
+      authenticated: serverEnabled,
+      pageId: page.id,
+    }),
   });
+  const canEditPreviewPage = page.permission !== "view" && !page.settings.lockPage;
   const [previewTitle, setPreviewTitle] = useState(page.title);
   const [drawerWidth, setDrawerWidth] = useState(() => {
     const savedWidth = Number(window.localStorage.getItem(PAGE_DRAWER_WIDTH_STORAGE_KEY));
@@ -5978,6 +7735,10 @@ function PagePreviewDrawer({
   const isClosingRef = useRef(false);
   const resizeStartRef = useRef<{ pointerX: number; width: number } | null>(null);
   const closeTimerRef = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    previewEditor.isEditable = canEditPreviewPage;
+  }, [canEditPreviewPage, previewEditor]);
 
   const closeWithAnimation = (afterClose?: () => void) => {
     if (isClosingRef.current) return;
@@ -6124,6 +7885,7 @@ function PagePreviewDrawer({
               className="page-preview-title"
               value={previewTitle}
               onChange={(event) => {
+                if (!canEditPreviewPage) return;
                 const nextTitle = event.target.value;
                 setPreviewTitle(nextTitle);
                 onChange({ title: nextTitle.trim() || "제목 없음" });
@@ -6133,7 +7895,7 @@ function PagePreviewDrawer({
               }}
               placeholder="제목 없음"
               aria-label="미리보기 페이지 제목"
-              disabled={page.settings.lockPage}
+              disabled={!canEditPreviewPage}
             />
 
             {page.settings.showProperties && (
@@ -6145,13 +7907,23 @@ function PagePreviewDrawer({
             )}
 
             <div className="page-preview-divider" />
+            <InlineDatabaseSyncProvider
+              enabled={serverEnabled}
+              pageId={page.id}
+              collaborative={(page.permission ?? "owner") !== "owner"}
+              readOnly={!canEditPreviewPage}
+            >
             <BlockNoteView
               editor={previewEditor}
               theme={theme}
-              editable={!page.settings.lockPage}
-              onChange={() => onChange({ blocks: previewEditor.document as unknown as PartialBlock[] })}
+              editable={canEditPreviewPage}
+              onChange={() => {
+                if (!canEditPreviewPage) return;
+                onChange({ blocks: previewEditor.document as unknown as PartialBlock[] });
+              }}
               data-theming-css-variables-demo
             />
+            </InlineDatabaseSyncProvider>
           </div>
         </div>
       </aside>
