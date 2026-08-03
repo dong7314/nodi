@@ -1,4 +1,5 @@
 import { API_BASE_URL } from "./api-client";
+import { runtimeConfigString } from "./runtime-config";
 
 export const APP_NOTICE_EVENT = "nodi:notice";
 
@@ -59,11 +60,13 @@ function getAttachmentKind(file: File): AttachmentKind {
 
 function getRemoteSizeLimit(kind: AttachmentKind) {
   const imageLimit = readPositiveNumber(
-    import.meta.env.VITE_ATTACHMENT_MAX_IMAGE_MB,
+    runtimeConfigString("ATTACHMENT_MAX_IMAGE_MB")
+      ?? import.meta.env.VITE_ATTACHMENT_MAX_IMAGE_MB,
     DEFAULT_REMOTE_IMAGE_LIMIT_MB,
   );
   const fileLimit = readPositiveNumber(
-    import.meta.env.VITE_ATTACHMENT_MAX_FILE_MB,
+    runtimeConfigString("ATTACHMENT_MAX_FILE_MB")
+      ?? import.meta.env.VITE_ATTACHMENT_MAX_FILE_MB,
     DEFAULT_REMOTE_FILE_LIMIT_MB,
   );
   return (kind === "image" ? imageLimit : fileLimit) * 1024 * 1024;
@@ -105,8 +108,10 @@ async function uploadToMinio(file: File, pageId?: string | null) {
     throw new Error(`${limitLabel} 이하의 ${kind === "image" ? "이미지" : "파일"}만 첨부할 수 있습니다.`);
   }
 
-  const presignEndpoint = import.meta.env.VITE_ATTACHMENT_PRESIGN_ENDPOINT?.trim()
-    || `${API_BASE_URL}/attachments/presign`;
+  const presignEndpoint = (
+    runtimeConfigString("ATTACHMENT_PRESIGN_ENDPOINT")
+      ?? import.meta.env.VITE_ATTACHMENT_PRESIGN_ENDPOINT?.trim()
+  ) || `${API_BASE_URL}/attachments/presign`;
 
   const contentType = file.type || "application/octet-stream";
   const presignResponse = await fetch(presignEndpoint, {
@@ -181,7 +186,10 @@ async function uploadToLocalStorage(file: File) {
 }
 
 export async function uploadNodiAttachment(file: File, context: NodiAttachmentContext = {}) {
-  const configuredStorageMode = import.meta.env.VITE_ATTACHMENT_STORAGE_MODE?.trim().toLowerCase();
+  const configuredStorageMode = (
+    runtimeConfigString("ATTACHMENT_STORAGE_MODE")
+      ?? import.meta.env.VITE_ATTACHMENT_STORAGE_MODE?.trim()
+  )?.toLowerCase();
   const storageMode = configuredStorageMode || (context.authenticated === true ? "minio" : "local");
 
   try {
