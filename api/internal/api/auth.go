@@ -35,30 +35,43 @@ func userFromContext(ctx context.Context) (authUser, bool) {
 	return user, ok
 }
 
-func (s *Server) requireAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := bearerToken(r)
-		if token == "" {
-			if cookie, err := r.Cookie("nodi_session"); err == nil {
-				token = cookie.Value
-			}
+func sessionToken(r *http.Request) string {
+	token := bearerToken(r)
+	if token == "" {
+		if cookie, err := r.Cookie("nodi_session"); err == nil {
+			token = cookie.Value
 		}
-		if token == "" {
-			writeError(w, http.StatusUnauthorized, "AUTH_REQUIRED", "로그인이 필요합니다.", nil)
-			return
-		}
-		hash := sha256.Sum256([]byte(token))
-		var user authUser
-		err := s.pool.QueryRow(r.Context(), `
+	}
+	return token
+}
+
+func (s *Server) authenticatedUser(r *http.Request) (authUser, bool) {
+	token := sessionToken(r)
+	if token == "" {
+		return authUser{}, false
+	}
+	hash := sha256.Sum256([]byte(token))
+	var user authUser
+	err := s.pool.QueryRow(r.Context(), `
 			SELECT u.id, u.name, u.email, u.avatar_color, u.avatar_icon, u.role, u.status,
 			       u.password_hash, u.requested_at, u.decided_at
 			FROM sessions ss JOIN users u ON u.id=ss.user_id
 			WHERE ss.token_hash=$1 AND ss.expires_at>now() AND u.status='approved'
-		`, hash[:]).Scan(
-			&user.ID, &user.Name, &user.Email, &user.AvatarColor, &user.AvatarIcon,
-			&user.Role, &user.Status, &user.Password, &user.RequestedAt, &user.DecidedAt,
-		)
-		if err != nil {
+	`, hash[:]).Scan(
+		&user.ID, &user.Name, &user.Email, &user.AvatarColor, &user.AvatarIcon,
+		&user.Role, &user.Status, &user.Password, &user.RequestedAt, &user.DecidedAt,
+	)
+	return user, err == nil
+}
+
+func (s *Server) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if sessionToken(r) == "" {
+			writeError(w, http.StatusUnauthorized, "AUTH_REQUIRED", "로그인이 필요합니다.", nil)
+			return
+		}
+		user, ok := s.authenticatedUser(r)
+		if !ok {
 			writeError(w, http.StatusUnauthorized, "INVALID_SESSION", "로그인 세션이 만료되었습니다.", nil)
 			return
 		}
@@ -152,7 +165,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookie(w, token, expiresAt)
-	writeData(w, http.StatusCreated, map[string]any{"user": user, "status": status, "token": token, "expiresAt": expiresAt})
+	writeData(w, http.StatusCreated, map[string]any{"user": user, "status": status, "expiresAt": expiresAt})
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -189,7 +202,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookie(w, token, expiresAt)
-	writeData(w, http.StatusOK, map[string]any{"user": user, "token": token, "expiresAt": expiresAt})
+	writeData(w, http.StatusOK, map[string]any{"user": user, "expiresAt": expiresAt})
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {

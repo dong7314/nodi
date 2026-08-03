@@ -92,3 +92,58 @@ func TestAttachmentTokensAreHashed(t *testing.T) {
 		t.Fatal("different token matched the stored hash")
 	}
 }
+
+func TestAttachmentImageTypesRejectExecutableFormats(t *testing.T) {
+	for _, contentType := range []string{"image/png", "image/jpeg", "image/webp", "image/avif", "image/gif"} {
+		if !validAttachmentContentType("image", contentType) {
+			t.Fatalf("expected %s to be accepted", contentType)
+		}
+	}
+	for _, contentType := range []string{"image/svg+xml", "text/html", "application/octet-stream"} {
+		if validAttachmentContentType("image", contentType) {
+			t.Fatalf("expected %s to be rejected for inline images", contentType)
+		}
+	}
+}
+
+func TestHomeSettingsAlwaysRemainPrivate(t *testing.T) {
+	settings, err := privatePageSettings(json.RawMessage(`{"publicAccess":true,"wide":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err = json.Unmarshal(settings, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["publicAccess"] != false || decoded["wide"] != true {
+		t.Fatalf("unexpected private settings: %#v", decoded)
+	}
+}
+
+func TestOwnerPageSettingsDetectProtectedChanges(t *testing.T) {
+	current := json.RawMessage(`{"publicAccess":false,"lockPage":false,"status":"초안"}`)
+	if ownerPageSettingsChanged(current, json.RawMessage(`{"publicAccess":false,"lockPage":false,"status":"완료"}`)) {
+		t.Fatal("ordinary page properties should remain editable")
+	}
+	if !ownerPageSettingsChanged(current, json.RawMessage(`{"publicAccess":true,"lockPage":false,"status":"초안"}`)) {
+		t.Fatal("public access must be owner controlled")
+	}
+	if !ownerPageSettingsChanged(current, json.RawMessage(`{"publicAccess":false,"lockPage":true,"status":"초안"}`)) {
+		t.Fatal("page lock must be owner controlled")
+	}
+}
+
+func TestPageSettingsLocked(t *testing.T) {
+	if !pageSettingsLocked(json.RawMessage(`{"lockPage":true}`)) {
+		t.Fatal("expected the page to be locked")
+	}
+	if pageSettingsLocked(json.RawMessage(`{"lockPage":false}`)) || pageSettingsLocked(nil) {
+		t.Fatal("expected the page to be editable")
+	}
+}
+
+func TestNotificationExcerptUsesRuneLength(t *testing.T) {
+	if actual := notificationExcerpt(" 가나다라마 ", 3); actual != "가나다…" {
+		t.Fatalf("unexpected excerpt: %q", actual)
+	}
+}

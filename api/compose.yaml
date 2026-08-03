@@ -20,9 +20,43 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     mem_limit: 512m
     cpus: 1.5
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: nodi
+      MINIO_ROOT_PASSWORD: nodi-development-secret
+      MINIO_API_CORS_ALLOW_ORIGIN: ${MINIO_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - minio_data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    mem_limit: 512m
+    cpus: 1.0
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mc alias set local http://minio:9000 nodi nodi-development-secret &&
+        mc mb --ignore-existing local/nodi-attachments &&
+        mc anonymous set none local/nodi-attachments
+    restart: "no"
 
   api:
     build: .
@@ -31,19 +65,28 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     environment:
       DATABASE_URL: postgres://nodi:nodi@postgres:5432/nodi?sslmode=disable
-      PUBLIC_BASE_URL: http://localhost:8787
-      CORS_ORIGINS: http://localhost:5173
-      UPLOAD_DIR: /data/uploads
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8787}
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174
+      ATTACHMENT_STORAGE: minio
+      MINIO_ENDPOINT: minio:9000
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-localhost:9000}
+      MINIO_ACCESS_KEY: nodi
+      MINIO_SECRET_KEY: nodi-development-secret
+      MINIO_BUCKET: nodi-attachments
+      MINIO_USE_SSL: "false"
+      MINIO_PUBLIC_USE_SSL: "false"
       DB_MAX_CONNS: 8
       DB_MIN_CONNS: 1
       MAX_IN_FLIGHT: 128
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-600}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-240}
       AUTO_MIGRATE: "true"
     ports:
-      - "8787:8787"
-    volumes:
-      - attachment_data:/data/uploads
+      - "${API_PORT:-8787}:8787"
     read_only: true
     tmpfs:
       - /tmp
@@ -56,4 +99,4 @@ services:
 
 volumes:
   postgres_data:
-  attachment_data:
+  minio_data:

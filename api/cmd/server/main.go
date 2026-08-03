@@ -31,9 +31,14 @@ func main() {
 	}
 	defer pool.Close()
 
+	apiServer, err := api.NewServer(pool, cfg)
+	if err != nil {
+		logger.Error("api startup failed", "error", err)
+		os.Exit(1)
+	}
 	httpServer := &http.Server{
 		Addr:              cfg.Address,
-		Handler:           api.NewServer(pool, cfg),
+		Handler:           apiServer,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       2 * time.Minute,
 		WriteTimeout:      2 * time.Minute,

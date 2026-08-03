@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,19 +17,21 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/minio/minio-go/v7"
 )
 
 type attachment struct {
-	ID          uuid.UUID  `json:"id"`
-	OwnerID     uuid.UUID  `json:"ownerId"`
-	PageID      *string    `json:"pageId"`
-	FileName    string     `json:"fileName"`
-	ContentType string     `json:"contentType"`
-	Kind        string     `json:"kind"`
-	Size        int64      `json:"size"`
-	ObjectKey   string     `json:"objectKey"`
-	UploadedAt  *time.Time `json:"uploadedAt"`
-	CreatedAt   time.Time  `json:"createdAt"`
+	ID             uuid.UUID  `json:"id"`
+	OwnerID        uuid.UUID  `json:"ownerId"`
+	PageID         *string    `json:"pageId"`
+	FileName       string     `json:"fileName"`
+	ContentType    string     `json:"contentType"`
+	Kind           string     `json:"kind"`
+	Size           int64      `json:"size"`
+	ObjectKey      string     `json:"objectKey"`
+	StorageBackend string     `json:"storageBackend"`
+	UploadedAt     *time.Time `json:"uploadedAt"`
+	CreatedAt      time.Time  `json:"createdAt"`
 }
 
 func randomToken() (string, []byte, error) {
@@ -41,6 +44,22 @@ func randomToken() (string, []byte, error) {
 	return token, hash[:], nil
 }
 
+func validAttachmentContentType(kind, value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil || len(mediaType) > 200 {
+		return false
+	}
+	if kind != "image" {
+		return true
+	}
+	switch mediaType {
+	case "image/avif", "image/gif", "image/jpeg", "image/png", "image/webp":
+		return true
+	default:
+		return false
+	}
+}
+
 func tokenHash(value string) []byte {
 	hash := sha256.Sum256([]byte(value))
 	return hash[:]
@@ -48,6 +67,7 @@ func tokenHash(value string) []byte {
 
 func (s *Server) presignAttachment(w http.ResponseWriter, r *http.Request) {
 	user, _ := userFromContext(r.Context())
+	s.cleanupStaleAttachmentsIfDue(r.Context())
 	var input struct {
 		PageID       *string `json:"pageId"`
 		FileName     string  `json:"fileName"`
@@ -69,7 +89,7 @@ func (s *Server) presignAttachment(w http.ResponseWriter, r *http.Request) {
 	if input.Kind == "image" {
 		limit = s.config.MaxImageBytes
 	}
-	if (input.Kind != "image" && input.Kind != "file") || !nonEmpty(input.FileName, 255) || len(input.ContentType) > 200 || input.Size <= 0 || input.Size > limit {
+	if (input.Kind != "image" && input.Kind != "file") || !nonEmpty(input.FileName, 255) || !validAttachmentContentType(input.Kind, input.ContentType) || input.Size <= 0 || input.Size > limit {
 		writeError(w, http.StatusBadRequest, "INVALID_ATTACHMENT", "첨부파일 정보 또는 크기가 올바르지 않습니다.", nil)
 		return
 	}
@@ -97,13 +117,22 @@ func (s *Server) presignAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, err = s.pool.Exec(r.Context(), `INSERT INTO attachments
-		(id,owner_id,page_id,file_name,content_type,kind,size_bytes,object_key,upload_token_hash,asset_token_hash)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, id, user.ID, input.PageID, input.FileName, input.ContentType, input.Kind, input.Size, objectKey, uploadHash, assetHash)
+		(id,owner_id,page_id,file_name,content_type,kind,size_bytes,object_key,storage_backend,upload_token_hash,asset_token_hash)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, id, user.ID, input.PageID, input.FileName, input.ContentType, input.Kind, input.Size, objectKey, s.config.AttachmentStore, uploadHash, assetHash)
 	if err != nil {
 		handleError(w, err)
 		return
 	}
 	uploadURL := fmt.Sprintf("%s/v1/attachments/%s/content?uploadToken=%s", s.config.PublicBaseURL, id, uploadToken)
+	if s.config.AttachmentStore == "minio" {
+		presigned, presignErr := s.minioPublic.PresignedPutObject(r.Context(), s.config.MinIOBucket, objectKey, s.config.MinIOPresignTTL)
+		if presignErr != nil {
+			_, _ = s.pool.Exec(r.Context(), `DELETE FROM attachments WHERE id=$1`, id)
+			handleError(w, presignErr)
+			return
+		}
+		uploadURL = presigned.String()
+	}
 	assetURL := fmt.Sprintf("%s/v1/attachments/%s/content?assetToken=%s", s.config.PublicBaseURL, id, assetToken)
 	completeURL := fmt.Sprintf("%s/v1/attachments/%s/complete", s.config.PublicBaseURL, id)
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -125,14 +154,18 @@ func (s *Server) uploadAttachmentContent(w http.ResponseWriter, r *http.Request)
 	}
 	var value attachment
 	var expectedHash []byte
-	err = s.pool.QueryRow(r.Context(), `SELECT id,owner_id,page_id,file_name,content_type,kind,size_bytes,object_key,uploaded_at,created_at,upload_token_hash
-		FROM attachments WHERE id=$1`, id).Scan(&value.ID, &value.OwnerID, &value.PageID, &value.FileName, &value.ContentType, &value.Kind, &value.Size, &value.ObjectKey, &value.UploadedAt, &value.CreatedAt, &expectedHash)
+	err = s.pool.QueryRow(r.Context(), `SELECT id,owner_id,page_id,file_name,content_type,kind,size_bytes,object_key,storage_backend,uploaded_at,created_at,upload_token_hash
+		FROM attachments WHERE id=$1`, id).Scan(&value.ID, &value.OwnerID, &value.PageID, &value.FileName, &value.ContentType, &value.Kind, &value.Size, &value.ObjectKey, &value.StorageBackend, &value.UploadedAt, &value.CreatedAt, &expectedHash)
 	if err != nil {
 		handleError(w, err)
 		return
 	}
 	if value.UploadedAt != nil {
 		writeError(w, http.StatusConflict, "ALREADY_UPLOADED", "이미 업로드가 완료된 첨부파일입니다.", nil)
+		return
+	}
+	if value.StorageBackend != "local" {
+		writeError(w, http.StatusMethodNotAllowed, "DIRECT_UPLOAD_REQUIRED", "이 첨부파일은 발급된 MinIO 주소로 업로드해야 합니다.", nil)
 		return
 	}
 	if !equalBytes(expectedHash, tokenHash(token)) {
@@ -208,17 +241,33 @@ func (s *Server) completeAttachment(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	var objectKey string
+	var objectKey, storageBackend string
 	var uploadedAt *time.Time
 	var fileName, contentType, kind string
 	var size int64
-	err = s.pool.QueryRow(r.Context(), `SELECT object_key,uploaded_at,file_name,content_type,kind,size_bytes FROM attachments WHERE id=$1 AND owner_id=$2`, id, user.ID).Scan(&objectKey, &uploadedAt, &fileName, &contentType, &kind, &size)
+	err = s.pool.QueryRow(r.Context(), `SELECT object_key,storage_backend,uploaded_at,file_name,content_type,kind,size_bytes FROM attachments WHERE id=$1 AND owner_id=$2`, id, user.ID).Scan(&objectKey, &storageBackend, &uploadedAt, &fileName, &contentType, &kind, &size)
 	if err != nil {
 		handleError(w, err)
 		return
 	}
-	if uploadedAt == nil || input.ObjectKey != objectKey || (input.UploadID != "" && input.UploadID != id.String()) || input.FileName != fileName || input.ContentType != contentType || input.Kind != kind || input.Size != size {
+	if input.ObjectKey != objectKey || (input.UploadID != "" && input.UploadID != id.String()) || input.FileName != fileName || input.ContentType != contentType || input.Kind != kind || input.Size != size {
 		writeError(w, http.StatusConflict, "UPLOAD_NOT_COMPLETE", "업로드가 아직 완료되지 않았거나 정보가 일치하지 않습니다.", nil)
+		return
+	}
+	if storageBackend == "minio" && uploadedAt == nil {
+		info, statErr := s.minio.StatObject(r.Context(), s.config.MinIOBucket, objectKey, minio.StatObjectOptions{})
+		if statErr != nil || info.Size != size || (info.ContentType != "" && info.ContentType != contentType) {
+			writeError(w, http.StatusConflict, "UPLOAD_NOT_COMPLETE", "MinIO 업로드가 아직 완료되지 않았거나 파일 크기가 일치하지 않습니다.", nil)
+			return
+		}
+		if _, err = s.pool.Exec(r.Context(), `UPDATE attachments SET uploaded_at=now() WHERE id=$1 AND uploaded_at IS NULL`, id); err != nil {
+			handleError(w, err)
+			return
+		}
+		uploadedAt = &info.LastModified
+	}
+	if uploadedAt == nil {
+		writeError(w, http.StatusConflict, "UPLOAD_NOT_COMPLETE", "업로드가 아직 완료되지 않았습니다.", nil)
 		return
 	}
 	// The raw asset token is only returned at presign time. The client already keeps
@@ -234,14 +283,44 @@ func (s *Server) downloadAttachmentContent(w http.ResponseWriter, r *http.Reques
 	}
 	var value attachment
 	var expectedHash []byte
-	err = s.pool.QueryRow(r.Context(), `SELECT id,owner_id,page_id,file_name,content_type,kind,size_bytes,object_key,uploaded_at,created_at,asset_token_hash
-		FROM attachments WHERE id=$1`, id).Scan(&value.ID, &value.OwnerID, &value.PageID, &value.FileName, &value.ContentType, &value.Kind, &value.Size, &value.ObjectKey, &value.UploadedAt, &value.CreatedAt, &expectedHash)
+	err = s.pool.QueryRow(r.Context(), `SELECT id,owner_id,page_id,file_name,content_type,kind,size_bytes,object_key,storage_backend,uploaded_at,created_at,asset_token_hash
+		FROM attachments WHERE id=$1`, id).Scan(&value.ID, &value.OwnerID, &value.PageID, &value.FileName, &value.ContentType, &value.Kind, &value.Size, &value.ObjectKey, &value.StorageBackend, &value.UploadedAt, &value.CreatedAt, &expectedHash)
 	if err != nil {
 		handleError(w, err)
 		return
 	}
 	if value.UploadedAt == nil || !equalBytes(expectedHash, tokenHash(r.URL.Query().Get("assetToken"))) {
 		writeError(w, http.StatusNotFound, "ATTACHMENT_NOT_FOUND", "첨부파일을 찾을 수 없습니다.", nil)
+		return
+	}
+	if value.PageID == nil {
+		user, authenticated := s.authenticatedUser(r)
+		if !authenticated || user.ID != value.OwnerID {
+			writeError(w, http.StatusNotFound, "ATTACHMENT_NOT_FOUND", "첨부파일을 찾을 수 없습니다.", nil)
+			return
+		}
+	} else if !s.canReadPageAttachment(r, *value.PageID) {
+		writeError(w, http.StatusNotFound, "ATTACHMENT_NOT_FOUND", "첨부파일을 찾을 수 없습니다.", nil)
+		return
+	}
+	disposition := "attachment"
+	if value.Kind == "image" {
+		disposition = "inline"
+	}
+	if value.StorageBackend == "minio" {
+		object, objectErr := s.minio.GetObject(r.Context(), s.config.MinIOBucket, value.ObjectKey, minio.GetObjectOptions{})
+		if objectErr != nil {
+			handleError(w, objectErr)
+			return
+		}
+		defer object.Close()
+		info, statErr := object.Stat()
+		if statErr != nil {
+			writeError(w, http.StatusNotFound, "ATTACHMENT_NOT_FOUND", "첨부파일을 찾을 수 없습니다.", nil)
+			return
+		}
+		setAttachmentHeaders(w, value, disposition)
+		http.ServeContent(w, r, value.FileName, info.LastModified, object)
 		return
 	}
 	path, err := s.attachmentPath(value.ObjectKey)
@@ -264,14 +343,30 @@ func (s *Server) downloadAttachmentContent(w http.ResponseWriter, r *http.Reques
 		handleError(w, err)
 		return
 	}
-	disposition := "attachment"
-	if value.Kind == "image" {
-		disposition = "inline"
+	setAttachmentHeaders(w, value, disposition)
+	http.ServeContent(w, r, value.FileName, stat.ModTime(), file)
+}
+
+func (s *Server) canReadPageAttachment(r *http.Request, pageID string) bool {
+	var public bool
+	if err := s.pool.QueryRow(r.Context(), `SELECT NOT archived AND settings_json @> '{"publicAccess":true}'::jsonb FROM pages WHERE id=$1`, pageID).Scan(&public); err != nil {
+		return false
 	}
+	if public {
+		return true
+	}
+	user, ok := s.authenticatedUser(r)
+	if !ok {
+		return false
+	}
+	_, err := s.authorizePage(r, user.ID, pageID, "view")
+	return err == nil
+}
+
+func setAttachmentHeaders(w http.ResponseWriter, value attachment, disposition string) {
 	w.Header().Set("Content-Type", value.ContentType)
 	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": value.FileName}))
 	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
-	http.ServeContent(w, r, value.FileName, stat.ModTime(), file)
 }
 
 func (s *Server) deleteAttachment(w http.ResponseWriter, r *http.Request) {
@@ -281,16 +376,116 @@ func (s *Server) deleteAttachment(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	var objectKey string
-	err = s.pool.QueryRow(r.Context(), `DELETE FROM attachments WHERE id=$1 AND owner_id=$2 RETURNING object_key`, id, user.ID).Scan(&objectKey)
+	var objectKey, storageBackend string
+	err = s.pool.QueryRow(r.Context(), `SELECT object_key,storage_backend FROM attachments WHERE id=$1 AND owner_id=$2`, id, user.ID).Scan(&objectKey, &storageBackend)
 	if err != nil {
 		handleError(w, err)
 		return
 	}
-	if path, pathErr := s.attachmentPath(objectKey); pathErr == nil {
-		_ = os.Remove(path)
+	if err = s.removeAttachmentObject(r.Context(), objectKey, storageBackend); err != nil {
+		handleError(w, err)
+		return
+	}
+	if _, err = s.pool.Exec(r.Context(), `DELETE FROM attachments WHERE id=$1 AND owner_id=$2`, id, user.ID); err != nil {
+		handleError(w, err)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) removeAttachmentObject(ctx context.Context, objectKey, storageBackend string) error {
+	if storageBackend == "minio" {
+		if s.minio == nil {
+			return fmt.Errorf("MinIO client is not configured")
+		}
+		return s.minio.RemoveObject(ctx, s.config.MinIOBucket, objectKey, minio.RemoveObjectOptions{})
+	}
+	path, err := s.attachmentPath(objectKey)
+	if err != nil {
+		return err
+	}
+	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) cleanupStaleAttachmentsIfDue(ctx context.Context) {
+	s.attachmentCleanupMu.Lock()
+	defer s.attachmentCleanupMu.Unlock()
+	if time.Since(s.lastAttachmentCleanup) < time.Hour {
+		return
+	}
+	if err := s.cleanupStaleAttachments(ctx, time.Now().Add(-24*time.Hour), 100); err == nil {
+		s.lastAttachmentCleanup = time.Now()
+	}
+}
+
+func (s *Server) cleanupStaleAttachments(ctx context.Context, before time.Time, limit int) error {
+	if limit <= 0 {
+		return nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id,object_key,storage_backend
+		FROM attachments
+		WHERE uploaded_at IS NULL AND created_at < $1
+		ORDER BY created_at
+		LIMIT $2`, before, limit)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type staleAttachment struct {
+		id      uuid.UUID
+		key     string
+		backend string
+	}
+	stale := make([]staleAttachment, 0, limit)
+	for rows.Next() {
+		var value staleAttachment
+		if err = rows.Scan(&value.id, &value.key, &value.backend); err != nil {
+			return err
+		}
+		stale = append(stale, value)
+	}
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	for _, value := range stale {
+		if err = s.removeAttachmentObject(ctx, value.key, value.backend); err != nil {
+			return err
+		}
+		if _, err = s.pool.Exec(ctx, `DELETE FROM attachments WHERE id=$1 AND uploaded_at IS NULL`, value.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) deletePageAttachments(ctx context.Context, pageID string) error {
+	rows, err := s.pool.Query(ctx, `SELECT object_key,storage_backend FROM attachments WHERE page_id=$1`, pageID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type storedObject struct{ key, backend string }
+	objects := make([]storedObject, 0, 4)
+	for rows.Next() {
+		var value storedObject
+		if err = rows.Scan(&value.key, &value.backend); err != nil {
+			return err
+		}
+		objects = append(objects, value)
+	}
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	for _, object := range objects {
+		if err = s.removeAttachmentObject(ctx, object.key, object.backend); err != nil {
+			return err
+		}
+	}
+	_, err = s.pool.Exec(ctx, `DELETE FROM attachments WHERE page_id=$1`, pageID)
+	return err
 }
 
 func (s *Server) attachmentPath(objectKey string) (string, error) {

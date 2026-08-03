@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -10,26 +12,70 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/nodi-app/nodi/api/internal/config"
 )
 
 type Server struct {
-	pool     *pgxpool.Pool
-	config   config.Config
-	router   http.Handler
-	limiter  *ipLimiter
-	inFlight chan struct{}
+	pool                  *pgxpool.Pool
+	config                config.Config
+	router                http.Handler
+	limiter               *ipLimiter
+	inFlight              chan struct{}
+	minio                 *minio.Client
+	minioPublic           *minio.Client
+	attachmentCleanupMu   sync.Mutex
+	lastAttachmentCleanup time.Time
+	realtime              *pageRealtimeHub
 }
 
-func NewServer(pool *pgxpool.Pool, cfg config.Config) *Server {
+func NewServer(pool *pgxpool.Pool, cfg config.Config) (*Server, error) {
 	s := &Server{
 		pool:     pool,
 		config:   cfg,
-		limiter:  newIPLimiter(60, 120),
+		limiter:  newIPLimiter(cfg.RateLimitPerMinute, cfg.RateLimitBurst),
 		inFlight: make(chan struct{}, cfg.MaxInFlight),
+		realtime: newPageRealtimeHub(),
 	}
+	if cfg.AttachmentStore == "minio" {
+		var err error
+		s.minio, err = minio.New(cfg.MinIOEndpoint, &minio.Options{
+			Creds:  credentials.NewStaticV4(cfg.MinIOAccessKey, cfg.MinIOSecretKey, ""),
+			Secure: cfg.MinIOUseSSL,
+			Region: cfg.MinIORegion,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create MinIO client: %w", err)
+		}
+		s.minioPublic, err = minio.New(cfg.MinIOPublicEndpoint, &minio.Options{
+			Creds:  credentials.NewStaticV4(cfg.MinIOAccessKey, cfg.MinIOSecretKey, ""),
+			Secure: cfg.MinIOPublicUseSSL,
+			Region: cfg.MinIORegion,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create public MinIO signer: %w", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		exists, err := s.minio.BucketExists(ctx, cfg.MinIOBucket)
+		if err != nil {
+			return nil, fmt.Errorf("check MinIO bucket: %w", err)
+		}
+		if !exists {
+			if err = s.minio.MakeBucket(ctx, cfg.MinIOBucket, minio.MakeBucketOptions{Region: cfg.MinIORegion}); err != nil {
+				return nil, fmt.Errorf("create MinIO bucket: %w", err)
+			}
+		}
+	}
+	cleanupContext, cancelCleanup := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelCleanup()
+	if err := s.cleanupStaleAttachments(cleanupContext, time.Now().Add(-24*time.Hour), 1000); err != nil {
+		return nil, fmt.Errorf("clean stale attachments: %w", err)
+	}
+	s.lastAttachmentCleanup = time.Now()
 	s.router = s.routes()
-	return s
+	return s, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -71,9 +117,14 @@ func (s *Server) routes() http.Handler {
 
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireAuth)
+		r.Get("/v1/home", s.getHomePage)
+		r.Put("/v1/home", s.updateHomePage)
+		r.Get("/v1/preferences", s.getPreferences)
+		r.Put("/v1/preferences", s.updatePreferences)
 		r.Get("/v1/pages", s.listPages)
 		r.Post("/v1/pages", s.createPage)
 		r.Get("/v1/pages/{pageID}", s.getPage)
+		r.Get("/v1/pages/{pageID}/realtime", s.pageRealtime)
 		r.Patch("/v1/pages/{pageID}", s.updatePage)
 		r.Delete("/v1/pages/{pageID}", s.deletePage)
 		r.Put("/v1/pages/{pageID}/blocks", s.updatePageBlocks)
@@ -86,12 +137,20 @@ func (s *Server) routes() http.Handler {
 		r.Delete("/v1/folders/{folderID}", s.deleteFolder)
 
 		r.Get("/v1/pages/{pageID}/comments", s.listComments)
+		r.Get("/v1/comments", s.listAllComments)
 		r.Post("/v1/pages/{pageID}/comments", s.createCommentThread)
 		r.Post("/v1/comments/{threadID}/messages", s.addCommentMessage)
 		r.Patch("/v1/comments/{threadID}", s.resolveCommentThread)
 		r.Delete("/v1/comments/{threadID}", s.deleteCommentThread)
+		r.Delete("/v1/comments/{threadID}/messages/{messageID}", s.deleteCommentMessage)
+
+		r.Get("/v1/notifications", s.listNotifications)
+		r.Post("/v1/notifications/read-all", s.readAllNotifications)
+		r.Patch("/v1/notifications/{notificationID}", s.updateNotification)
+		r.Delete("/v1/notifications/{notificationID}", s.deleteNotification)
 
 		r.Get("/v1/pages/{pageID}/shares", s.listPageShares)
+		r.Get("/v1/shares", s.listAllPageShares)
 		r.Put("/v1/pages/{pageID}/shares/{userID}", s.setPageShare)
 		r.Delete("/v1/pages/{pageID}/shares/{userID}", s.deletePageShare)
 
@@ -118,6 +177,13 @@ func (s *Server) routes() http.Handler {
 
 func (s *Server) limitConcurrency(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A WebSocket request remains open while the page is being edited. It
+		// must not occupy one of the short-lived HTTP request slots, otherwise a
+		// few editors could make every regular API request return SERVER_BUSY.
+		if strings.HasSuffix(r.URL.Path, "/realtime") {
+			next.ServeHTTP(w, r)
+			return
+		}
 		select {
 		case s.inFlight <- struct{}{}:
 			defer func() { <-s.inFlight }()

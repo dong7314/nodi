@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,42 @@ type page struct {
 }
 
 type rowScanner interface{ Scan(...any) error }
+
+const (
+	pagePublicAccessSetting = "publicAccess"
+	pageLockSetting         = "lockPage"
+)
+
+func decodePageSettings(value json.RawMessage) map[string]any {
+	settings := map[string]any{}
+	_ = json.Unmarshal(value, &settings)
+	return settings
+}
+
+func pageSettingsLocked(value json.RawMessage) bool {
+	locked, _ := decodePageSettings(value)[pageLockSetting].(bool)
+	return locked
+}
+
+func ownerPageSettingsChanged(current, next json.RawMessage) bool {
+	currentSettings := decodePageSettings(current)
+	nextSettings := decodePageSettings(next)
+	for _, key := range []string{pagePublicAccessSetting, pageLockSetting} {
+		if !reflect.DeepEqual(currentSettings[key], nextSettings[key]) {
+			return true
+		}
+	}
+	return false
+}
+
+func jsonValuesEqual(current, next json.RawMessage) bool {
+	var currentValue any
+	var nextValue any
+	if json.Unmarshal(current, &currentValue) != nil || json.Unmarshal(next, &nextValue) != nil {
+		return false
+	}
+	return reflect.DeepEqual(currentValue, nextValue)
+}
 
 func scanPage(scanner rowScanner) (page, error) {
 	var value page
@@ -70,6 +107,7 @@ func scanPageSummary(scanner rowScanner) (page, error) {
 func (s *Server) listPages(w http.ResponseWriter, r *http.Request) {
 	user, _ := userFromContext(r.Context())
 	includeArchived := r.URL.Query().Get("includeArchived") == "true"
+	includeBlocks := r.URL.Query().Get("includeBlocks") == "true"
 	favoriteOnly := r.URL.Query().Get("favorite") == "true"
 	limit := boundedInt(r.URL.Query().Get("limit"), 200, 1, 500)
 	cursorOrder, cursorID, err := decodePageCursor(r.URL.Query().Get("cursor"))
@@ -77,8 +115,12 @@ func (s *Server) listPages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "INVALID_CURSOR", "페이지 커서가 올바르지 않습니다.", nil)
 		return
 	}
-	rows, err := s.pool.Query(r.Context(), pageListSelect+`
-		WHERE (p.owner_id=$1 OR ps.user_id=$1) AND ($2 OR NOT p.archived) AND (NOT $3 OR pf.favorited_at IS NOT NULL)
+	selectSQL := pageListSelect
+	if includeBlocks {
+		selectSQL = pageSelect
+	}
+	rows, err := s.pool.Query(r.Context(), selectSQL+`
+		WHERE (p.owner_id=$1 OR ps.user_id=$1) AND (NOT p.archived OR (p.owner_id=$1 AND $2)) AND (NOT $3 OR pf.favorited_at IS NOT NULL)
 		  AND ($4::bigint IS NULL OR (p.order_index,p.id)>($4,$5::text))
 		ORDER BY p.order_index,p.id LIMIT $6
 	`, user.ID, includeArchived, favoriteOnly, cursorOrder, cursorID, limit+1)
@@ -90,7 +132,12 @@ func (s *Server) listPages(w http.ResponseWriter, r *http.Request) {
 	result := make([]page, 0, limit)
 	var nextCursor string
 	for rows.Next() {
-		value, err := scanPageSummary(rows)
+		var value page
+		if includeBlocks {
+			value, err = scanPage(rows)
+		} else {
+			value, err = scanPageSummary(rows)
+		}
 		if err != nil {
 			handleError(w, err)
 			return
@@ -137,6 +184,10 @@ func (s *Server) createPage(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.ID == "" {
 		input.ID = "page-" + uuid.NewString()
+	}
+	if input.ID == homePageResourceID {
+		writeError(w, http.StatusConflict, "RESERVED_PAGE_ID", "개인 홈은 전용 홈 API로 저장해야 합니다.", nil)
+		return
 	}
 	if !validResourceID(input.ID) {
 		writeError(w, 400, "INVALID_ID", "페이지 ID가 올바르지 않습니다.", nil)
@@ -190,7 +241,7 @@ func (s *Server) getPage(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	value, err := scanPage(s.pool.QueryRow(r.Context(), pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR ps.user_id=$1)`, user.ID, pageID))
+	value, err := scanPage(s.pool.QueryRow(r.Context(), pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived))`, user.ID, pageID))
 	if err != nil {
 		handleError(w, err)
 		return
@@ -258,9 +309,17 @@ func (s *Server) updatePage(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "VALIDATION_ERROR", "페이지 설정은 JSON 객체여야 합니다.", nil)
 			return
 		}
+		if current.Permission != "owner" && ownerPageSettingsChanged(current.Settings, input.Settings) {
+			writeError(w, http.StatusForbidden, "PAGE_OWNER_SETTINGS_REQUIRED", "공개 여부와 페이지 잠금은 소유자만 변경할 수 있습니다.", nil)
+			return
+		}
 		settings = input.Settings
 	}
 	if input.Blocks != nil {
+		if pageSettingsLocked(current.Settings) && !jsonValuesEqual(current.Blocks, input.Blocks) {
+			writeError(w, http.StatusLocked, "PAGE_LOCKED", "잠긴 페이지의 블록은 변경할 수 없습니다.", nil)
+			return
+		}
 		if !validJSONArray(input.Blocks) {
 			writeError(w, 400, "VALIDATION_ERROR", "블록은 JSON 배열이어야 합니다.", nil)
 			return
@@ -270,7 +329,15 @@ func (s *Server) updatePage(w http.ResponseWriter, r *http.Request) {
 	if input.Archived != nil {
 		archived = *input.Archived
 	}
-	err = s.pool.QueryRow(r.Context(), `UPDATE pages SET parent_id=$1,folder_id=$2,order_index=$3,title=$4,settings_json=$5,blocks_json=$6,archived=$7,revision=revision+1,updated_at=now() WHERE id=$8 AND revision=$9 RETURNING revision,updated_at`, parentID, folderID, order, title, settings, blocks, archived, pageID, current.Revision).Scan(&current.Revision, &current.UpdatedAt)
+	if input.Revision == nil {
+		// Collaborative editors intentionally omit a revision. Their updates use
+		// last-write-wins semantics and the resulting snapshot is broadcast to
+		// every connected participant. Private pages continue to use optimistic
+		// revision checks below.
+		err = s.pool.QueryRow(r.Context(), `UPDATE pages SET parent_id=$1,folder_id=$2,order_index=$3,title=$4,settings_json=$5,blocks_json=$6,archived=$7,revision=revision+1,updated_at=now() WHERE id=$8 RETURNING revision,updated_at`, parentID, folderID, order, title, settings, blocks, archived, pageID).Scan(&current.Revision, &current.UpdatedAt)
+	} else {
+		err = s.pool.QueryRow(r.Context(), `UPDATE pages SET parent_id=$1,folder_id=$2,order_index=$3,title=$4,settings_json=$5,blocks_json=$6,archived=$7,revision=revision+1,updated_at=now() WHERE id=$8 AND revision=$9 RETURNING revision,updated_at`, parentID, folderID, order, title, settings, blocks, archived, pageID, current.Revision).Scan(&current.Revision, &current.UpdatedAt)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		s.writePageRevisionConflict(w, r, pageID)
 		return
@@ -280,6 +347,7 @@ func (s *Server) updatePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	current.ParentID, current.FolderID, current.Order, current.Title, current.Settings, current.Blocks, current.Archived = parentID, folderID, order, title, settings, blocks, archived
+	s.realtime.broadcast(pageID, pageRealtimeEvent{Type: "page.updated", Page: &current, ActorID: user.ID.String()})
 	writeData(w, 200, current)
 }
 
@@ -307,11 +375,19 @@ func (s *Server) updatePageBlocks(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
+	if pageSettingsLocked(current.Settings) {
+		writeError(w, http.StatusLocked, "PAGE_LOCKED", "잠긴 페이지의 블록은 변경할 수 없습니다.", nil)
+		return
+	}
 	if input.Revision != nil && *input.Revision != current.Revision {
 		writeError(w, 409, "REVISION_CONFLICT", "페이지가 다른 위치에서 변경되었습니다.", map[string]any{"currentRevision": current.Revision})
 		return
 	}
-	err = s.pool.QueryRow(r.Context(), `UPDATE pages SET blocks_json=$1,revision=revision+1,updated_at=now() WHERE id=$2 AND revision=$3 RETURNING revision,updated_at`, input.Blocks, pageID, current.Revision).Scan(&current.Revision, &current.UpdatedAt)
+	if input.Revision == nil {
+		err = s.pool.QueryRow(r.Context(), `UPDATE pages SET blocks_json=$1,revision=revision+1,updated_at=now() WHERE id=$2 RETURNING revision,updated_at`, input.Blocks, pageID).Scan(&current.Revision, &current.UpdatedAt)
+	} else {
+		err = s.pool.QueryRow(r.Context(), `UPDATE pages SET blocks_json=$1,revision=revision+1,updated_at=now() WHERE id=$2 AND revision=$3 RETURNING revision,updated_at`, input.Blocks, pageID, current.Revision).Scan(&current.Revision, &current.UpdatedAt)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		s.writePageRevisionConflict(w, r, pageID)
 		return
@@ -321,6 +397,7 @@ func (s *Server) updatePageBlocks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	current.Blocks = input.Blocks
+	s.realtime.broadcast(pageID, pageRealtimeEvent{Type: "page.updated", Page: &current, ActorID: user.ID.String()})
 	writeData(w, 200, current)
 }
 
@@ -338,6 +415,10 @@ func (s *Server) setPageFavorite(w http.ResponseWriter, r *http.Request) {
 	pageID, err := routeResourceID(r, "pageID")
 	if err != nil {
 		handleError(w, err)
+		return
+	}
+	if pageID == homePageResourceID {
+		writeError(w, http.StatusForbidden, "HOME_PAGE_PRIVATE", "개인 홈은 즐겨찾기에 추가할 수 없습니다.", nil)
 		return
 	}
 	if _, err = s.authorizePage(r, user.ID, pageID, "view"); err != nil {
@@ -379,14 +460,24 @@ func (s *Server) deletePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Query().Get("hard") == "true" {
+		if err = s.deletePageAttachments(r.Context(), current.ID); err != nil {
+			handleError(w, err)
+			return
+		}
 		_, err = s.pool.Exec(r.Context(), `DELETE FROM pages WHERE id=$1`, current.ID)
 	} else {
-		_, err = s.pool.Exec(r.Context(), `UPDATE pages SET archived=true,revision=revision+1,updated_at=now() WHERE id=$1`, current.ID)
+		err = s.pool.QueryRow(r.Context(), `UPDATE pages SET archived=true,revision=revision+1,updated_at=now() WHERE id=$1 RETURNING revision,updated_at`, current.ID).Scan(&current.Revision, &current.UpdatedAt)
+		current.Archived = true
 	}
 	if err != nil {
 		handleError(w, err)
 		return
 	}
+	eventType := "page.archived"
+	if r.URL.Query().Get("hard") == "true" {
+		eventType = "page.deleted"
+	}
+	s.realtime.broadcast(pageID, pageRealtimeEvent{Type: eventType, Page: &current, ActorID: user.ID.String()})
 	w.WriteHeader(204)
 }
 
@@ -399,8 +490,8 @@ func (s *Server) getPublicPage(w http.ResponseWriter, r *http.Request) {
 	var value page
 	err = s.pool.QueryRow(r.Context(), `
 	SELECT id,owner_id,parent_id,folder_id,order_index,title,settings_json,blocks_json,archived,revision,created_at,updated_at,'view',NULL
-	FROM pages WHERE id=$1 AND NOT archived AND settings_json->>'publicAccess'='true'
-`, pageID).Scan(&value.ID, &value.OwnerID, &value.ParentID, &value.FolderID, &value.Order, &value.Title, &value.Settings, &value.Blocks, &value.Archived, &value.Revision, &value.CreatedAt, &value.UpdatedAt, &value.Permission, &value.FavoritedAt)
+	FROM pages WHERE id=$1 AND id<>$2 AND NOT archived AND settings_json->>'publicAccess'='true'
+`, pageID, homePageResourceID).Scan(&value.ID, &value.OwnerID, &value.ParentID, &value.FolderID, &value.Order, &value.Title, &value.Settings, &value.Blocks, &value.Archived, &value.Revision, &value.CreatedAt, &value.UpdatedAt, &value.Permission, &value.FavoritedAt)
 	if err != nil {
 		handleError(w, err)
 		return
@@ -417,7 +508,10 @@ func (s *Server) searchPages(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := boundedInt(r.URL.Query().Get("limit"), 30, 1, 100)
 	rows, err := s.pool.Query(r.Context(), pageListSelect+`
-	WHERE (p.owner_id=$1 OR ps.user_id=$1) AND NOT p.archived AND p.search_document @@ websearch_to_tsquery('simple',$2)
+	WHERE (p.owner_id=$1 OR ps.user_id=$1) AND NOT p.archived
+	  AND (p.search_document @@ websearch_to_tsquery('simple',$2)
+	       OR p.title ILIKE '%'||$2||'%'
+	       OR p.blocks_json::text ILIKE '%'||$2||'%')
 	ORDER BY ts_rank_cd(p.search_document,websearch_to_tsquery('simple',$2)) DESC,p.updated_at DESC LIMIT $3
 `, user.ID, query, limit)
 	if err != nil {
@@ -438,7 +532,7 @@ func (s *Server) searchPages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pageForAccess(r *http.Request, userID uuid.UUID, pageID, required string) (page, error) {
-	value, err := scanPage(s.pool.QueryRow(r.Context(), pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR ps.user_id=$1)`, userID, pageID))
+	value, err := scanPage(s.pool.QueryRow(r.Context(), pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived))`, userID, pageID))
 	if err != nil {
 		return page{}, err
 	}
@@ -465,7 +559,7 @@ func (s *Server) authorizePage(r *http.Request, userID uuid.UUID, pageID, requir
 		SELECT p.owner_id,CASE WHEN p.owner_id=$1 THEN 'owner' ELSE ps.permission END,p.updated_at
 		FROM pages p
 		LEFT JOIN page_shares ps ON ps.page_id=p.id AND ps.user_id=$1
-		WHERE p.id=$2 AND (p.owner_id=$1 OR ps.user_id=$1)
+		WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived))
 	`, userID, pageID).Scan(&access.OwnerID, &access.Permission, &access.UpdatedAt)
 	if err != nil {
 		return pageAccess{}, err
