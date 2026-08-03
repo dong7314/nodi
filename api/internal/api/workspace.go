@@ -125,7 +125,7 @@ func (s *Server) presignAttachment(w http.ResponseWriter, r *http.Request) {
 	}
 	uploadURL := fmt.Sprintf("%s/v1/attachments/%s/content?uploadToken=%s", s.config.PublicBaseURL, id, uploadToken)
 	if s.config.AttachmentStore == "minio" {
-		presigned, presignErr := s.minioPublic.PresignedPutObject(r.Context(), s.config.MinIOBucket, objectKey, s.config.MinIOPresignTTL)
+		presigned, presignErr := s.minioPublic.PresignedPutObject(r.Context(), s.config.MinIOBucket, objectKey, minioPresignTTL)
 		if presignErr != nil {
 			_, _ = s.pool.Exec(r.Context(), `DELETE FROM attachments WHERE id=$1`, id)
 			handleError(w, presignErr)

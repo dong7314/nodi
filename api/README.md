@@ -20,7 +20,7 @@ cd api
 docker compose up --build
 ```
 
-상태 확인 주소는 `GET http://localhost:8787/health`, MinIO 콘솔은 `http://localhost:9001`입니다. 개발 중 Go 서버를 직접 실행하려면 PostgreSQL과 MinIO를 먼저 시작한 뒤 환경 변수를 설정합니다.
+상태 확인 주소는 `GET http://localhost:8787/health`입니다. Kubernetes probe는 프로세스 liveness용 `/live`와 PostgreSQL readiness용 `/ready`를 구분해서 사용할 수 있습니다. MinIO 콘솔은 `http://localhost:9001`입니다. 개발 중 Go 서버를 직접 실행하려면 PostgreSQL과 MinIO를 먼저 시작한 뒤 환경 변수를 설정합니다.
 
 PowerShell에서는 다음처럼 실행할 수 있습니다.
 

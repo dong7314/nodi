@@ -17,6 +17,11 @@ import (
 	"github.com/nodi-app/nodi/api/internal/config"
 )
 
+const (
+	minioDefaultRegion = "us-east-1"
+	minioPresignTTL    = 15 * time.Minute
+)
+
 type Server struct {
 	pool                  *pgxpool.Pool
 	config                config.Config
@@ -31,10 +36,17 @@ type Server struct {
 }
 
 func NewServer(pool *pgxpool.Pool, cfg config.Config) (*Server, error) {
+	trustedProxies, err := parseTrustedProxyCIDRs(cfg.TrustedProxyCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	limiter := newIPLimiter(cfg.RateLimitPerMinute, cfg.RateLimitBurst)
+	limiter.enabled = cfg.RateLimitEnabled
+	limiter.trustedProxies = trustedProxies
 	s := &Server{
 		pool:     pool,
 		config:   cfg,
-		limiter:  newIPLimiter(cfg.RateLimitPerMinute, cfg.RateLimitBurst),
+		limiter:  limiter,
 		inFlight: make(chan struct{}, cfg.MaxInFlight),
 		realtime: newPageRealtimeHub(),
 	}
@@ -43,7 +55,7 @@ func NewServer(pool *pgxpool.Pool, cfg config.Config) (*Server, error) {
 		s.minio, err = minio.New(cfg.MinIOEndpoint, &minio.Options{
 			Creds:  credentials.NewStaticV4(cfg.MinIOAccessKey, cfg.MinIOSecretKey, ""),
 			Secure: cfg.MinIOUseSSL,
-			Region: cfg.MinIORegion,
+			Region: minioDefaultRegion,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("create MinIO client: %w", err)
@@ -51,7 +63,7 @@ func NewServer(pool *pgxpool.Pool, cfg config.Config) (*Server, error) {
 		s.minioPublic, err = minio.New(cfg.MinIOPublicEndpoint, &minio.Options{
 			Creds:  credentials.NewStaticV4(cfg.MinIOAccessKey, cfg.MinIOSecretKey, ""),
 			Secure: cfg.MinIOPublicUseSSL,
-			Region: cfg.MinIORegion,
+			Region: minioDefaultRegion,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("create public MinIO signer: %w", err)
@@ -63,7 +75,7 @@ func NewServer(pool *pgxpool.Pool, cfg config.Config) (*Server, error) {
 			return nil, fmt.Errorf("check MinIO bucket: %w", err)
 		}
 		if !exists {
-			if err = s.minio.MakeBucket(ctx, cfg.MinIOBucket, minio.MakeBucketOptions{Region: cfg.MinIORegion}); err != nil {
+			if err = s.minio.MakeBucket(ctx, cfg.MinIOBucket, minio.MakeBucketOptions{Region: minioDefaultRegion}); err != nil {
 				return nil, fmt.Errorf("create MinIO bucket: %w", err)
 			}
 		}
@@ -92,7 +104,9 @@ func (s *Server) routes() http.Handler {
 	r.Use(s.limiter.middleware)
 	r.Use(s.limitConcurrency)
 
-	r.Get("/health", s.health)
+	r.Get("/live", s.live)
+	r.Get("/ready", s.ready)
+	r.Get("/health", s.ready)
 	r.Get("/v1/public/pages/{pageID}", s.getPublicPage)
 	r.Put("/v1/attachments/{attachmentID}/content", s.uploadAttachmentContent)
 	r.Get("/v1/attachments/{attachmentID}/content", s.downloadAttachmentContent)
@@ -195,7 +209,13 @@ func (s *Server) limitConcurrency(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+func (s *Server) live(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok", "service": "nodi-api", "time": time.Now().UTC(),
+	})
+}
+
+func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, 2*time.Second)
 	defer cancel()
 	if err := s.pool.Ping(ctx); err != nil {
@@ -248,20 +268,26 @@ type ipBucket struct {
 }
 
 type ipLimiter struct {
-	mu          sync.Mutex
-	clients     map[string]*ipBucket
-	perMinute   int
-	burst       int
-	lastCleanup time.Time
+	mu             sync.Mutex
+	clients        map[string]*ipBucket
+	perMinute      int
+	burst          int
+	lastCleanup    time.Time
+	enabled        bool
+	trustedProxies []*net.IPNet
 }
 
 func newIPLimiter(perMinute, burst int) *ipLimiter {
-	return &ipLimiter{clients: make(map[string]*ipBucket), perMinute: perMinute, burst: burst, lastCleanup: time.Now()}
+	return &ipLimiter{clients: make(map[string]*ipBucket), perMinute: perMinute, burst: burst, lastCleanup: time.Now(), enabled: true}
 }
 
 func (l *ipLimiter) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !l.allow(clientIP(r), time.Now()) {
+		if !l.enabled {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !l.allow(clientIP(r, l.trustedProxies), time.Now()) {
 			w.Header().Set("Retry-After", "60")
 			writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.", nil)
 			return
@@ -298,10 +324,43 @@ func (l *ipLimiter) allow(ip string, now time.Time) bool {
 	return true
 }
 
-func clientIP(r *http.Request) string {
+func parseTrustedProxyCIDRs(values []string) ([]*net.IPNet, error) {
+	result := make([]*net.IPNet, 0, len(values))
+	for _, value := range values {
+		_, network, err := net.ParseCIDR(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid TRUSTED_PROXY_CIDRS entry %q: %w", value, err)
+		}
+		result = append(result, network)
+	}
+	return result, nil
+}
+
+func ipInNetworks(ip net.IP, networks []*net.IPNet) bool {
+	for _, network := range networks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func clientIP(r *http.Request, trustedProxies []*net.IPNet) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	remoteIP := net.ParseIP(host)
+	if remoteIP == nil || !ipInNetworks(remoteIP, trustedProxies) {
 		return host
 	}
-	return strings.TrimSpace(r.RemoteAddr)
+
+	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for index := len(forwarded) - 1; index >= 0; index-- {
+		candidate := net.ParseIP(strings.TrimSpace(forwarded[index]))
+		if candidate != nil && !ipInNetworks(candidate, trustedProxies) {
+			return candidate.String()
+		}
+	}
+	return remoteIP.String()
 }

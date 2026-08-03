@@ -2,12 +2,39 @@ package api
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/nodi-app/nodi/api/internal/config"
 )
+
+func TestClientIPUsesForwardedChainOnlyFromTrustedProxy(t *testing.T) {
+	trusted, err := parseTrustedProxyCIDRs([]string{"10.42.0.0/16"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest("GET", "http://nodi.local/v1/pages", nil)
+	request.RemoteAddr = "10.42.1.15:43120"
+	request.Header.Set("X-Forwarded-For", "203.0.113.25, 10.42.0.8")
+	if actual := clientIP(request, trusted); actual != "203.0.113.25" {
+		t.Fatalf("unexpected forwarded client IP: %s", actual)
+	}
+
+	request.RemoteAddr = "198.51.100.10:43120"
+	request.Header.Set("X-Forwarded-For", "203.0.113.99")
+	if actual := clientIP(request, trusted); actual != "198.51.100.10" {
+		t.Fatalf("untrusted peer spoofed the client IP: %s", actual)
+	}
+}
+
+func TestTrustedProxyCIDRsRejectInvalidValues(t *testing.T) {
+	if _, err := parseTrustedProxyCIDRs([]string{"not-a-cidr"}); err == nil {
+		t.Fatal("expected an invalid trusted proxy CIDR to fail")
+	}
+}
 
 func TestValidResourceID(t *testing.T) {
 	for _, value := range []string{"page-123", "folder-한글", "quick-note"} {
