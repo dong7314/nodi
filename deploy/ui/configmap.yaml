@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nodi-ui-config
+  namespace: nodi
+data:
+  runtime-config.js: |
+    window.__NODI_CONFIG__ = Object.freeze({
+      API_BASE_URL: "/v1",
+      ATTACHMENT_STORAGE_MODE: "minio"
+    });
