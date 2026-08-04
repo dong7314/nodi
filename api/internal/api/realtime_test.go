@@ -100,3 +100,26 @@ func TestMergeRealtimeBlocksDeletesOnlyExplicitBlocks(t *testing.T) {
 		t.Fatalf("unexpected deletion result: %v", ids)
 	}
 }
+
+func TestMergeRealtimeBlocksNormalizesLegacyBlocksWithoutIDs(t *testing.T) {
+	legacy := json.RawMessage(`[
+		{"type":"paragraph","content":""}
+	]`)
+	incoming := json.RawMessage(`[
+		{"id":"generated-id","type":"paragraph","content":[{"type":"text","text":"test","styles":{}}]}
+	]`)
+
+	merged, err := mergeRealtimeBlocks(legacy, incoming, []string{"generated-id"}, nil, false)
+	if err != nil {
+		t.Fatalf("normalize legacy blocks: %v", err)
+	}
+	blocks := realtimeBlocksByID(t, merged)
+	block := blocks["generated-id"]
+	if block == nil {
+		t.Fatalf("normalized block ID is missing: %s", merged)
+	}
+	content, ok := block["content"].([]any)
+	if !ok || len(content) != 1 || content[0].(map[string]any)["text"] != "test" {
+		t.Fatalf("normalized content was not preserved: %s", merged)
+	}
+}

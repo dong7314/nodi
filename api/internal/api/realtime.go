@@ -199,13 +199,42 @@ func decodeRealtimeBlocks(value json.RawMessage) ([]json.RawMessage, []string, e
 	return blocks, ids, nil
 }
 
+func realtimeBlocksMissingIDs(value json.RawMessage) bool {
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(value, &blocks); err != nil || blocks == nil {
+		return false
+	}
+	for _, block := range blocks {
+		var envelope realtimeBlockEnvelope
+		if err := json.Unmarshal(block, &envelope); err != nil {
+			return false
+		}
+		if strings.TrimSpace(envelope.ID) == "" {
+			return true
+		}
+	}
+	return false
+}
+
 // mergeRealtimeBlocks applies only the blocks changed by the sender to the
 // latest canonical document. That keeps concurrent edits in other blocks and
 // avoids the previous whole-document last-write-wins data loss.
 func mergeRealtimeBlocks(current, incoming json.RawMessage, changedIDs, deletedIDs []string, structural bool) (json.RawMessage, error) {
 	currentBlocks, currentOrder, err := decodeRealtimeBlocks(current)
 	if err != nil {
-		return nil, err
+		if !realtimeBlocksMissingIDs(current) {
+			return nil, err
+		}
+		// Pages created before realtime collaboration can contain valid BlockNote
+		// blocks without stable IDs. The browser has already normalized the full
+		// document by the time it sends its first patch, so accept that document
+		// once as the canonical ID-bearing baseline. Subsequent edits use the
+		// regular block-level merge path below.
+		incomingBlocks, _, incomingErr := decodeRealtimeBlocks(incoming)
+		if incomingErr != nil {
+			return nil, incomingErr
+		}
+		return json.Marshal(incomingBlocks)
 	}
 	incomingBlocks, incomingOrder, err := decodeRealtimeBlocks(incoming)
 	if err != nil {
