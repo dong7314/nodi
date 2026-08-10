@@ -496,7 +496,63 @@ func (s *Server) getPublicPage(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	writeData(w, 200, value)
+
+	databases := make([]inlineDatabase, 0)
+	rows, err := s.pool.Query(r.Context(), `
+		SELECT id,owner_id,page_id,state_json,revision,created_at,updated_at
+		FROM inline_databases WHERE page_id=$1 ORDER BY created_at
+	`, pageID)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	for rows.Next() {
+		var database inlineDatabase
+		if err = rows.Scan(&database.ID, &database.OwnerID, &database.PageID, &database.State, &database.Revision, &database.CreatedAt, &database.UpdatedAt); err != nil {
+			rows.Close()
+			handleError(w, err)
+			return
+		}
+		databases = append(databases, database)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		handleError(w, err)
+		return
+	}
+	rows.Close()
+
+	type publicChildPage struct {
+		ID    string `json:"id"`
+		Title string `json:"title"`
+	}
+	childPages := make([]publicChildPage, 0)
+	childRows, err := s.pool.Query(r.Context(), `
+		SELECT id,title FROM pages WHERE parent_id=$1 AND NOT archived ORDER BY order_index,created_at
+	`, pageID)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer childRows.Close()
+	for childRows.Next() {
+		var child publicChildPage
+		if err = childRows.Scan(&child.ID, &child.Title); err != nil {
+			handleError(w, err)
+			return
+		}
+		childPages = append(childPages, child)
+	}
+	if err = childRows.Err(); err != nil {
+		handleError(w, err)
+		return
+	}
+
+	writeData(w, 200, map[string]any{
+		"page":       value,
+		"databases":  databases,
+		"childPages": childPages,
+	})
 }
 
 func (s *Server) searchPages(w http.ResponseWriter, r *http.Request) {
