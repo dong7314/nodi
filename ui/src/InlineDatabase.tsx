@@ -9,6 +9,7 @@ import { NodiApiError } from "./api-client";
 import { workspaceApi, type ServerInlineDatabase } from "./server-api";
 
 export const INLINE_DATABASE_REALTIME_EVENT = "nodi:inline-database-realtime";
+export const DATABASE_COLUMN_RESIZE_START_EVENT = "nodi:database-column-resize-start";
 
 type PropertyType = "text" | "select" | "multi_select" | "status" | "date" | "number" | "checkbox" | "url" | "email" | "phone";
 type ViewType = "table" | "timeline";
@@ -36,7 +37,7 @@ type DatabaseView = {
   filter?: DatabaseFilter;
   sort?: DatabaseSort;
 };
-type DatabaseState = {
+export type DatabaseState = {
   name: string;
   properties: DatabaseProperty[];
   records: DatabaseRecord[];
@@ -50,6 +51,7 @@ type InlineDatabaseSyncContextValue = {
   pageId: string | null;
   collaborative?: boolean;
   readOnly?: boolean;
+  initialStates?: Record<string, DatabaseState>;
 };
 
 const InlineDatabaseSyncContext = createContext<InlineDatabaseSyncContextValue>({ enabled: false, pageId: null, collaborative: false, readOnly: false });
@@ -59,9 +61,10 @@ export function InlineDatabaseSyncProvider({
   pageId,
   collaborative = false,
   readOnly = false,
+  initialStates,
   children,
 }: InlineDatabaseSyncContextValue & { children: ReactNode }) {
-  return <InlineDatabaseSyncContext.Provider value={{ enabled, pageId, collaborative, readOnly }}>{children}</InlineDatabaseSyncContext.Provider>;
+  return <InlineDatabaseSyncContext.Provider value={{ enabled, pageId, collaborative, readOnly, initialStates }}>{children}</InlineDatabaseSyncContext.Provider>;
 }
 
 type DatabasePopoverController = { openPopoverId: string | null; setOpenPopoverId: Dispatch<SetStateAction<string | null>> };
@@ -201,7 +204,7 @@ function dateRangeAt(value: CellValue | undefined) {
 
 function beginningOfWeek(date: Date) {
   const next = new Date(date);
-  next.setDate(next.getDate() - ((next.getDay() + 6) % 7));
+  next.setDate(next.getDate() - next.getDay());
   next.setHours(0, 0, 0, 0);
   return next;
 }
@@ -272,7 +275,7 @@ function recordsForView(records: DatabaseRecord[], properties: DatabaseProperty[
 export function InlineDatabase({ databaseId, locked: editorLocked, onNotice, onRemove }: { databaseId: string; locked: boolean; onNotice: (message: string) => void; onRemove: () => void }) {
   const serverSync = useContext(InlineDatabaseSyncContext);
   const locked = editorLocked || Boolean(serverSync.readOnly);
-  const [database, setDatabase] = useState<DatabaseState>(() => loadDatabase(databaseId));
+  const [database, setDatabase] = useState<DatabaseState>(() => serverSync.initialStates?.[databaseId] ?? loadDatabase(databaseId));
   const [pendingDeletion, setPendingDeletion] = useState<DatabaseRecord | null>(null);
   const [pendingDatabaseRemoval, setPendingDatabaseRemoval] = useState(false);
   const [timelineStart, setTimelineStart] = useState(() => beginningOfWeek(new Date()));
@@ -288,6 +291,12 @@ export function InlineDatabase({ databaseId, locked: editorLocked, onNotice, onR
   useEffect(() => {
     databaseRef.current = database;
   }, [database]);
+
+  useEffect(() => {
+    if (serverSync.enabled) return;
+    const initialState = serverSync.initialStates?.[databaseId];
+    if (initialState) setDatabase(initialState);
+  }, [databaseId, serverSync.enabled, serverSync.initialStates]);
 
   useEffect(() => {
     noticeRef.current = onNotice;
@@ -658,13 +667,11 @@ function DatabaseTable({ records, properties, disabled, hasHiddenProperties, isF
     if (disabled) return;
     event.preventDefault();
     event.stopPropagation();
+    window.dispatchEvent(new CustomEvent(DATABASE_COLUMN_RESIZE_START_EVENT));
     resizeCleanupRef.current?.();
     const measuredWidths = Object.fromEntries(Array.from(tableRef.current?.querySelectorAll<HTMLTableCellElement>("th[data-property-id]") ?? []).map((header) => [header.dataset.propertyId ?? "", Math.round(header.getBoundingClientRect().width)]));
     const startingWidths = properties.reduce<Record<string, number>>((widths, property) => ({ ...widths, [property.id]: measuredWidths[property.id] ?? columnWidths[property.id] ?? 180 }), {});
-    const propertyIndex = properties.findIndex((property) => property.id === propertyId);
-    const adjacentProperty = propertyIndex >= 0 ? properties[propertyIndex + 1] : undefined;
     const startingWidth = startingWidths[propertyId];
-    const adjacentStartingWidth = adjacentProperty ? startingWidths[adjacentProperty.id] : undefined;
     const startingX = event.clientX;
     const previousCursor = document.body.style.cursor;
     const previousUserSelect = document.body.style.userSelect;
@@ -673,15 +680,6 @@ function DatabaseTable({ records, properties, disabled, hasHiddenProperties, isF
     onColumnWidthsChange(startingWidths);
     const move = (moveEvent: PointerEvent) => {
       const rawDelta = Math.round(moveEvent.clientX - startingX);
-      if (adjacentProperty && adjacentStartingWidth !== undefined) {
-        const delta = Math.min(Math.max(rawDelta, 100 - startingWidth), adjacentStartingWidth - 100);
-        onColumnWidthsChange({
-          ...startingWidths,
-          [propertyId]: startingWidth + delta,
-          [adjacentProperty.id]: adjacentStartingWidth - delta,
-        });
-        return;
-      }
       onColumnWidthsChange({ ...startingWidths, [propertyId]: Math.max(100, startingWidth + rawDelta) });
     };
     const finish = () => {
@@ -697,7 +695,7 @@ function DatabaseTable({ records, properties, disabled, hasHiddenProperties, isF
     window.addEventListener("pointerup", finish);
     window.addEventListener("pointercancel", finish);
   };
-  return <div className="database-table-section">
+  return <div className="database-table-section" data-nodi-block-selection-ignore="true">
     <div className="database-table-frame">
       <DatabaseHorizontalScrollArea className="database-table-wrap">
         <div className="database-table-scroll-content" style={properties.length > 0 ? { width: `${tableWidth + 48}px` } : undefined}>
@@ -709,7 +707,7 @@ function DatabaseTable({ records, properties, disabled, hasHiddenProperties, isF
             </colgroup>
             <thead>
               <tr>
-                {properties.map((property) => <th key={property.id} className="database-property-column" data-property-id={property.id}><PropertyHeaderPopover property={property} disabled={disabled} onUpdate={onUpdateProperty} onRemove={onRemoveProperty} onAddOption={onAddSelectOption} onRemoveOption={onRemoveSelectOption} />{!disabled && <span className="database-column-resize-handle" role="separator" aria-orientation="vertical" aria-label={`${property.name} 열 너비 조절`} onPointerDown={(event) => startColumnResize(event, property.id)} onMouseDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()} />}</th>)}
+                {properties.map((property) => <th key={property.id} className="database-property-column" data-property-id={property.id}><PropertyHeaderPopover property={property} disabled={disabled} onUpdate={onUpdateProperty} onRemove={onRemoveProperty} onAddOption={onAddSelectOption} onRemoveOption={onRemoveSelectOption} />{!disabled && <span className="database-column-resize-handle" data-nodi-block-selection-ignore="true" role="separator" aria-orientation="vertical" aria-label={`${property.name} 열 너비 조절`} onPointerDown={(event) => startColumnResize(event, property.id)} onMouseDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()} />}</th>)}
                 {properties.length > 0 && <th className="database-table-filler-column" aria-hidden="true" />}
                 {properties.length === 0 && <th className="database-empty-table-spacer"><span className="sr-only">속성 영역</span></th>}
               </tr>
@@ -778,14 +776,17 @@ function PropertyCreatorPopover({ disabled, onAdd, label, className = "" }: { di
   const { open, onOpenChange } = useDatabasePopover(label ? "toolbar-property-add" : "table-property-add");
   const [name, setName] = useState("");
   const [type, setType] = useState<PropertyType>("text");
+  const creatingRef = useRef(false);
   const createProperty = () => {
-    if (!name.trim()) return;
+    if (!name.trim() || creatingRef.current) return;
+    creatingRef.current = true;
     onAdd(name, type);
     setName("");
     setType("text");
     onOpenChange(false);
+    window.setTimeout(() => { creatingRef.current = false; }, 0);
   };
-  return <Popover.Root open={open} onOpenChange={onOpenChange}><Popover.Trigger asChild><button className={`database-add-property-trigger ${className}`} type="button" disabled={disabled} aria-label="새 속성 추가"><Plus size={16} />{label && <span>{label}</span>}</button></Popover.Trigger><Popover.Portal><Popover.Content className="database-property-popover" side="bottom" align="start" sideOffset={7} onCloseAutoFocus={(event) => event.preventDefault()}><label>속성 이름<input autoFocus value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); createProperty(); } }} placeholder="예: 마감일" /></label><div><span>유형 선택</span><div className="property-type-grid">{propertyTypeOptions.map((option) => <button key={option.value} type="button" className={option.value === type ? "active" : ""} onClick={() => setType(option.value)}><b>{option.glyph}</b>{option.label}</button>)}</div></div><button className="create-property-button" type="button" disabled={!name.trim()} onClick={createProperty}>속성 만들기</button></Popover.Content></Popover.Portal></Popover.Root>;
+  return <Popover.Root open={open} onOpenChange={onOpenChange}><Popover.Trigger asChild><button className={`database-add-property-trigger ${className}`} type="button" disabled={disabled} aria-label="새 속성 추가"><Plus size={16} />{label && <span>{label}</span>}</button></Popover.Trigger><Popover.Portal><Popover.Content className="database-property-popover" side="bottom" align="start" sideOffset={7} onCloseAutoFocus={(event) => event.preventDefault()}><label>속성 이름<input autoFocus value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) { event.preventDefault(); event.stopPropagation(); createProperty(); } }} placeholder="예: 마감일" /></label><div><span>유형 선택</span><div className="property-type-grid">{propertyTypeOptions.map((option) => <button key={option.value} type="button" className={option.value === type ? "active" : ""} onClick={() => setType(option.value)}><b>{option.glyph}</b>{option.label}</button>)}</div></div><button className="create-property-button" type="button" disabled={!name.trim()} onClick={createProperty}>속성 만들기</button></Popover.Content></Popover.Portal></Popover.Root>;
 }
 
 function PropertyHeaderPopover({ property, disabled, onUpdate, onRemove, onAddOption, onRemoveOption }: { property: DatabaseProperty; disabled: boolean; onUpdate: (propertyId: string, patch: Partial<DatabaseProperty>) => void; onRemove: (propertyId: string) => void; onAddOption: (propertyId: string, name: string) => void; onRemoveOption: (propertyId: string, optionId: string) => void }) {

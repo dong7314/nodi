@@ -51,7 +51,7 @@ export function DatePicker({ value, onChange, disabled = false, ariaLabel, minDa
   const disabledDates = minDate ? { before: parseDate(minDate)! } : undefined;
   const calendarProps = {
     locale: ko,
-    weekStartsOn: 1 as const,
+    weekStartsOn: 0 as const,
     fixedWeeks: true,
     showOutsideDays: true,
     disabled: disabledDates,
