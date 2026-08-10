@@ -21,6 +21,7 @@
     "boring-avatars": "^2.0.4",
     "date-fns": "^4.4.0",
     "lucide-react": "latest",
+    "prosemirror-state": "^1.4.4",
     "react": "latest",
     "react-day-picker": "^10.0.1",
     "react-dom": "latest",

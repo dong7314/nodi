@@ -2243,10 +2243,60 @@ body:has(.workspace-settings-layer) .record-confirm-layer {
 .nodi-code-language-menu[data-side="top"] {
   transform-origin: bottom left;
 }
+.nodi-code-language-search {
+  height: 32px;
+  margin: 5px 5px 3px;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #dedbd5;
+  border-radius: 6px;
+  color: #918c84;
+  background: #fff;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.nodi-code-language-search:focus-within {
+  border-color: #8178dd;
+  box-shadow: 0 0 0 2px #8178dd20;
+}
+.nodi-code-language-search input {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  outline: 0;
+  appearance: none;
+  color: #4f4b45;
+  background: transparent;
+  font-family: var(--nodi-font-family);
+  font-size: 12px;
+  box-shadow: none;
+}
+.nodi-code-language-search input:focus,
+.nodi-code-language-search input:focus-visible {
+  border: 0 !important;
+  outline: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+.nodi-code-language-search input::-webkit-search-cancel-button { display: none; }
+.nodi-code-language-empty {
+  padding: 12px 10px 14px;
+  display: block;
+  color: #9a968f;
+  font-size: 12px;
+  text-align: center;
+}
 .nodi-code-language-menu .shadcn-select-viewport {
-  max-height: min(316px, var(--radix-select-content-available-height, calc(100dvh - 34px)));
+  max-height: min(274px, var(--radix-select-content-available-height, calc(100dvh - 76px)));
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+.nodi-code-language-menu [hidden] {
+  display: none !important;
 }
 .nodi-code-language-menu .shadcn-select-item {
   width: 100%;
@@ -2297,6 +2347,28 @@ body:has(.workspace-settings-layer) .record-confirm-layer {
   border: 2px solid transparent;
   border-radius: 999px;
   background: #b7b2aa;
+  background-clip: padding-box;
+}
+/* Keep wide BlockNote tables on the same slim, floating scrollbar language as databases. */
+.bn-editor [data-content-type="table"] .tableWrapper {
+  scrollbar-width: thin;
+  scrollbar-color: #817c7480 transparent;
+}
+.bn-editor [data-content-type="table"] .tableWrapper::-webkit-scrollbar {
+  height: 10px;
+}
+.bn-editor [data-content-type="table"] .tableWrapper::-webkit-scrollbar-track {
+  background: transparent;
+}
+.bn-editor [data-content-type="table"] .tableWrapper::-webkit-scrollbar-thumb {
+  min-width: 42px;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: #817c7480;
+  background-clip: padding-box;
+}
+.bn-editor [data-content-type="table"] .tableWrapper::-webkit-scrollbar-thumb:hover {
+  background: #615b54a8;
   background-clip: padding-box;
 }
 .nodi-code-copy-button {
@@ -2754,8 +2826,9 @@ html, body, #root { height: 100%; overflow: hidden; }
 .shadcn-calendar-nav-button:hover { color: #4e479f; background: #f1efff; border-color: #ded9fb; }
 .shadcn-calendar-weekdays { height: 31px; color: #8f8981; font-size: 12px; }
 .shadcn-calendar-weekday { width: 40px; height: 31px; font-weight: 650; }
-.shadcn-calendar-weekday:last-child { color: #c75b5b; }
+.shadcn-calendar-weekday:first-child { color: #c75b5b; }
 .shadcn-calendar .shadcn-calendar-day-button { width: 38px; height: 36px; border-radius: 7px; color: #514b43; font-size: 13px; font-weight: 500; }
+.shadcn-calendar .rdp-week > .shadcn-calendar-day:first-child:not(.shadcn-calendar-selected):not(.shadcn-calendar-range-start):not(.shadcn-calendar-range-middle):not(.shadcn-calendar-range-end) .shadcn-calendar-day-button { color: #c75b5b; }
 .shadcn-calendar .shadcn-calendar-day:not(.shadcn-calendar-selected):not(.shadcn-calendar-range-start):not(.shadcn-calendar-range-middle):not(.shadcn-calendar-range-end) .shadcn-calendar-day-button:hover { color: #5149ae; background: #f1efff; }
 .shadcn-calendar-selected .shadcn-calendar-day-button { color: #fff; background: #5e56bd; }
 .shadcn-calendar-range-middle .shadcn-calendar-day-button { border-radius: 0; color: #5149ae; background: #eceaff; }
@@ -2763,6 +2836,7 @@ html, body, #root { height: 100%; overflow: hidden; }
 .shadcn-calendar-range-end .shadcn-calendar-day-button { border-radius: 0 7px 7px 0; color: #fff; background: #5e56bd; }
 .shadcn-calendar-today:not(.shadcn-calendar-selected) .shadcn-calendar-day-button { border: 1px solid #bcb6e8; color: #5c54b9; background: #faf9ff; }
 .shadcn-calendar-outside .shadcn-calendar-day-button { color: #c6c1ba; }
+.shadcn-calendar .rdp-week > .shadcn-calendar-day.shadcn-calendar-outside:first-child:not(.shadcn-calendar-selected):not(.shadcn-calendar-range-start):not(.shadcn-calendar-range-middle):not(.shadcn-calendar-range-end) .shadcn-calendar-day-button { color: #c6c1ba; }
 .shadcn-calendar-disabled .shadcn-calendar-day-button { color: #d6d2cc; }
 .shadcn-date-actions { min-height: 34px; margin-top: 9px; padding-top: 9px; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid #efedea; }
 .shadcn-date-actions > div { display: flex; align-items: center; gap: 3px; }
@@ -2995,8 +3069,8 @@ html, body, #root { height: 100%; overflow: hidden; }
 .database-block .database-table td .database-cell-input:focus {
   text-overflow: clip;
 }
-.database-column-resize-handle { width: 10px; position: absolute; z-index: 4; top: 0; right: -5px; bottom: 0; cursor: col-resize; touch-action: none; }
-.database-column-resize-handle::after { width: 2px; position: absolute; top: 8px; bottom: 8px; left: 4px; border-radius: 999px; background: #665dcc; content: ""; opacity: 0; transform: scaleY(.72); transition: opacity .14s ease, transform .14s ease; }
+.database-column-resize-handle { width: 16px; position: absolute; z-index: 8; top: 0; right: -8px; bottom: 0; cursor: col-resize; touch-action: none; user-select: none; }
+.database-column-resize-handle::after { width: 2px; position: absolute; top: 8px; bottom: 8px; left: 7px; border-radius: 999px; background: #665dcc; content: ""; opacity: 0; transform: scaleY(.72); transition: opacity .14s ease, transform .14s ease; }
 .database-property-column:hover .database-column-resize-handle::after, .database-column-resize-handle:active::after { opacity: 1; transform: scaleY(1); }
 
 /* View-level database tools mirror Notion's search, filter, sort, and visibility model. */
@@ -3165,24 +3239,25 @@ html, body, #root { height: 100%; overflow: hidden; }
   white-space: nowrap;
 }
 
-.database-scroll-shell.has-overflow { padding-bottom: 11px; }
+.database-scroll-shell.has-overflow { padding-bottom: 10px; }
 .database-scrollbar {
-  right: 4px;
+  right: 5px;
   bottom: 1px;
-  left: 4px;
+  left: 5px;
   height: 8px;
 }
 .database-scrollbar-thumb {
   top: 2px;
   height: 4px;
-  background: #746f6766;
+  background: #746f6770;
   box-shadow: none;
+  transition: background-color .14s ease;
 }
 .database-scrollbar-thumb:hover,
 .database-scrollbar.is-dragging .database-scrollbar-thumb {
-  top: 1px;
-  height: 6px;
-  background: #5f5a5296;
+  top: 2px;
+  height: 4px;
+  background: #5f5a52a3;
 }
 .database-view-toolbar .database-delete-trigger {
   color: #9f625f;
@@ -5392,7 +5467,7 @@ body:has(.settings-layer) [data-radix-popper-content-wrapper]:has(> .shadcn-date
 }
 
 .block-selected-overlay {
-  position: fixed;
+  position: absolute;
   z-index: 72;
   border-radius: 4px;
   background: var(--nodi-block-selected);
@@ -5787,6 +5862,12 @@ body:has(.settings-layer) [data-radix-popper-content-wrapper]:has(> .shadcn-date
 
 .has-block-selection .bn-block-content {
   cursor: default;
+}
+
+/* Cmd/Ctrl+A keeps a native range so Chrome will emit the next copy event.
+   Nodi's block overlays are the visible selection state. */
+.has-block-selection .bn-editor ::selection {
+  background: transparent;
 }
 
 .has-block-selection [data-node-type="blockContainer"] > .bn-block-content:not(:has(.database-block)):not(:has(.child-page-block)),
@@ -6774,6 +6855,18 @@ html.is-nodi-block-dragging * {
   color: #e2dfd8;
   background: #343434;
 }
+:root[data-theme="dark"] .nodi-code-language-search {
+  color: #8f8b85;
+  border-color: #494949;
+  background: #292929;
+}
+:root[data-theme="dark"] .nodi-code-language-search:focus-within {
+  border-color: #9188e5;
+  box-shadow: 0 0 0 2px #9188e524;
+}
+:root[data-theme="dark"] .nodi-code-language-search input {
+  color: #e2dfd8;
+}
 :root[data-theme="dark"] .nodi-code-language-menu .shadcn-select-item:hover,
 :root[data-theme="dark"] .nodi-code-language-menu .shadcn-select-item:focus-visible {
   color: #f0efed;
@@ -6788,6 +6881,17 @@ html.is-nodi-block-dragging * {
 }
 :root[data-theme="dark"] .bn-block-content[data-content-type="codeBlock"] > pre::-webkit-scrollbar-thumb {
   background: #555;
+  background-clip: padding-box;
+}
+:root[data-theme="dark"] .bn-editor [data-content-type="table"] .tableWrapper {
+  scrollbar-color: #77736d transparent;
+}
+:root[data-theme="dark"] .bn-editor [data-content-type="table"] .tableWrapper::-webkit-scrollbar-thumb {
+  background: #77736d;
+  background-clip: padding-box;
+}
+:root[data-theme="dark"] .bn-editor [data-content-type="table"] .tableWrapper::-webkit-scrollbar-thumb:hover {
+  background: #9a958d;
   background-clip: padding-box;
 }
 :root[data-theme="dark"] .nodi-code-copy-button {
@@ -8001,8 +8105,14 @@ html.is-nodi-block-dragging * {
 :root[data-theme="dark"] .shadcn-calendar-disabled .shadcn-calendar-day-button {
   color: #55514c;
 }
-:root[data-theme="dark"] .shadcn-calendar-weekday:last-child {
+:root[data-theme="dark"] .shadcn-calendar-weekday:first-child {
   color: var(--nodi-text-danger);
+}
+:root[data-theme="dark"] .shadcn-calendar .rdp-week > .shadcn-calendar-day:first-child:not(.shadcn-calendar-selected):not(.shadcn-calendar-range-start):not(.shadcn-calendar-range-middle):not(.shadcn-calendar-range-end) .shadcn-calendar-day-button {
+  color: var(--nodi-text-danger);
+}
+:root[data-theme="dark"] .shadcn-calendar .rdp-week > .shadcn-calendar-day.shadcn-calendar-outside:first-child:not(.shadcn-calendar-selected):not(.shadcn-calendar-range-start):not(.shadcn-calendar-range-middle):not(.shadcn-calendar-range-end) .shadcn-calendar-day-button {
+  color: #716d66;
 }
 :root[data-theme="dark"] .shadcn-date-actions {
   border-color: var(--nodi-dark-border-subtle);

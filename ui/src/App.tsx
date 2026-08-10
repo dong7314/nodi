@@ -8,6 +8,7 @@ import type {
   ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { TextSelection } from "prosemirror-state";
 import { BlockNoteSchema, createCodeBlockSpec, defaultBlockSpecs, type BlockNoteEditor, type PartialBlock } from "@blocknote/core";
 import { filterSuggestionItems, insertOrUpdateBlockForSlashMenu } from "@blocknote/core/extensions";
 import { ko } from "@blocknote/core/locales";
@@ -17,7 +18,7 @@ import { createHighlighter } from "shiki";
 import { BlockCommentPanel } from "./BlockCommentPanel";
 import { BlockNotePopoverScrollOverlays } from "./BlockNotePopoverScrollOverlays";
 import { AuthDialog, type AuthDialogMode } from "./AuthDialog";
-import { INLINE_DATABASE_REALTIME_EVENT, InlineDatabase, InlineDatabaseSyncProvider } from "./InlineDatabase";
+import { DATABASE_COLUMN_RESIZE_START_EVENT, INLINE_DATABASE_REALTIME_EVENT, InlineDatabase, InlineDatabaseSyncProvider, type DatabaseState } from "./InlineDatabase";
 import { PageSharePanel } from "./PageSharePanel";
 import { PageSettingsPanel, type PageSettings } from "./PageSettings";
 import { SharedPagesView } from "./SharedPagesView";
@@ -100,6 +101,7 @@ import {
   Check,
   Code2,
   Copy,
+  CopyPlus,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -170,6 +172,7 @@ const APP_THEME_STORAGE_KEY = "nodi:app-theme";
 const HOME_PAGE_TITLE_STORAGE_KEY = "nodi:home-title-v2";
 const USER_NAME_STORAGE_KEY = "nodi:user:name";
 const USER_PROFILE_STORAGE_KEYS = ["nodi:user:profile", "nodi:auth:user"];
+const NODI_BLOCK_CLIPBOARD_MIME = "application/x-nodi-blocks+json";
 const DEFAULT_USER_NAME = "Lee";
 const USER_PROFILE_CHANGED_EVENT = "nodi:user-profile-changed";
 type AppTheme = "light" | "dark";
@@ -599,7 +602,200 @@ type BlockDropIndicator = {
   left: number;
   top: number;
   width: number;
+  nested?: boolean;
 };
+
+function clipboardContentPlainText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map(clipboardContentPlainText).join("");
+  }
+  if (!content || typeof content !== "object") return "";
+
+  const value = content as {
+    type?: unknown;
+    text?: unknown;
+    content?: unknown;
+    rows?: unknown;
+  };
+  if (typeof value.text === "string") return value.text;
+  if (value.type === "tableContent" && Array.isArray(value.rows)) {
+    return value.rows.map((row) => {
+      if (!row || typeof row !== "object" || !("cells" in row) || !Array.isArray(row.cells)) return "";
+      return row.cells.map(clipboardContentPlainText).join("\t");
+    }).join("\n");
+  }
+  return clipboardContentPlainText(value.content);
+}
+
+function blockPlainText(block: { content?: unknown }) {
+  return clipboardContentPlainText(block.content);
+}
+
+function clipboardBlocksPlainText(blocks: Array<{ content?: unknown; children?: unknown }>) {
+  const blockText = (block: { content?: unknown; children?: unknown }): string => {
+    const content = clipboardContentPlainText(block.content);
+    const children = Array.isArray(block.children)
+      ? block.children
+        .filter((child): child is { content?: unknown; children?: unknown } => (
+          Boolean(child) && typeof child === "object"
+        ))
+        .map(blockText)
+        .filter(Boolean)
+        .join("\n")
+      : "";
+    return [content, children].filter(Boolean).join("\n");
+  };
+
+  return blocks.map(blockText).join("\n");
+}
+
+function clipboardBlockWithoutId(value: unknown): PartialBlock | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const block = value as {
+    type?: unknown;
+    props?: unknown;
+    content?: unknown;
+    children?: unknown;
+  };
+  if (typeof block.type !== "string") return null;
+
+  const partialBlock: Record<string, unknown> = { type: block.type };
+  if (block.props && typeof block.props === "object" && !Array.isArray(block.props)) {
+    partialBlock.props = block.props;
+  }
+  if ("content" in block && block.content !== undefined) {
+    partialBlock.content = block.content;
+  }
+  if (Array.isArray(block.children)) {
+    const children = block.children
+      .map(clipboardBlockWithoutId)
+      .filter((child): child is PartialBlock => child !== null);
+    if (children.length > 0) partialBlock.children = children;
+  }
+  return partialBlock as unknown as PartialBlock;
+}
+
+function parseNodiClipboardBlocks(clipboardData: DataTransfer | null): PartialBlock[] | null {
+  const rawPayload = clipboardData?.getData(NODI_BLOCK_CLIPBOARD_MIME);
+  if (!rawPayload) return null;
+  try {
+    const payload = JSON.parse(rawPayload) as { version?: unknown; blocks?: unknown };
+    if (payload.version !== 1 || !Array.isArray(payload.blocks)) return null;
+    const blocks = payload.blocks
+      .map(clipboardBlockWithoutId)
+      .filter((block): block is PartialBlock => block !== null);
+    return blocks.length > 0 ? blocks : null;
+  } catch {
+    return null;
+  }
+}
+
+function pasteNodiClipboardBlocks(
+  activeEditor: BlockNoteEditor<any, any, any>,
+  clipboardData: DataTransfer | null,
+) {
+  const blocks = parseNodiClipboardBlocks(clipboardData);
+  if (!blocks) return false;
+
+  let targetBlock = activeEditor.document.at(-1);
+  try {
+    targetBlock = activeEditor.getTextCursorPosition().block;
+  } catch {
+    // A non-text block may currently hold a node selection. In that case,
+    // appending after the final document block is the safest deterministic
+    // fallback.
+  }
+  if (!targetBlock) return true;
+
+  const isEmptyParagraph = targetBlock.type === "paragraph"
+    && blockPlainText(targetBlock).length === 0
+    && targetBlock.children.length === 0;
+  const insertedBlocks = isEmptyParagraph
+    ? activeEditor.replaceBlocks([targetBlock.id], blocks).insertedBlocks
+    : activeEditor.insertBlocks(blocks, targetBlock.id, "after");
+  const finalInsertedBlock = insertedBlocks.at(-1);
+  if (finalInsertedBlock) {
+    window.requestAnimationFrame(() => {
+      activeEditor.focus();
+      try {
+        activeEditor.setTextCursorPosition(finalInsertedBlock.id, "end");
+      } catch {
+        // Blocks without inline content cannot receive a text cursor.
+      }
+    });
+  }
+  return true;
+}
+
+function plainTextWithLineBreaksToHTML(value: string) {
+  const escape = (text: string) => text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+  return `<p>${value.split(/\r?\n/).map(escape).join("<br>")}</p>`;
+}
+
+function clipboardHTMLWithLineBreaksToText(value: string) {
+  if (!value) return "";
+  const parsed = new DOMParser().parseFromString(value, "text/html");
+  parsed.body.querySelectorAll("br").forEach((lineBreak) => {
+    lineBreak.replaceWith(parsed.createTextNode("\n"));
+  });
+  parsed.body.querySelectorAll("p, li, h1, h2, h3, h4, h5, h6, pre, blockquote, tr").forEach((block) => {
+    if (block.nextSibling) block.append(parsed.createTextNode("\n"));
+  });
+  return (parsed.body.textContent ?? "")
+    .replaceAll("\u00a0", " ")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/\n$/, "");
+}
+
+function codeBlockClipboardText(clipboardData: DataTransfer | null) {
+  if (!clipboardData) return "";
+  const copiedBlocks = parseNodiClipboardBlocks(clipboardData);
+  if (copiedBlocks) {
+    return clipboardBlocksPlainText(copiedBlocks);
+  }
+
+  const plainText = clipboardData.getData("text/plain").replace(/\r\n?/g, "\n");
+
+  // BlockNote keeps hard breaks in its HTML payload even when a browser's
+  // text/plain representation flattens a multi-line selection.
+  for (const mimeType of ["blocknote/html", "text/html"]) {
+    const richText = clipboardHTMLWithLineBreaksToText(clipboardData.getData(mimeType));
+    if (richText.includes("\n")) return richText;
+  }
+  return plainText;
+}
+
+function hydratePublicResourceBlocks(
+  blocks: PartialBlock[],
+  childPageTitles: Record<string, string>,
+): PartialBlock[] {
+  return blocks.map((typedBlock) => {
+    const block = typedBlock as unknown as {
+      type?: string;
+      props?: Record<string, unknown>;
+      children?: PartialBlock[];
+      [key: string]: unknown;
+    };
+    const props = block.type === "childPage"
+      && typeof block.props?.pageId === "string"
+      && childPageTitles[block.props.pageId]
+        ? { ...block.props, title: childPageTitles[block.props.pageId] }
+        : block.props;
+    return {
+      ...block,
+      props,
+      children: block.children
+        ? hydratePublicResourceBlocks(block.children, childPageTitles)
+        : block.children,
+    } as unknown as PartialBlock;
+  });
+}
 
 const databaseBlockSpec = createReactBlockSpec(
   {
@@ -794,8 +990,10 @@ const nodiCodeBlockRender: typeof baseCodeBlockRender = function (block, editor)
         removeLanguageMenu();
         return;
       }
+      if (event.target instanceof HTMLInputElement) return;
       if (!languageMenu || !["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
-      const items = Array.from(languageMenu.querySelectorAll<HTMLButtonElement>('[role="option"]'));
+      const items = Array.from(languageMenu.querySelectorAll<HTMLButtonElement>('[role="option"]'))
+        .filter((item) => !item.hidden);
       if (items.length === 0) return;
       const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
       const nextIndex = event.key === "Home"
@@ -842,6 +1040,16 @@ const nodiCodeBlockRender: typeof baseCodeBlockRender = function (block, editor)
       menu.dataset.state = "open";
       menu.setAttribute("role", "listbox");
       menu.setAttribute("aria-label", "코드 언어 선택");
+      const searchWrap = document.createElement("label");
+      searchWrap.className = "nodi-code-language-search";
+      const searchIcon = document.createElement("span");
+      searchIcon.setAttribute("aria-hidden", "true");
+      searchIcon.textContent = "⌕";
+      const searchInput = document.createElement("input");
+      searchInput.type = "search";
+      searchInput.placeholder = "언어 검색";
+      searchInput.setAttribute("aria-label", "코드 언어 검색");
+      searchWrap.append(searchIcon, searchInput);
       const viewport = document.createElement("div");
       viewport.className = "shadcn-select-viewport";
       let selectedItem: HTMLButtonElement | null = null;
@@ -850,6 +1058,9 @@ const nodiCodeBlockRender: typeof baseCodeBlockRender = function (block, editor)
         const item = document.createElement("button");
         item.type = "button";
         item.className = "shadcn-select-item";
+        item.dataset.search = [option.label, option.value, ...(CODE_BLOCK_LANGUAGES[option.value].aliases ?? [])]
+          .join(" ")
+          .toLocaleLowerCase("ko-KR");
         item.setAttribute("role", "option");
         item.setAttribute("aria-selected", String(option.value === selectedLanguage));
         const itemLabel = document.createElement("span");
@@ -873,7 +1084,39 @@ const nodiCodeBlockRender: typeof baseCodeBlockRender = function (block, editor)
         viewport.appendChild(item);
       });
 
-      menu.appendChild(viewport);
+      const emptyResult = document.createElement("span");
+      emptyResult.className = "nodi-code-language-empty";
+      emptyResult.textContent = "일치하는 언어가 없습니다.";
+      emptyResult.hidden = true;
+      const filterLanguages = () => {
+        const query = searchInput.value.trim().toLocaleLowerCase("ko-KR");
+        let visibleCount = 0;
+        viewport.querySelectorAll<HTMLButtonElement>('[role="option"]').forEach((item) => {
+          const visible = !query || item.dataset.search?.includes(query);
+          item.hidden = !visible;
+          if (visible) visibleCount += 1;
+        });
+        emptyResult.hidden = visibleCount > 0;
+      };
+      searchInput.addEventListener("input", filterLanguages);
+      searchInput.addEventListener("pointerdown", stopLanguagePickerEvent);
+      searchInput.addEventListener("keydown", (event) => {
+        event.stopPropagation();
+        if (event.key === "Escape") {
+          event.preventDefault();
+          removeLanguageMenu();
+          languageTrigger?.focus();
+          return;
+        }
+        if (event.key !== "ArrowDown") return;
+        const firstVisibleItem = Array.from(viewport.querySelectorAll<HTMLButtonElement>('[role="option"]'))
+          .find((item) => !item.hidden);
+        if (firstVisibleItem) {
+          event.preventDefault();
+          firstVisibleItem.focus();
+        }
+      });
+      menu.append(searchWrap, viewport, emptyResult);
       document.body.appendChild(menu);
       languageMenu = menu;
       closeLanguageMenu = removeLanguageMenu;
@@ -883,7 +1126,10 @@ const nodiCodeBlockRender: typeof baseCodeBlockRender = function (block, editor)
       window.addEventListener("resize", removeLanguageMenu);
       window.addEventListener("scroll", handleLanguageMenuScroll, true);
       positionLanguageMenu(menu);
-      window.requestAnimationFrame(() => selectedItem?.focus());
+      window.requestAnimationFrame(() => {
+        searchInput.focus();
+        selectedItem?.scrollIntoView({ block: "nearest" });
+      });
     };
     const handleLanguageTriggerClick = (event: MouseEvent) => {
       event.preventDefault();
@@ -1352,6 +1598,31 @@ function App() {
     schema: editorSchema,
     initialContent: initialPage.blocks as never,
     dictionary: NODI_DICTIONARY,
+    pasteHandler: ({ event, editor: activeEditor, defaultPasteHandler }) => {
+      const plainText = event.clipboardData?.getData("text/plain") ?? "";
+      const hasBlockNotePayload = event.clipboardData?.types.includes("blocknote/html") ?? false;
+      const hasFiles = event.clipboardData?.files.length;
+      const isCodeBlock = activeEditor.transact((transaction) => (
+        transaction.selection.$from.parent.type.spec.code === true
+        && transaction.selection.$to.parent.type.spec.code === true
+      ));
+      if (!hasFiles && isCodeBlock && plainText.length > 0) {
+        const normalizedText = codeBlockClipboardText(event.clipboardData);
+        const { state, dispatch } = activeEditor.prosemirrorView;
+        dispatch(state.tr
+          .insertText(normalizedText, state.selection.from, state.selection.to)
+          .scrollIntoView());
+        return true;
+      }
+      if (!hasFiles && !isCodeBlock && pasteNodiClipboardBlocks(activeEditor, event.clipboardData)) {
+        return true;
+      }
+      if (!hasFiles && !hasBlockNotePayload && !isCodeBlock && /\r?\n/.test(plainText)) {
+        activeEditor.pasteHTML(plainTextWithLineBreaksToHTML(plainText));
+        return true;
+      }
+      return defaultPasteHandler();
+    },
     uploadFile: async (file, blockId) => {
       try {
         return await uploadNodiAttachment(file, {
@@ -1416,6 +1687,7 @@ function App() {
   const [activeCommentBlockId, setActiveCommentBlockId] = useState<string | null>(null);
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
   const [realtimeParticipants, setRealtimeParticipants] = useState<ServerRealtimeParticipant[]>([]);
+  const [publicDatabaseStates, setPublicDatabaseStates] = useState<Record<string, DatabaseState>>({});
   const [selectedBlockIds, setSelectedBlockIds] = useState<string[]>([]);
   const selectedBlockIdsRef = useRef<string[]>([]);
   const [isBlockSelectionMode, setIsBlockSelectionMode] = useState(false);
@@ -1495,15 +1767,18 @@ function App() {
     initialBlockIds: string[];
     additiveSelection: boolean;
     preserveClick: boolean;
+    spansEditorWidth: boolean;
   } | null>(null);
   const refreshMarqueeSelectionRef = useRef<(() => void) | null>(null);
+  const marqueeAutoScrollFrameRef = useRef<number | null>(null);
+  const marqueeApplyFrameRef = useRef<number | null>(null);
   const blockDragRef = useRef<{
     pointerId: number;
     blockIds: string[];
     startX: number;
     startY: number;
     dragging: boolean;
-    dropTarget: { blockId: string; placement: "before" | "after" } | null;
+    dropTarget: { blockId: string; placement: "before" | "after" | "nested" } | null;
   } | null>(null);
   const suppressEditorClickRef = useRef(false);
   const isDarkMode = appTheme === "dark";
@@ -1531,6 +1806,12 @@ function App() {
   useEffect(() => () => {
     if (localSaveStateTimerRef.current) window.clearTimeout(localSaveStateTimerRef.current);
     if (realtimeBlocksTimerRef.current) window.clearTimeout(realtimeBlocksTimerRef.current);
+    if (marqueeApplyFrameRef.current !== null) {
+      window.cancelAnimationFrame(marqueeApplyFrameRef.current);
+    }
+    if (marqueeAutoScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(marqueeAutoScrollFrameRef.current);
+    }
   }, []);
 
   useEffect(() => {
@@ -1550,9 +1831,21 @@ function App() {
     let active = true;
     setLocalSaveState("saving");
     void workspaceApi.getPublicPage(publicPageId)
-      .then((serverPage) => {
+      .then((payload) => {
         if (!active) return;
-        const publicPage = storedPageFromServer({ ...serverPage, permission: "view" });
+        const childPageTitles = Object.fromEntries(payload.childPages.map((page) => [page.id, page.title]));
+        const hydratedBlocks = hydratePublicResourceBlocks(
+          (payload.page.blocks ?? []) as PartialBlock[],
+          childPageTitles,
+        );
+        const publicPage = storedPageFromServer({
+          ...payload.page,
+          blocks: hydratedBlocks,
+          permission: "view",
+        });
+        setPublicDatabaseStates(Object.fromEntries(
+          payload.databases.map((database) => [database.id, database.state as DatabaseState]),
+        ));
         const nextPages = { [publicPage.id]: publicPage };
         loadingPageRef.current = true;
         pagesRef.current = nextPages;
@@ -2420,6 +2713,13 @@ function App() {
     setRightPanel(null);
     setActiveCommentBlockId(null);
     setContextMenu(null);
+    blockSelectionModeRef.current = false;
+    blockSelectionAnchorRef.current = null;
+    selectedBlockIdsRef.current = [];
+    setIsBlockSelectionMode(false);
+    setSelectedBlockIds([]);
+    setBlockSelectionActionMenu(null);
+    setBlockSelectionMarquee(null);
     editor.replaceBlocks(
       editor.document,
       (targetPage.blocks.length ? targetPage.blocks : [{ type: "paragraph", content: "" }]) as never,
@@ -4172,6 +4472,25 @@ function App() {
     setBlockSelectionActionMenu(null);
   };
 
+  useEffect(() => {
+    const cancelSelectionForColumnResize = () => {
+      marqueeSelectionRef.current = null;
+      marginSelectionRef.current = null;
+      if (marqueeApplyFrameRef.current !== null) {
+        window.cancelAnimationFrame(marqueeApplyFrameRef.current);
+        marqueeApplyFrameRef.current = null;
+      }
+      if (marqueeAutoScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(marqueeAutoScrollFrameRef.current);
+        marqueeAutoScrollFrameRef.current = null;
+      }
+      setBlockSelectionMarquee(null);
+      clearBlockSelection();
+    };
+    window.addEventListener(DATABASE_COLUMN_RESIZE_START_EVENT, cancelSelectionForColumnResize);
+    return () => window.removeEventListener(DATABASE_COLUMN_RESIZE_START_EVENT, cancelSelectionForColumnResize);
+  }, []);
+
   const selectBlockRange = (anchorId: string, targetId: string) => {
     const orderedIds = getOrderedBlockIds();
     const anchorIndex = orderedIds.indexOf(anchorId);
@@ -4255,6 +4574,12 @@ function App() {
     const initialBlockIds = isAdditiveSelection ? getLiveSelectedBlockIds() : [];
     const scrollArea = editorStageRef.current;
     const scrollRect = scrollArea?.getBoundingClientRect();
+    const editorRect = editorContextRef.current?.getBoundingClientRect();
+    const eventTarget = event.target as HTMLElement;
+    const spansEditorWidth = Boolean(
+      eventTarget.closest(".block-selection-gutter")
+      || (editorRect && (event.clientX < editorRect.left || event.clientX > editorRect.right)),
+    );
     marqueeSelectionRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -4269,6 +4594,7 @@ function App() {
       initialBlockIds,
       additiveSelection: isAdditiveSelection,
       preserveClick,
+      spansEditorWidth,
     };
     if (!preserveClick) {
       event.preventDefault();
@@ -4293,14 +4619,21 @@ function App() {
     const anchoredStartY = scrollArea && scrollRect
       ? scrollRect.top + marqueeState.startContentY - scrollArea.scrollTop
       : marqueeState.startY;
-    const left = Math.min(marqueeState.startX, clientX);
+    const editorRect = editorContextRef.current?.getBoundingClientRect();
+    const marqueeLeft = Math.min(marqueeState.startX, clientX);
+    const marqueeRight = Math.max(marqueeState.startX, clientX);
+    const hitLeft = marqueeState.spansEditorWidth && editorRect
+      ? editorRect.left
+      : marqueeLeft;
     const top = Math.min(anchoredStartY, clientY);
-    const right = Math.max(marqueeState.startX, clientX);
+    const hitRight = marqueeState.spansEditorWidth && editorRect
+      ? editorRect.right
+      : marqueeRight;
     const bottom = Math.max(anchoredStartY, clientY);
     const marquee = {
-      left,
+      left: marqueeLeft,
       top,
-      width: right - left,
+      width: marqueeRight - marqueeLeft,
       height: bottom - top,
     };
     setBlockSelectionMarquee((current) => (
@@ -4322,8 +4655,8 @@ function App() {
         if (!content) return false;
         const rect = content.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return false;
-        return left <= rect.right
-          && right >= rect.left
+        return hitLeft <= rect.right
+          && hitRight >= rect.left
           && top <= rect.bottom
           && bottom >= rect.top;
       })
@@ -4331,7 +4664,11 @@ function App() {
       .filter((blockId): blockId is string => Boolean(blockId));
     const nextSelection = [...new Set([...marqueeState.initialBlockIds, ...hitIds])];
     const orderedIds = getOrderedBlockIds();
-    nextSelection.sort((first, second) => orderedIds.indexOf(first) - orderedIds.indexOf(second));
+    const orderIndex = new Map(orderedIds.map((blockId, index) => [blockId, index]));
+    nextSelection.sort((first, second) => (
+      (orderIndex.get(first) ?? Number.MAX_SAFE_INTEGER)
+      - (orderIndex.get(second) ?? Number.MAX_SAFE_INTEGER)
+    ));
     if (nextSelection.length > 0) {
       setBlockSelectionState(nextSelection, nextSelection[0]);
       setFocusedBlockId(nextSelection.at(-1) ?? nextSelection[0]);
@@ -4340,10 +4677,61 @@ function App() {
     }
   };
 
+  const scheduleMarqueeSelection = (
+    marqueeState: NonNullable<typeof marqueeSelectionRef.current>,
+    clientX: number,
+    clientY: number,
+  ) => {
+    marqueeState.lastClientX = clientX;
+    marqueeState.lastClientY = clientY;
+    if (marqueeApplyFrameRef.current !== null) return;
+    marqueeApplyFrameRef.current = window.requestAnimationFrame(() => {
+      marqueeApplyFrameRef.current = null;
+      const current = marqueeSelectionRef.current;
+      if (!current?.dragging) return;
+      applyMarqueeSelection(current, current.lastClientX, current.lastClientY);
+    });
+  };
+
+  const stopMarqueeAutoScroll = () => {
+    if (marqueeAutoScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(marqueeAutoScrollFrameRef.current);
+      marqueeAutoScrollFrameRef.current = null;
+    }
+  };
+
+  const startMarqueeAutoScroll = () => {
+    if (marqueeAutoScrollFrameRef.current !== null) return;
+    const step = () => {
+      marqueeAutoScrollFrameRef.current = null;
+      const marqueeState = marqueeSelectionRef.current;
+      const scrollArea = editorStageRef.current;
+      if (!marqueeState?.dragging || !scrollArea) return;
+      const scrollRect = scrollArea.getBoundingClientRect();
+      const edgeSize = 64;
+      const topDistance = marqueeState.lastClientY - scrollRect.top;
+      const bottomDistance = scrollRect.bottom - marqueeState.lastClientY;
+      const speed = topDistance < edgeSize
+        ? -Math.ceil((edgeSize - Math.max(0, topDistance)) / 3)
+        : bottomDistance < edgeSize
+          ? Math.ceil((edgeSize - Math.max(0, bottomDistance)) / 3)
+          : 0;
+      if (speed !== 0) {
+        const previousScrollTop = scrollArea.scrollTop;
+        scrollArea.scrollTop += speed;
+        if (scrollArea.scrollTop !== previousScrollTop) {
+          scheduleMarqueeSelection(marqueeState, marqueeState.lastClientX, marqueeState.lastClientY);
+          marqueeAutoScrollFrameRef.current = window.requestAnimationFrame(step);
+        }
+      }
+    };
+    marqueeAutoScrollFrameRef.current = window.requestAnimationFrame(step);
+  };
+
   refreshMarqueeSelectionRef.current = () => {
     const marqueeState = marqueeSelectionRef.current;
     if (!marqueeState?.dragging) return;
-    applyMarqueeSelection(
+    scheduleMarqueeSelection(
       marqueeState,
       marqueeState.lastClientX,
       marqueeState.lastClientY,
@@ -4397,20 +4785,8 @@ function App() {
       }
     }
 
-    const scrollArea = editorStageRef.current;
-    if (scrollArea) {
-      const scrollRect = scrollArea.getBoundingClientRect();
-      const edgeSize = 54;
-      const topDistance = event.clientY - scrollRect.top;
-      const bottomDistance = scrollRect.bottom - event.clientY;
-      if (topDistance < edgeSize) {
-        scrollArea.scrollTop -= Math.ceil((edgeSize - Math.max(0, topDistance)) / 3);
-      } else if (bottomDistance < edgeSize) {
-        scrollArea.scrollTop += Math.ceil((edgeSize - Math.max(0, bottomDistance)) / 3);
-      }
-    }
-
-    applyMarqueeSelection(marqueeState, event.clientX, event.clientY);
+    scheduleMarqueeSelection(marqueeState, event.clientX, event.clientY);
+    startMarqueeAutoScroll();
   };
 
   const finishMarqueeSelection = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -4424,7 +4800,15 @@ function App() {
       if (marqueeState.clickedBlockId) selectSingleBlock(marqueeState.clickedBlockId);
       else clearBlockSelection();
     }
+    if (marqueeApplyFrameRef.current !== null) {
+      window.cancelAnimationFrame(marqueeApplyFrameRef.current);
+      marqueeApplyFrameRef.current = null;
+      if (marqueeState.dragging) {
+        applyMarqueeSelection(marqueeState, marqueeState.lastClientX, marqueeState.lastClientY);
+      }
+    }
     marqueeSelectionRef.current = null;
+    stopMarqueeAutoScroll();
     setBlockSelectionMarquee(null);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
@@ -4435,26 +4819,52 @@ function App() {
   const moveBlocksToDropTarget = (
     blockIds: string[],
     targetBlockId: string,
-    placement: "before" | "after",
+    placement: "before" | "after" | "nested",
   ) => {
     if (!currentPageIsEditable()) return;
     const selected = new Set(normalizeBlockIds(blockIds));
     if (selected.size === 0 || selected.has(targetBlockId)) return;
 
-    const rootBlocks = [...editor.document];
-    const movingBlocks = rootBlocks.filter((block) => selected.has(block.id));
+    type EditorBlock = NonNullable<ReturnType<typeof editor.getBlock>>;
+    const movingBlocks: EditorBlock[] = [];
+    const collectMovingBlocks = (blocks: readonly EditorBlock[]) => {
+      blocks.forEach((block) => {
+        if (selected.has(block.id)) movingBlocks.push(block);
+        else collectMovingBlocks(block.children as readonly EditorBlock[]);
+      });
+    };
+    collectMovingBlocks(editor.document as readonly EditorBlock[]);
     if (movingBlocks.length === 0) return;
 
-    const remainingBlocks = rootBlocks.filter((block) => !selected.has(block.id));
-    const targetIndex = remainingBlocks.findIndex((block) => block.id === targetBlockId);
-    if (targetIndex < 0) return;
-
-    const insertionIndex = targetIndex + (placement === "after" ? 1 : 0);
-    const nextDocument = [
-      ...remainingBlocks.slice(0, insertionIndex),
-      ...movingBlocks,
-      ...remainingBlocks.slice(insertionIndex),
-    ];
+    const removeSelected = (blocks: readonly EditorBlock[]): EditorBlock[] => blocks
+      .filter((block) => !selected.has(block.id))
+      .map((block) => ({
+        ...block,
+        children: removeSelected(block.children as readonly EditorBlock[]),
+      })) as EditorBlock[];
+    let inserted = false;
+    const insertAtTarget = (blocks: readonly EditorBlock[]): EditorBlock[] => {
+      const next: EditorBlock[] = [];
+      blocks.forEach((block) => {
+        if (block.id === targetBlockId && placement === "before") {
+          next.push(...movingBlocks);
+          inserted = true;
+        }
+        const children = insertAtTarget(block.children as readonly EditorBlock[]);
+        const nextBlock = block.id === targetBlockId && placement === "nested"
+          ? ({ ...block, children: [...children, ...movingBlocks] } as EditorBlock)
+          : ({ ...block, children } as EditorBlock);
+        if (block.id === targetBlockId && placement === "nested") inserted = true;
+        next.push(nextBlock);
+        if (block.id === targetBlockId && placement === "after") {
+          next.push(...movingBlocks);
+          inserted = true;
+        }
+      });
+      return next;
+    };
+    const nextDocument = insertAtTarget(removeSelected(editor.document as readonly EditorBlock[]));
+    if (!inserted) return;
     const nextIds = movingBlocks.map((block) => block.id);
 
     editor.replaceBlocks(editor.document, nextDocument as never);
@@ -4494,7 +4904,7 @@ function App() {
       setFocusedBlockId(blockId);
       return;
     }
-    if (target.closest(".bn-side-menu, button, input, textarea, select, [role='button'], [role='menu']")) return;
+    if (target.closest("[data-nodi-block-selection-ignore='true'], [data-content-type='table'], .database-block, .bn-side-menu, button, input, textarea, select, [role='button'], [role='menu'], .database-scrollbar")) return;
     const blockElement = getBlockElementAtPoint(event.clientX, event.clientY);
     const blockId = blockElement?.dataset.id;
     if (!blockId || !blockElement) {
@@ -4518,6 +4928,7 @@ function App() {
     if (startsInsideWrittenText) {
       // 여러 줄의 텍스트를 선택하는 동안 세로 이동이 커지더라도
       // 블록 marquee 선택으로 전환하지 않고 네이티브 텍스트 선택을 유지한다.
+      if (blockSelectionModeRef.current) clearBlockSelection();
       return;
     }
     const isInlineWhitespace = !isBlockMargin
@@ -4571,23 +4982,35 @@ function App() {
         setBlockDropIndicator(null);
         return;
       }
-      const targetRect = targetElement.getBoundingClientRect();
-      const placement: "before" | "after" = event.clientY < targetRect.top + targetRect.height / 2
-        ? "before"
-        : "after";
+      const targetContent = targetElement.querySelector<HTMLElement>(":scope > .bn-block-content")
+        ?? targetElement.querySelector<HTMLElement>(".bn-block-content");
+      const targetRect = (targetContent ?? targetElement).getBoundingClientRect();
+      const targetBlock = editor.getBlock(targetBlockId);
+      const canNest = targetBlock?.type === "toggleListItem"
+        || (targetBlock?.type === "heading" && Boolean((targetBlock.props as { isToggleable?: boolean }).isToggleable));
+      const placement: "before" | "after" | "nested" = canNest
+        && event.clientX > targetRect.left + 28
+        && event.clientY >= targetRect.top + targetRect.height * .38
+          ? "nested"
+          : event.clientY < targetRect.top + targetRect.height / 2
+            ? "before"
+            : "after";
       const nextTarget = { blockId: targetBlockId, placement };
       dragState.dropTarget = nextTarget;
       const horizontalPadding = 7;
+      const nestedIndent = placement === "nested" ? 26 : 0;
       const nextIndicator = {
-        left: targetRect.left - horizontalPadding,
+        left: targetRect.left - horizontalPadding + nestedIndent,
         top: placement === "before" ? targetRect.top : targetRect.bottom,
-        width: targetRect.width + horizontalPadding * 2,
+        width: Math.max(40, targetRect.width + horizontalPadding * 2 - nestedIndent),
+        nested: placement === "nested",
       };
       setBlockDropIndicator((current) => (
         current
         && current.left === nextIndicator.left
         && current.top === nextIndicator.top
         && current.width === nextIndicator.width
+        && current.nested === nextIndicator.nested
           ? current
           : nextIndicator
       ));
@@ -4703,7 +5126,11 @@ function App() {
     const selection = editor.getSelection();
     const selectionType = editor.prosemirrorView.state.selection.constructor.name;
     const isNodeSelection = selectionType === "NodeSelection" || selectionType === "MultipleNodeSelection";
-    if (blockSelectionModeRef.current || isNodeSelection) {
+    // Marquee/handle selection is managed independently from ProseMirror's transient
+    // pointer selection. Syncing that transient selection here collapses a multi-block
+    // marquee back to the single block below the pointer on pointer-up.
+    if (blockSelectionModeRef.current) return;
+    if (isNodeSelection) {
       const ids = selection?.blocks.map((block) => block.id)
         ?? (cursorBlockId ? [cursorBlockId] : []);
       if (ids.length > 0) {
@@ -4772,6 +5199,19 @@ function App() {
     setNotice(`${blocks.length}개 블록을 복제했어요`);
   };
 
+  const copySelectedBlocks = () => {
+    if (!blockSelectionModeRef.current || selectedBlockIdsRef.current.length === 0) return;
+
+    // Keep the native copy event inside the editor context so the existing
+    // block clipboard serializer can include Nodi, BlockNote, HTML and plain
+    // text formats. This preserves full block structure when pasting into a
+    // different page while still working as a direct toolbar action.
+    editorContextRef.current?.focus({ preventScroll: true });
+    if (!document.execCommand("copy")) {
+      setNotice("블록을 클립보드에 복사하지 못했어요");
+    }
+  };
+
   const removeBlocks = (blockIds: string[]) => {
     if (pageSettings.lockPage) return;
     const normalizedIds = normalizeBlockIds(blockIds);
@@ -4816,6 +5256,109 @@ function App() {
       && editorRoot.contains(selection.focusNode);
   };
 
+  const writeBlocksToClipboard = (
+    event: ReactClipboardEvent<HTMLDivElement>,
+    blockIds: string[],
+  ) => {
+    type EditorBlock = NonNullable<ReturnType<typeof editor.getBlock>>;
+    const blocks = normalizeBlockIds(blockIds)
+      .map((blockId) => editor.getBlock(blockId))
+      .filter((block): block is EditorBlock => block !== undefined);
+    if (blocks.length === 0) return [];
+    const clipboardBlocks = blocks as unknown as PartialBlock[];
+    const plainText = clipboardBlocksPlainText(clipboardBlocks);
+    const externalHtml = editor.blocksToHTMLLossy(clipboardBlocks);
+    const blockNoteHtml = editor.blocksToFullHTML(clipboardBlocks);
+    event.clipboardData.clearData();
+    event.clipboardData.setData(NODI_BLOCK_CLIPBOARD_MIME, JSON.stringify({
+      version: 1,
+      blocks: clipboardBlocks,
+    }));
+    event.clipboardData.setData("blocknote/html", blockNoteHtml);
+    event.clipboardData.setData("text/html", externalHtml);
+    event.clipboardData.setData("text/plain", plainText);
+    return blocks;
+  };
+
+  const handleEditorCopy = (event: ReactClipboardEvent<HTMLDivElement>) => {
+    // Marquee/whole-block selection must win over a stale native text range.
+    // Browsers can keep the previous DOM selection even after the user starts a
+    // block selection, which otherwise makes Ctrl/Cmd+C serialize only that
+    // old text range instead of the selected blocks.
+    if (blockSelectionModeRef.current && selectedBlockIdsRef.current.length > 0) {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        const copiedBlocks = writeBlocksToClipboard(event, selectedBlockIdsRef.current);
+        if (copiedBlocks.length > 0) setNotice(`${copiedBlocks.length}개 블록을 복사했어요`);
+      } catch {
+        setNotice("블록을 클립보드에 복사하지 못했어요");
+      }
+      return;
+    }
+
+    const { state } = editor.prosemirrorView;
+    const { selection } = state;
+    if (!selection.empty) {
+      let codeDepth: number | undefined;
+      for (let depth = selection.$from.depth; depth > 0; depth -= 1) {
+        if (selection.$from.node(depth).type.spec.code === true) {
+          codeDepth = depth;
+          break;
+        }
+      }
+      if (codeDepth !== undefined) {
+        const codeNode = selection.$from.node(codeDepth);
+        const codeStart = selection.$from.start(codeDepth);
+        const codeEnd = codeStart + codeNode.content.size;
+        if (selection.from >= codeStart && selection.to <= codeEnd) {
+          event.preventDefault();
+          event.stopPropagation();
+          event.clipboardData.clearData();
+          event.clipboardData.setData(
+            "text/plain",
+            state.doc.textBetween(selection.from, selection.to, "\n", "\n"),
+          );
+          return;
+        }
+      }
+    }
+    if (hasNativeEditorTextSelection()) {
+      const nativeSelection = window.getSelection();
+      if (!nativeSelection || nativeSelection.rangeCount === 0) return;
+
+      // Browser/BlockNote clipboard serialization can flatten hard breaks or
+      // express them as Markdown's trailing backslash. ProseMirror already
+      // knows the exact selected range, so write real newline characters to
+      // text/plain while keeping a rich HTML representation for styled paste.
+      const selectedText = state.doc.textBetween(selection.from, selection.to, "\n", "\n");
+      const htmlContainer = document.createElement("div");
+      htmlContainer.append(nativeSelection.getRangeAt(0).cloneContents());
+      event.preventDefault();
+      event.stopPropagation();
+      event.clipboardData.clearData();
+      event.clipboardData.setData("text/plain", selectedText);
+      event.clipboardData.setData("text/html", htmlContainer.innerHTML);
+      return;
+    }
+  };
+
+  const handleWorkspacePasteCapture = (event: ReactClipboardEvent<HTMLElement>) => {
+    if (!event.clipboardData.types.includes(NODI_BLOCK_CLIPBOARD_MIME)) return;
+    const target = event.target as HTMLElement;
+    if (editorContextRef.current?.contains(target)) return;
+    if (!currentPageIsEditable()) return;
+
+    const isTitleInput = target === titleInputRef.current;
+    if (!isTitleInput && target.closest("input, textarea, select, [contenteditable='true']")) return;
+    if (!pasteNodiClipboardBlocks(editor, event.clipboardData)) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    clearBlockSelection();
+    setNotice("복사한 블록을 붙여넣었어요");
+  };
+
   const handleEditorCut = (event: ReactClipboardEvent<HTMLDivElement>) => {
     if (!currentPageIsEditable()) return;
     // 텍스트를 드래그해 선택한 상태에서는 BlockNote/브라우저의 기본
@@ -4838,6 +5381,31 @@ function App() {
     );
     if (isNativeFormControl) return;
 
+    if (!blockSelectionModeRef.current) {
+      const selection = editor.prosemirrorView.state.selection;
+      if (selection.empty && selection.$from.parent.type.spec.code === true) {
+        const text = selection.$from.parent.textContent;
+        const cursorOffset = selection.$from.parentOffset;
+        const lineStart = text.lastIndexOf("\n", Math.max(0, cursorOffset - 1)) + 1;
+        const nextNewline = text.indexOf("\n", cursorOffset);
+        const lineEnd = nextNewline < 0 ? text.length : nextNewline + 1;
+        const cutText = text.slice(lineStart, nextNewline < 0 ? text.length : lineEnd);
+        let deleteStart = lineStart;
+        let deleteEnd = lineEnd;
+        if (nextNewline < 0 && lineStart > 0) deleteStart -= 1;
+        event.preventDefault();
+        event.stopPropagation();
+        event.clipboardData.clearData();
+        event.clipboardData.setData("text/plain", cutText);
+        const transaction = editor.prosemirrorView.state.tr
+          .delete(selection.$from.start() + deleteStart, selection.$from.start() + deleteEnd)
+          .scrollIntoView();
+        editor.prosemirrorView.dispatch(transaction);
+        setNotice("현재 코드 줄을 잘라냈어요");
+        return;
+      }
+    }
+
     let blockIds = selectedBlockIdsRef.current;
     if (!blockSelectionModeRef.current || blockIds.length === 0) {
       try {
@@ -4856,22 +5424,10 @@ function App() {
       return;
     }
 
-    const normalizedIds = normalizeBlockIds(blockIds);
-    type EditorBlock = NonNullable<ReturnType<typeof editor.getBlock>>;
-    const blocks = normalizedIds
-      .map((blockId) => editor.getBlock(blockId))
-      .filter((block): block is EditorBlock => block !== undefined);
-    if (blocks.length === 0) return;
-
     try {
-      const clipboardBlocks = blocks as unknown as PartialBlock[];
-      const markdown = editor.blocksToMarkdownLossy(clipboardBlocks);
-      const externalHtml = editor.blocksToHTMLLossy(clipboardBlocks);
-      const blockNoteHtml = editor.blocksToFullHTML(clipboardBlocks);
-      event.clipboardData.clearData();
-      event.clipboardData.setData("blocknote/html", blockNoteHtml);
-      event.clipboardData.setData("text/html", externalHtml);
-      event.clipboardData.setData("text/plain", markdown);
+      const normalizedIds = normalizeBlockIds(blockIds);
+      const blocks = writeBlocksToClipboard(event, normalizedIds);
+      if (blocks.length === 0) return;
       removeBlocks(normalizedIds);
       setNotice(`${blocks.length}개 블록을 잘라냈어요`);
     } catch {
@@ -4893,6 +5449,35 @@ function App() {
       cursorBlockId = undefined;
     }
     const blockId = getEventBlockId(event.target) ?? cursorBlockId ?? focusedBlockId ?? undefined;
+    const currentBlock = blockId ? editor.getBlock(blockId) : undefined;
+    const prosemirrorSelection = editor.prosemirrorView.state.selection;
+    let codeBlockSelectionDepth: number | undefined;
+    for (let depth = prosemirrorSelection.$from.depth; depth > 0; depth -= 1) {
+      if (prosemirrorSelection.$from.node(depth).type.spec.code === true) {
+        codeBlockSelectionDepth = depth;
+        break;
+      }
+    }
+    const isCodeBlockEvent = currentBlock?.type === "codeBlock"
+      || codeBlockSelectionDepth !== undefined;
+
+    if (
+      event.key === "`"
+      && !hasPrimaryModifier
+      && !event.altKey
+      && !event.shiftKey
+      && currentBlock?.type === "paragraph"
+      && blockPlainText(currentBlock).trim() === "``"
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      editor.updateBlock(currentBlock.id, { type: "codeBlock", props: { language: "text" }, content: "" });
+      window.requestAnimationFrame(() => {
+        editor.setTextCursorPosition(currentBlock.id, "start");
+        editor.focus();
+      });
+      return;
+    }
 
     if (event.key === "Escape") {
       if (document.querySelector(".bn-suggestion-menu")) return;
@@ -4912,11 +5497,34 @@ function App() {
       && !event.altKey
       && !isNativeTextControl
     ) {
+      if (isCodeBlockEvent && codeBlockSelectionDepth !== undefined) {
+        event.preventDefault();
+        event.stopPropagation();
+        const { state, dispatch } = editor.prosemirrorView;
+        const codeBlockNode = state.selection.$from.node(codeBlockSelectionDepth);
+        const codeStart = state.selection.$from.start(codeBlockSelectionDepth);
+        const codeEnd = codeStart + codeBlockNode.content.size;
+        if (blockSelectionModeRef.current) clearBlockSelection();
+        dispatch(state.tr.setSelection(TextSelection.create(state.doc, codeStart, codeEnd)));
+        editor.focus();
+        return;
+      }
       const orderedBlockIds = getOrderedBlockIds();
       if (orderedBlockIds.length === 0) return;
       event.preventDefault();
       event.stopPropagation();
-      window.getSelection()?.removeAllRanges();
+      // Keep a real DOM range after Cmd/Ctrl+A. Chrome can skip the following
+      // native `copy` event when only Nodi's visual block selection exists and
+      // the browser selection is empty. The copy handler still serializes the
+      // selected blocks first, so this range is only the browser-level trigger.
+      const nativeSelection = window.getSelection();
+      const editorRoot = editorContextRef.current?.querySelector<HTMLElement>(".bn-editor");
+      nativeSelection?.removeAllRanges();
+      if (nativeSelection && editorRoot) {
+        const editorRange = document.createRange();
+        editorRange.selectNodeContents(editorRoot);
+        nativeSelection.addRange(editorRange);
+      }
       setBlockSelectionState(orderedBlockIds, orderedBlockIds[0]);
       setFocusedBlockId(orderedBlockIds[orderedBlockIds.length - 1]);
       return;
@@ -4982,41 +5590,77 @@ function App() {
 
   useLayoutEffect(() => {
     const root = editorContextRef.current;
+    const editorRoot = root?.querySelector<HTMLElement>(".bn-editor");
+    if (!root || !editorRoot || selectedBlockIds.length === 0) return;
+    let frame = 0;
+    const updateOverlays = () => {
+      const rootRect = root.getBoundingClientRect();
+      selectedBlockIds.forEach((blockId) => {
+        const overlay = blockSelectionOverlayRefs.current.get(blockId);
+        const element = root.querySelector<HTMLElement>(
+          `[data-node-type='blockContainer'][data-id="${CSS.escape(blockId)}"]`,
+        );
+        if (!overlay || !element) {
+          overlay?.removeAttribute("data-positioned");
+          return;
+        }
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+          overlay.removeAttribute("data-positioned");
+          return;
+        }
+        const horizontalInset = currentPageId === ROOT_PAGE_ID ? 0 : 7;
+        const verticalGap = Math.min(1, rect.height / 4);
+        overlay.style.left = `${rect.left - rootRect.left - horizontalInset}px`;
+        overlay.style.top = `${rect.top - rootRect.top + verticalGap}px`;
+        overlay.style.width = `${rect.width + horizontalInset * 2}px`;
+        overlay.style.height = `${Math.max(2, rect.height - verticalGap * 2)}px`;
+        overlay.dataset.positioned = "true";
+      });
+    };
+    const schedule = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(updateOverlays);
+    };
+    schedule();
+    const resizeObserver = new ResizeObserver(schedule);
+    resizeObserver.observe(root);
+    resizeObserver.observe(editorRoot);
+    const mutationObserver = new MutationObserver(schedule);
+    mutationObserver.observe(editorRoot, { subtree: true, childList: true });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      resizeObserver.disconnect();
+      mutationObserver.disconnect();
+    };
+  }, [currentPageId, selectedBlockIds]);
+
+  useLayoutEffect(() => {
+    const root = editorContextRef.current;
     if (!root) return;
     const editorRoot = root.querySelector<HTMLElement>(".bn-editor");
     const scrollArea = editorStageRef.current;
     let frame = 0;
 
     const updatePosition = () => {
-      const rects = selectedBlockIds
+      const positionIds = selectedBlockIds.length > 1
+        ? [selectedBlockIds[0], selectedBlockIds[selectedBlockIds.length - 1]]
+        : selectedBlockIds;
+      const rects = positionIds
         .map((blockId) => {
-          const overlay = blockSelectionOverlayRefs.current.get(blockId);
           const element = root.querySelector<HTMLElement>(
             `[data-node-type='blockContainer'][data-id="${CSS.escape(blockId)}"]`,
           );
-          if (!element || !overlay) {
-            overlay?.removeAttribute("data-positioned");
-            return null;
-          }
+          if (!element) return null;
           const rect = element.getBoundingClientRect();
-          if (rect.width <= 0 || rect.height <= 0) {
-            overlay.removeAttribute("data-positioned");
-            return null;
-          }
-          const selectionGap = Math.min(1, rect.height / 4);
+          if (rect.width <= 0 || rect.height <= 0) return null;
           const selectionHorizontalInset = currentPageId === ROOT_PAGE_ID ? 0 : 7;
-          const selectionRect = {
+          return {
             left: rect.left - selectionHorizontalInset,
-            top: rect.top + selectionGap,
+            top: rect.top,
             width: rect.width + selectionHorizontalInset * 2,
-            height: Math.max(2, rect.height - selectionGap * 2),
+            height: rect.height,
           };
-          overlay.style.left = `${selectionRect.left}px`;
-          overlay.style.top = `${selectionRect.top}px`;
-          overlay.style.width = `${selectionRect.width}px`;
-          overlay.style.height = `${selectionRect.height}px`;
-          overlay.dataset.positioned = "true";
-          return selectionRect;
         })
         .filter((rect): rect is BlockSelectionMarquee => Boolean(rect));
 
@@ -5131,7 +5775,16 @@ function App() {
       scrollArea?.removeEventListener("scroll", updatePosition);
       window.removeEventListener("resize", schedulePosition);
     };
-  }, [authUser?.id, blockComments, currentPageId, realtimeParticipants, selectedBlockIds]);
+  }, [
+    authUser?.id,
+    blockComments,
+    currentPageId,
+    realtimeParticipants,
+    selectedBlockIds,
+    isBlockSelectionMode,
+    isBlockDragging,
+    blockSelectionMarquee === null,
+  ]);
 
   useLayoutEffect(() => {
     const menuState = blockSelectionActionMenu;
@@ -6196,7 +6849,7 @@ function App() {
         </div>
       </aside>
 
-      <main className="main-area">
+      <main className="main-area" onPasteCapture={handleWorkspacePasteCapture}>
         <header className="topbar">
           <div className="topbar-left">
             {!sidebarOpen && !publicPageId && (
@@ -6507,6 +7160,7 @@ function App() {
               onPointerUpCapture={finishEditorPointerInteraction}
               onPointerCancelCapture={finishEditorPointerInteraction}
               onKeyDownCapture={handleEditorKeyDown}
+              onCopyCapture={handleEditorCopy}
               onCutCapture={handleEditorCut}
               onInputCapture={dismissStarterDockForCurrentPage}
             >
@@ -6639,12 +7293,21 @@ function App() {
                   </button>
                   <button
                     type="button"
+                    aria-label="선택한 블록 복사"
+                    title="복사 (⌘/Ctrl+C)"
+                    onPointerDown={(event) => runSelectionToolbarPointerAction(event, copySelectedBlocks)}
+                    onClick={(event) => runSelectionToolbarKeyboardAction(event, copySelectedBlocks)}
+                  >
+                    <Copy size={15} />
+                  </button>
+                  <button
+                    type="button"
                     aria-label="선택한 블록 복제"
                     title="복제 (⌘/Ctrl+D)"
                     onPointerDown={(event) => runSelectionToolbarPointerAction(event, () => duplicateBlocks(liveSelectedBlockIds))}
                     onClick={(event) => runSelectionToolbarKeyboardAction(event, () => duplicateBlocks(liveSelectedBlockIds))}
                   >
-                    <Copy size={15} />
+                    <CopyPlus size={15} />
                   </button>
                   <button
                     className="is-danger"
@@ -6719,9 +7382,10 @@ function App() {
                 </div>
               )}
               <InlineDatabaseSyncProvider
-                enabled={isAuthenticated}
+                enabled={isAuthenticated && !publicPageId}
                 pageId={isHomePage ? null : currentPageId}
                 readOnly={!canEditCurrentPage}
+                initialStates={publicPageId ? publicDatabaseStates : undefined}
                 collaborative={!isHomePage && (
                   (currentPage.permission ?? "owner") !== "owner"
                   || (pageShares[currentPageId]?.members.length ?? 0) > 0

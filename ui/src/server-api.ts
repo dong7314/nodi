@@ -117,6 +117,12 @@ export type ServerInlineDatabase<TState = Record<string, unknown>> = {
   updatedAt: string;
 };
 
+export type ServerPublicPage = {
+  page: ServerPage;
+  databases: ServerInlineDatabase[];
+  childPages: Array<{ id: string; title: string }>;
+};
+
 export type ServerPreferences<TPreferences = Record<string, unknown>> = {
   preferences: TPreferences;
   revision: number;
@@ -163,7 +169,7 @@ export const authApi = {
 };
 
 export const workspaceApi = {
-  getPublicPage: (pageId: string) => apiRequest<ServerPage>(`/public/pages/${encodeURIComponent(pageId)}`),
+  getPublicPage: (pageId: string) => apiRequest<ServerPublicPage>(`/public/pages/${encodeURIComponent(pageId)}`),
   listPages: (includeArchived = true, includeBlocks = false) => apiRequest<ServerPage[]>(`/pages?includeArchived=${includeArchived}&includeBlocks=${includeBlocks}&limit=500`),
   getPage: (pageId: string) => apiRequest<ServerPage>(`/pages/${encodeURIComponent(pageId)}`),
   pageRealtimeURL: (pageId: string) => apiWebSocketURL(`/pages/${encodeURIComponent(pageId)}/realtime`),
