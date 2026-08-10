@@ -1,0 +1,181 @@
+name: Nodi CI/CD
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - api/**
+      - ui/**
+      - .github/workflows/ci-cd.yaml
+  workflow_dispatch:
+
+concurrency:
+  group: nodi-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  detect-changes:
+    runs-on: self-hosted
+    outputs:
+      backend: ${{ steps.changes.outputs.backend }}
+      frontend: ${{ steps.changes.outputs.frontend }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed applications
+        id: changes
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          backend=false
+          frontend=false
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            # 수동 실행은 배포 상태를 완전히 맞출 수 있도록 두 이미지를 모두 갱신한다.
+            backend=true
+            frontend=true
+          elif [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" =~ ^0+$ ]] || ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            # 최초 실행처럼 비교 기준이 없는 push도 안전하게 전체 빌드한다.
+            backend=true
+            frontend=true
+          else
+            changed_files="$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA")"
+            printf '%s\n' "$changed_files"
+
+            if grep -qE '^api/' <<<"$changed_files"; then
+              backend=true
+            fi
+            if grep -qE '^ui/' <<<"$changed_files"; then
+              frontend=true
+            fi
+            if grep -qE '^\.github/workflows/ci-cd\.yaml$' <<<"$changed_files"; then
+              # 파이프라인 자체 변경은 두 이미지 빌드 경로를 함께 검증한다.
+              backend=true
+              frontend=true
+            fi
+          fi
+
+          echo "backend=$backend" >> "$GITHUB_OUTPUT"
+          echo "frontend=$frontend" >> "$GITHUB_OUTPUT"
+          echo "Backend changed: $backend"
+          echo "Frontend changed: $frontend"
+
+  build-and-deploy:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend == 'true' || needs.detect-changes.outputs.frontend == 'true'
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.HARBOR_REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Build and push backend image
+        if: needs.detect-changes.outputs.backend == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./api
+          file: ./api/Dockerfile
+          push: true
+          tags: ${{ secrets.HARBOR_REGISTRY }}/nodi/backend:${{ github.sha }}
+
+      - name: Build and push frontend image
+        if: needs.detect-changes.outputs.frontend == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./ui
+          file: ./ui/Dockerfile
+          push: true
+          tags: ${{ secrets.HARBOR_REGISTRY }}/nodi/frontend:${{ github.sha }}
+
+      - name: Checkout infra-manifests repository
+        uses: actions/checkout@v4
+        with:
+          repository: dong7314/infra-manifests
+          token: ${{ secrets.GH_TOKEN }}
+          path: infra
+
+      - name: Update changed deployment images
+        shell: bash
+        env:
+          BACKEND_CHANGED: ${{ needs.detect-changes.outputs.backend }}
+          FRONTEND_CHANGED: ${{ needs.detect-changes.outputs.frontend }}
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$BACKEND_CHANGED" == "true" ]]; then
+            file="infra/backend/nodi/deployment.yaml"
+            image="$HARBOR_REGISTRY/nodi/backend:$IMAGE_TAG"
+            test -f "$file"
+            grep -qE 'image:[[:space:]]+[^[:space:]]*/nodi/backend:' "$file"
+            sed -i -E "s|^([[:space:]]*image:[[:space:]]*)[^[:space:]]*/nodi/backend:[^[:space:]]+|\\1$image|" "$file"
+            grep -nE 'image:[[:space:]]+[^[:space:]]*/nodi/backend:' "$file"
+          fi
+
+          if [[ "$FRONTEND_CHANGED" == "true" ]]; then
+            file="infra/frontend/nodi/deployment.yaml"
+            image="$HARBOR_REGISTRY/nodi/frontend:$IMAGE_TAG"
+            test -f "$file"
+            grep -qE 'image:[[:space:]]+[^[:space:]]*/nodi/frontend:' "$file"
+            sed -i -E "s|^([[:space:]]*image:[[:space:]]*)[^[:space:]]*/nodi/frontend:[^[:space:]]+|\\1$image|" "$file"
+            grep -nE 'image:[[:space:]]+[^[:space:]]*/nodi/frontend:' "$file"
+          fi
+
+      - name: Commit and push deployment manifests
+        shell: bash
+        env:
+          BACKEND_CHANGED: ${{ needs.detect-changes.outputs.backend }}
+          FRONTEND_CHANGED: ${{ needs.detect-changes.outputs.frontend }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd infra
+
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          components=()
+          if [[ "$BACKEND_CHANGED" == "true" ]]; then
+            git add backend/nodi/deployment.yaml
+            components+=(backend)
+          fi
+          if [[ "$FRONTEND_CHANGED" == "true" ]]; then
+            git add frontend/nodi/deployment.yaml
+            components+=(frontend)
+          fi
+
+          if git diff --cached --quiet; then
+            echo "No deployment manifest changes to commit."
+            exit 0
+          fi
+
+          component_names="$(IFS=,; echo "${components[*]}")"
+          git commit -m "[deploy]: nodi ${component_names} ${IMAGE_TAG}"
+          git push
+
+      - name: Docker cleanup
+        if: always()
+        run: |
+          docker image prune -af
+          docker builder prune -af
