@@ -737,15 +737,6 @@ function pasteClipboardBlocks(
   return true;
 }
 
-function plainTextWithLineBreaksToHTML(value: string) {
-  const escape = (text: string) => text
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-  return `<p>${value.split(/\r?\n/).map(escape).join("<br>")}</p>`;
-}
-
 function clipboardHTMLWithLineBreaksToText(value: string) {
   if (!value) return "";
   const parsed = new DOMParser().parseFromString(value, "text/html");
@@ -908,6 +899,28 @@ function pasteFencedCodeClipboard(
   if (!plainText) return false;
   const codeBlock = parseFencedCodeClipboard(plainText);
   return codeBlock ? pasteClipboardBlocks(activeEditor, [codeBlock]) : false;
+}
+
+function pasteStructuredMarkdownClipboard(
+  activeEditor: BlockNoteEditor<any, any, any>,
+  clipboardData: DataTransfer | null,
+) {
+  const plainText = clipboardData?.getData("text/plain");
+  if (!plainText) return false;
+
+  const markdown = plainText.replace(/\r\n?/g, "\n");
+  const hasBlockSyntax = [
+    /(?:^|\n) {0,3}#{1,6}[ \t]+\S/,
+    /(?:^|\n) {0,3}(?:`{3,}|~{3,})[^\n]*\n/,
+    /(?:^|\n)[ \t]{0,5}(?:[-+*]|\d+\.)[ \t]+\S/,
+    /(?:^|\n) {0,3}>[ \t]+\S/,
+    /(?:^|\n) {0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*(?:\n|$)/,
+    /(?:^|\n)[ \t]*\|[^\n]+\|[ \t]*\n[ \t]*\|?[ :|-]+\|/,
+  ].some((pattern) => pattern.test(markdown));
+  if (!hasBlockSyntax) return false;
+
+  activeEditor.pasteMarkdown(markdown);
+  return true;
 }
 
 let closeActiveCodeLanguageMenu: (() => void) | null = null;
@@ -1649,7 +1662,6 @@ function App() {
     dictionary: NODI_DICTIONARY,
     pasteHandler: ({ event, editor: activeEditor, defaultPasteHandler }) => {
       const plainText = event.clipboardData?.getData("text/plain") ?? "";
-      const hasBlockNotePayload = event.clipboardData?.types.includes("blocknote/html") ?? false;
       const hasFiles = event.clipboardData?.files.length;
       const isCodeBlock = activeEditor.transact((transaction) => (
         transaction.selection.$from.parent.type.spec.code === true
@@ -1669,8 +1681,7 @@ function App() {
       if (!hasFiles && !isCodeBlock && pasteFencedCodeClipboard(activeEditor, event.clipboardData)) {
         return true;
       }
-      if (!hasFiles && !hasBlockNotePayload && !isCodeBlock && /\r?\n/.test(plainText)) {
-        activeEditor.pasteHTML(plainTextWithLineBreaksToHTML(plainText));
+      if (!hasFiles && !isCodeBlock && pasteStructuredMarkdownClipboard(activeEditor, event.clipboardData)) {
         return true;
       }
       return defaultPasteHandler();
