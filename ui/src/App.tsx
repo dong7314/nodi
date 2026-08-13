@@ -698,6 +698,15 @@ function pasteNodiClipboardBlocks(
   const blocks = parseNodiClipboardBlocks(clipboardData);
   if (!blocks) return false;
 
+  return pasteClipboardBlocks(activeEditor, blocks);
+}
+
+function pasteClipboardBlocks(
+  activeEditor: BlockNoteEditor<any, any, any>,
+  blocks: PartialBlock[],
+) {
+  if (blocks.length === 0) return false;
+
   let targetBlock = activeEditor.document.at(-1);
   try {
     targetBlock = activeEditor.getTextCursorPosition().block;
@@ -861,6 +870,46 @@ const CODE_BLOCK_LANGUAGE_OPTIONS = Object.entries(CODE_BLOCK_LANGUAGES).map(([v
   value,
   label: language.name,
 }));
+
+function resolveCodeBlockLanguage(info: string) {
+  const requested = info.trim().toLocaleLowerCase().replace(/^language-/, "");
+  if (!requested) return "text";
+  for (const [languageId, language] of Object.entries(CODE_BLOCK_LANGUAGES)) {
+    if (languageId.toLocaleLowerCase() === requested) return languageId;
+    if (language.aliases?.some((alias) => alias.toLocaleLowerCase() === requested)) return languageId;
+  }
+  return "text";
+}
+
+function parseFencedCodeClipboard(value: string): PartialBlock | null {
+  const normalized = value.replace(/\r\n?/g, "\n");
+  const lines = normalized.split("\n");
+  while (lines.length > 0 && lines[0].trim() === "") lines.shift();
+  while (lines.length > 0 && lines.at(-1)?.trim() === "") lines.pop();
+  if (lines.length < 2) return null;
+
+  const opening = lines[0].match(/^ {0,3}(`{3,}|~{3,})(?:[ \t]*([^\s`~]+))?[ \t]*$/);
+  const closing = lines.at(-1)?.match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
+  if (!opening || !closing) return null;
+  if (opening[1][0] !== closing[1][0] || closing[1].length < opening[1].length) return null;
+
+  return {
+    type: "codeBlock",
+    props: { language: resolveCodeBlockLanguage(opening[2] ?? "") },
+    content: lines.slice(1, -1).join("\n"),
+  } as PartialBlock;
+}
+
+function pasteFencedCodeClipboard(
+  activeEditor: BlockNoteEditor<any, any, any>,
+  clipboardData: DataTransfer | null,
+) {
+  const plainText = clipboardData?.getData("text/plain");
+  if (!plainText) return false;
+  const codeBlock = parseFencedCodeClipboard(plainText);
+  return codeBlock ? pasteClipboardBlocks(activeEditor, [codeBlock]) : false;
+}
+
 let closeActiveCodeLanguageMenu: (() => void) | null = null;
 
 async function writeClipboardText(value: string) {
@@ -1615,6 +1664,9 @@ function App() {
         return true;
       }
       if (!hasFiles && !isCodeBlock && pasteNodiClipboardBlocks(activeEditor, event.clipboardData)) {
+        return true;
+      }
+      if (!hasFiles && !isCodeBlock && pasteFencedCodeClipboard(activeEditor, event.clipboardData)) {
         return true;
       }
       if (!hasFiles && !hasBlockNotePayload && !isCodeBlock && /\r?\n/.test(plainText)) {
