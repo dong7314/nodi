@@ -29,6 +29,7 @@ type PageSharePanelProps = {
   isPublic: boolean;
   members: PageShareMember[];
   registeredUsers: NodiUser[];
+  onSearchUsers: (query: string) => Promise<NodiUser[]>;
   onPublicChange: (isPublic: boolean) => void;
   onShare: (userId: string, permission: SharePermission) => void;
   onPermissionChange: (userId: string, permission: SharePermission) => void;
@@ -43,6 +44,7 @@ export function PageSharePanel({
   isPublic,
   members,
   registeredUsers,
+  onSearchUsers,
   onPublicChange,
   onShare,
   onPermissionChange,
@@ -54,20 +56,53 @@ export function PageSharePanel({
   const inviteRef = useRef<HTMLDivElement>(null);
   const sharedMemberListRef = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState("");
+  const [serverSearchUsers, setServerSearchUsers] = useState<NodiUser[]>([]);
+  const [searchingUsers, setSearchingUsers] = useState(false);
   const [permission, setPermission] = useState<SharePermission>("edit");
   const [openPermissionSelect, setOpenPermissionSelect] = useState<string | null>(null);
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const memberIds = useMemo(() => new Set(members.map((member) => member.userId)), [members]);
   const matchedUsers = useMemo(() => {
     if (!normalizedQuery) return [];
-    return registeredUsers
+    const candidates = [...serverSearchUsers, ...registeredUsers].filter((user, index, users) => (
+      users.findIndex((candidate) => candidate.id === user.id) === index
+    ));
+    return candidates
       .filter((user) => !memberIds.has(user.id))
       .filter((user) => (
         user.name.toLocaleLowerCase().includes(normalizedQuery)
         || user.email.toLocaleLowerCase().includes(normalizedQuery)
       ))
       .slice(0, 5);
-  }, [memberIds, normalizedQuery, registeredUsers]);
+  }, [memberIds, normalizedQuery, registeredUsers, serverSearchUsers]);
+
+  useEffect(() => {
+    if (!normalizedQuery) {
+      setServerSearchUsers([]);
+      setSearchingUsers(false);
+      return;
+    }
+
+    let active = true;
+    setSearchingUsers(true);
+    const timer = window.setTimeout(() => {
+      void onSearchUsers(normalizedQuery)
+        .then((users) => {
+          if (active) setServerSearchUsers(users);
+        })
+        .catch(() => {
+          if (active) setServerSearchUsers([]);
+        })
+        .finally(() => {
+          if (active) setSearchingUsers(false);
+        });
+    }, 180);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [normalizedQuery, onSearchUsers]);
 
   useEffect(() => {
     const closeOnOutsidePointer = (event: PointerEvent) => {
@@ -187,7 +222,7 @@ export function PageSharePanel({
                     <UserPlus size={15} />
                   </button>
                 )) : (
-                  <p>일치하는 Nodi 회원이 없어요.</p>
+                  <p>{searchingUsers ? "Nodi 회원을 검색하고 있어요." : "일치하는 Nodi 회원이 없어요."}</p>
                 )}
               </div>
             )}

@@ -6172,6 +6172,14 @@ function App() {
       )) === index
     ));
   }, [authUser, registrationDirectoryRevision, serverDirectoryUsers]);
+  const searchRegisteredNodiUsers = useCallback(async (query: string) => {
+    if (!authUser) return [];
+    const users = await authApi.searchUsers(query);
+    return users.map((user) => ({
+      ...user,
+      avatarColor: user.avatarColor as NodiAvatarColor,
+    }));
+  }, [authUser?.id]);
   const currentPageShare = pageShares[currentPageId];
   const isCurrentPageOwner = !currentPageShare || currentPageShare.ownerId === currentNodiUser.id;
   const isInvitedNodiMember = Boolean(currentPageShare?.members.some((member) => (
@@ -7578,6 +7586,7 @@ function App() {
             isPublic={pageSettings.publicAccess}
             members={pageShares[currentPageId]?.members ?? []}
             registeredUsers={registeredNodiUsers}
+            onSearchUsers={searchRegisteredNodiUsers}
             onPublicChange={(publicAccess) => setPageSettings({ ...pageSettings, publicAccess })}
             onShare={(userId, permission) => sharePageWithMember(currentPageId, userId, permission)}
             onPermissionChange={(userId, permission) => updatePageSharePermission(currentPageId, userId, permission)}

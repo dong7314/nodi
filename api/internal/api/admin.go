@@ -18,7 +18,7 @@ func (s *Server) searchUsersHandler(w http.ResponseWriter, r *http.Request) {
 		FROM users
 		WHERE status='approved' AND id<>$1
 		  AND ($2='' OR name ILIKE '%'||$2||'%' OR email ILIKE '%'||$2||'%')
-		ORDER BY name,email LIMIT $3
+		ORDER BY CASE WHEN role='admin' THEN 0 ELSE 1 END,name,email LIMIT $3
 	`, current.ID, query, limit)
 	if err != nil {
 		handleError(w, err)
