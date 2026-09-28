@@ -182,6 +182,10 @@ type NodiPreferences = {
   [key: string]: unknown;
 };
 type WorkspaceSection = "pages" | "shared" | "shared-page" | "trash";
+type PageNavigationOptions = {
+  skipCurrentPageSave?: boolean;
+  historyMode?: "push" | "replace" | "none";
+};
 type InboxNotification = {
   id: string;
   kind: "share" | "comment" | "mention";
@@ -1814,6 +1818,7 @@ function App() {
   } | null>(null);
   const sidebarSuppressClickRef = useRef(false);
   const currentPageIdRef = useRef(initialPageId);
+  const openPageRef = useRef<(pageId: string, options?: PageNavigationOptions) => void>(() => undefined);
   const loadingPageRef = useRef(false);
   const blockSelectionModeRef = useRef(false);
   const blockSelectionAnchorRef = useRef<string | null>(null);
@@ -2729,7 +2734,7 @@ function App() {
     updatePage(currentPageIdRef.current, { archived: isArchived });
   }, [isArchived, currentPageId]);
 
-  const openPage = (pageId: string, options: { skipCurrentPageSave?: boolean } = {}) => {
+  const openPage = (pageId: string, options: PageNavigationOptions = {}) => {
     setStarterDockPageId(null);
     setSelectedStarterPreset(null);
     const isCurrentPage = pageId === currentPageIdRef.current;
@@ -2758,12 +2763,19 @@ function App() {
     }
 
     loadingPageRef.current = true;
-    if (!publicPageId) {
+    const historyMode = options.historyMode ?? "push";
+    if (!publicPageId && historyMode !== "none") {
       const url = new URL(window.location.href);
       url.searchParams.delete("publicPage");
       if (pageId === ROOT_PAGE_ID) url.searchParams.delete("page");
       else url.searchParams.set("page", pageId);
-      window.history.replaceState(null, "", url);
+      const previousState = window.history.state;
+      const nextState = {
+        ...(previousState && typeof previousState === "object" ? previousState : {}),
+        nodiPageId: pageId,
+      };
+      if (historyMode === "replace") window.history.replaceState(nextState, "", url);
+      else window.history.pushState(nextState, "", url);
     }
     currentPageIdRef.current = pageId;
     setWorkspaceSection(targetSection);
@@ -2793,6 +2805,36 @@ function App() {
       titleInputRef.current?.focus();
     });
   };
+  openPageRef.current = openPage;
+
+  useEffect(() => {
+    if (publicPageId) return;
+
+    const currentState = window.history.state;
+    window.history.replaceState({
+      ...(currentState && typeof currentState === "object" ? currentState : {}),
+      nodiPageId: currentPageIdRef.current,
+    }, "", window.location.href);
+
+    const handleHistoryNavigation = () => {
+      const requestedPageId = new URLSearchParams(window.location.search).get("page") ?? ROOT_PAGE_ID;
+      if (requestedPageId === currentPageIdRef.current) return;
+
+      if (!pagesRef.current[requestedPageId]) {
+        const currentUrl = new URL(window.location.href);
+        if (currentPageIdRef.current === ROOT_PAGE_ID) currentUrl.searchParams.delete("page");
+        else currentUrl.searchParams.set("page", currentPageIdRef.current);
+        window.history.replaceState({ nodiPageId: currentPageIdRef.current }, "", currentUrl);
+        setNotice("이동하려는 페이지를 찾을 수 없어요");
+        return;
+      }
+
+      openPageRef.current(requestedPageId, { historyMode: "none" });
+    };
+
+    window.addEventListener("popstate", handleHistoryNavigation);
+    return () => window.removeEventListener("popstate", handleHistoryNavigation);
+  }, [publicPageId]);
 
   useEffect(() => {
     if (!authUser || publicPageId) return;
@@ -4470,7 +4512,10 @@ function App() {
     // mounted editor once more while navigating would write the stale
     // `isArchived === false` view state back and make the deleted page reappear
     // in the sidebar.
-    if (currentPageWasDeleted) openPage(fallbackPageId, { skipCurrentPageSave: true });
+    if (currentPageWasDeleted) openPage(fallbackPageId, {
+      skipCurrentPageSave: true,
+      historyMode: "replace",
+    });
     setNotice(pageIdsToDelete.size > 1 ? `${pageIdsToDelete.size}개 페이지를 휴지통으로 옮겼어요` : "페이지를 휴지통으로 옮겼어요");
   };
 
