@@ -23,9 +23,11 @@ export function mergeDatabase(base: DatabaseState, local: DatabaseState, remote:
     const values = (value: DatabaseState) => Object.fromEntries([...value.records, ...value.trash].map((row) => [row.id, row.values[propertyId]]));
     return !equal(values(base), values(state));
   };
+  const localProperties = new Map(local.properties.map((property) => [property.id, property]));
+  const remoteProperties = new Map(remote.properties.map((property) => [property.id, property]));
   const schemaCollision = base.properties.some((property) => {
-    const lp = local.properties.find((p) => p.id === property.id);
-    const rp = remote.properties.find((p) => p.id === property.id);
+    const lp = localProperties.get(property.id);
+    const rp = remoteProperties.get(property.id);
     return !equal(lp, rp) && ((!lp || lp.type !== property.type) && changedCells(remote, property.id)
       || (!rp || rp.type !== property.type) && changedCells(local, property.id));
   });
@@ -52,8 +54,9 @@ export function mergeDatabase(base: DatabaseState, local: DatabaseState, remote:
       const lm = new Map(l.map((v) => [v.id, v]));
       const rm = new Map(r.map((v) => [v.id, v]));
       const baseOrder = b.map((v) => v.id).filter((id) => lm.has(id) && rm.has(id));
-      const localOrder = l.map((v) => v.id).filter((id) => baseOrder.includes(id));
-      const remoteOrder = r.map((v) => v.id).filter((id) => baseOrder.includes(id));
+      const baseIds = new Set(baseOrder);
+      const localOrder = l.map((v) => v.id).filter((id) => baseIds.has(id));
+      const remoteOrder = r.map((v) => v.id).filter((id) => baseIds.has(id));
       let order = r.map((v) => v.id);
       if (!equal(localOrder, baseOrder)) {
         if (!equal(remoteOrder, baseOrder) && !equal(localOrder, remoteOrder)) {
@@ -80,23 +83,41 @@ export function mergeDatabase(base: DatabaseState, local: DatabaseState, remote:
   });
   const b = normalize(base), l = normalize(local), r = normalize(remote);
   const baseRows = new Map(b.rows.map((row) => [row.id, row]));
-  for (const row of [...l.rows]) {
+  const remoteRows = new Map(r.rows.map((row, index) => [row.id, { row, index }]));
+  const resolvedRows = new Map<string, typeof l.rows[number]>();
+  const localPositions = new Map<number, typeof l.rows[number]>();
+  const remotePositions = new Map<number, typeof l.rows[number]>();
+  for (const [index, row] of l.rows.entries()) {
     const original = baseRows.get(row.id);
-    const other = r.rows.find((value) => value.id === row.id);
+    const remoteRow = remoteRows.get(row.id);
+    const other = remoteRow?.row;
     if (original && other && row.location !== other.location
       && !equal(row, original) && !equal(other, original)) {
-      const resolved = conflict(original as unknown as Json, row as unknown as Json, other as unknown as Json, ["rows", row.id]);
+      const resolved = conflict(original as unknown as Json, row as unknown as Json, other as unknown as Json, ["rows", row.id]) as typeof row;
+      resolvedRows.set(row.id, resolved);
       // Preserve the chosen row's position without undoing unrelated reorders.
-      const source = equal(resolved, other) ? r.rows : l.rows;
-      const target = equal(resolved, other) ? l.rows : r.rows;
-      const position = source.findIndex((value) => value.id === row.id);
-      target.splice(target.findIndex((value) => value.id === row.id), 1);
-      target.splice(position, 0, resolved as typeof row);
-      // The ordinary merge should see the already resolved whole row.
-      l.rows = l.rows.map((value) => value.id === row.id ? resolved as typeof row : value);
-      r.rows = r.rows.map((value) => value.id === row.id ? resolved as typeof row : value);
+      if (resolved === other) localPositions.set(remoteRow!.index, resolved);
+      else remotePositions.set(index, resolved);
     }
   }
+  // Apply the resolutions in one pass. Repeated find/splice/map here made large
+  // tables quadratic even when only two independent cells had changed.
+  const applyResolvedRows = (rows: typeof l.rows, positions: typeof localPositions) => {
+    if (resolvedRows.size === 0) return rows;
+    const movedIds = new Set([...positions.values()].map((row) => row.id));
+    const remaining = rows.filter((row) => !movedIds.has(row.id));
+    const result: typeof rows = [];
+    let next = 0;
+    let length = rows.length;
+    for (const index of positions.keys()) length = Math.max(length, index + 1);
+    for (let index = 0; index < length; index += 1) {
+      const row = positions.get(index) ?? remaining[next++];
+      if (row) result.push(resolvedRows.get(row.id) ?? row);
+    }
+    return result;
+  };
+  l.rows = applyResolvedRows(l.rows, localPositions);
+  r.rows = applyResolvedRows(r.rows, remotePositions);
   const merged = merge(b as unknown as Json, l as unknown as Json, r as unknown as Json, []) as unknown as ReturnType<typeof normalize>;
   const { rows, ...rest } = merged;
   const state: DatabaseState = {

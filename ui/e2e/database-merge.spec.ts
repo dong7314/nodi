@@ -60,3 +60,53 @@ test("server JSON key ordering alone is not a change or conflict", () => {
   expect(result.conflicts).toEqual([]);
   expect(result.state.records[0].values.p).toBe("CHANGED");
 });
+
+test("resolving many archived rows retains each chosen location and unrelated row order", () => {
+  const local = structuredClone(base), remote = structuredClone(base);
+  local.records = [local.records[2]];
+  local.trash = [base.records[0], base.records[1]];
+  remote.records[0].values.p = "REMOTE A";
+  remote.records[1].values.p = "REMOTE B";
+  const result = mergeDatabase(base, local, remote);
+  expect(result.conflicts.filter((item) => item.path.length === 2)).toHaveLength(2);
+  const resolved = mergeDatabase(base, local, remote, {
+    [JSON.stringify(["rows", "a"])]: "remote",
+    [JSON.stringify(["rows", "b"])]: "local",
+  });
+  expect(resolved.conflicts).toEqual([]);
+  expect(resolved.state.records.map((row) => row.id)).toEqual(["a", "c"]);
+  expect(resolved.state.records[0].values.p).toBe("REMOTE A");
+  expect(resolved.state.trash.map((row) => row.id)).toEqual(["b"]);
+});
+
+test("large independent edits do not repeatedly scan every other row", () => {
+  const count = 6000;
+  let idReads = 0;
+  const makeRows = () => Array.from({ length: count }, (_, index) => ({
+    get id() { idReads++; return `row-${index}`; }, values: { p: `VALUE ${index}` },
+  }));
+  const snapshot = { ...base, records: makeRows() };
+  const local = { ...base, records: makeRows() };
+  const remote = { ...base, records: makeRows() };
+  local.records[0].values.p = "LOCAL";
+  remote.records[count - 1].values.p = "REMOTE";
+  const result = mergeDatabase(snapshot, local, remote);
+  expect(result.conflicts).toEqual([]);
+  expect(result.state.records[0].values.p).toBe("LOCAL");
+  expect(result.state.records[count - 1].values.p).toBe("REMOTE");
+  // Count input traversals, not wall time: this stays stable on slower CI hosts.
+  expect(idReads).toBeLessThan(count * 100);
+});
+
+test("bulk archive conflicts resolve without duplicating or dropping rows", () => {
+  const rows = Array.from({ length: 4000 }, (_, index) => ({ id: `row-${index}`, values: { p: `VALUE ${index}` } }));
+  const snapshot = { ...base, records: rows };
+  const local = { ...base, records: [], trash: structuredClone(rows) };
+  const remote = { ...base, records: rows.map((row) => ({ ...row, values: { p: `REMOTE ${row.id}` } })) };
+  const choices = Object.fromEntries(rows.map((row, index) => [JSON.stringify(["rows", row.id]), index % 2 ? "local" as const : "remote" as const]));
+  const result = mergeDatabase(snapshot, local, remote, choices);
+  expect(result.conflicts).toEqual([]);
+  expect(result.state.records.map((row) => row.id)).toEqual(rows.filter((_, index) => index % 2 === 0).map((row) => row.id));
+  expect(result.state.trash.map((row) => row.id)).toEqual(rows.filter((_, index) => index % 2 === 1).map((row) => row.id));
+  expect(new Set([...result.state.records, ...result.state.trash].map((row) => row.id)).size).toBe(rows.length);
+});
