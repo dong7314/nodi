@@ -1,3 +1,4 @@
+import { activateWorkspaceCache, backupWorkspaceCache } from "./workspace-cache";
 import { NodiApiError } from "./api-client";
 import { authApi } from "./server-api";
 
@@ -9,8 +10,44 @@ const LOCAL_ACCOUNTS_STORAGE_KEY = "nodi:auth:accounts";
 const LOCAL_AUTH_SESSION_STORAGE_KEY = "nodi:auth:session";
 const LOCAL_AUTH_INITIALIZED_STORAGE_KEY = "nodi:auth:initialized";
 const LOCAL_AUTH_LAST_EMAIL_STORAGE_KEY = "nodi:auth:last-email";
+const LOCAL_AUTH_SIGNED_OUT_STORAGE_KEY = "nodi:auth:signed-out";
 const LEGACY_USER_NAME_STORAGE_KEY = "nodi:user:name";
 const LEGACY_USER_PROFILE_STORAGE_KEY = "nodi:user:profile";
+const AUTH_TRANSITION_KEYS = [
+  LOCAL_ACCOUNTS_STORAGE_KEY, LOCAL_AUTH_SESSION_STORAGE_KEY,
+  LOCAL_AUTH_INITIALIZED_STORAGE_KEY, LOCAL_AUTH_LAST_EMAIL_STORAGE_KEY,
+  LOCAL_AUTH_SIGNED_OUT_STORAGE_KEY, LEGACY_USER_NAME_STORAGE_KEY,
+  LEGACY_USER_PROFILE_STORAGE_KEY, "nodi:auth:user",
+] as const;
+
+// In-flight authentication reads must not undo a newer login/logout intent.
+// Storage snapshots also detect transitions performed by another browser tab.
+let authGeneration = 0;
+type AuthRequestState = { generation: number; session: string | null; signedOut: string | null };
+
+function captureAuthState(): AuthRequestState {
+  return {
+    generation: authGeneration,
+    session: window.localStorage.getItem(LOCAL_AUTH_SESSION_STORAGE_KEY),
+    signedOut: window.localStorage.getItem(LOCAL_AUTH_SIGNED_OUT_STORAGE_KEY),
+  };
+}
+
+function isCurrentAuthState(state: AuthRequestState) {
+  const current = captureAuthState();
+  return state.generation === current.generation
+    && state.session === current.session
+    && state.signedOut === current.signedOut;
+}
+
+function beginAuthTransition() {
+  authGeneration += 1;
+  return captureAuthState();
+}
+
+function staleAuthResult(): LocalLoginResult {
+  return { ok: false, message: "인증 상태가 변경되었습니다. 다시 시도해 주세요." };
+}
 
 export type RegistrationRequestStatus = "pending" | "approved" | "rejected";
 export type LocalAccountRole = "admin" | "member";
@@ -87,21 +124,25 @@ export function persistRegistrationRequests(requests: RegistrationRequest[]) {
 
 export function bootstrapLocalAuth(): LocalAuthUser | null {
   const sessionUser = readLocalAuthUser();
-  if (sessionUser) {
-    syncLegacyProfile(sessionUser);
-    return sessionUser;
-  }
-
-  window.localStorage.setItem(LOCAL_AUTH_INITIALIZED_STORAGE_KEY, "true");
-  return null;
+  activateWorkspaceCache(sessionUser?.id ?? null, {
+    keys: AUTH_TRANSITION_KEYS,
+    write: () => {
+      if (sessionUser) syncLegacyProfile(sessionUser);
+      else window.localStorage.setItem(LOCAL_AUTH_INITIALIZED_STORAGE_KEY, "true");
+    },
+  });
+  return sessionUser;
 }
 
 export async function restoreServerAuth(): Promise<LocalAuthUser | null> {
+  if (window.localStorage.getItem(LOCAL_AUTH_SIGNED_OUT_STORAGE_KEY) === "true") return null;
+  const requestState = captureAuthState();
   const cachedUser = readLocalAuthUser();
+  let user: LocalAuthUser;
   try {
-    const user = await authApi.me();
-    return cacheServerSession(user);
+    user = await authApi.me();
   } catch (error) {
+    if (!isCurrentAuthState(requestState)) return readLocalAuthUser();
     if (error instanceof NodiApiError && error.status === 401) {
       clearCachedSession();
       return null;
@@ -112,6 +153,11 @@ export async function restoreServerAuth(): Promise<LocalAuthUser | null> {
     // until /auth/me explicitly answers with 401.
     return cachedUser;
   }
+  // Keep logout in control of its own completion/reload. A superseded read
+  // can report the current cache, but must never modify its session or marker.
+  if (!isCurrentAuthState(requestState)) return readLocalAuthUser();
+  // Cache transition failures are local failures, not temporary API failures.
+  return cacheServerSession(user, false);
 }
 
 export function readLocalAuthUser(): LocalAuthUser | null {
@@ -141,9 +187,11 @@ export function readApprovedLocalUsers(): LocalAuthUser[] {
 }
 
 export async function loginLocalAccount(email: string, password: string): Promise<LocalLoginResult> {
+  const requestState = beginAuthTransition();
   try {
     const { user } = await authApi.login(normalizeEmail(email), password);
-    return { ok: true, message: "로그인했습니다.", user: cacheServerSession(user) };
+    if (!isCurrentAuthState(requestState)) return staleAuthResult();
+    return { ok: true, message: "로그인했습니다.", user: cacheServerSession(user, true) };
   } catch (error) {
     return { ok: false, message: apiMessage(error, "이메일 또는 비밀번호가 일치하지 않습니다.") };
   }
@@ -166,14 +214,19 @@ export async function registerLocalAccount({
   if (!isValidEmail(normalizedEmail)) {
     return { ok: false, message: "올바른 이메일 주소를 입력해 주세요." };
   }
+  if (new TextEncoder().encode(password).length > 72) {
+    return { ok: false, message: "비밀번호는 UTF-8 기준 72바이트 이내로 입력해 주세요." };
+  }
   if (password.length < 8) {
     return { ok: false, message: "비밀번호를 8자 이상 입력해 주세요." };
   }
 
+  const requestState = beginAuthTransition();
   try {
     const result = await authApi.register(normalizedName, normalizedEmail, password);
-    window.localStorage.setItem(LOCAL_AUTH_LAST_EMAIL_STORAGE_KEY, normalizedEmail);
-    const user = result.user ? cacheServerSession(result.user) : undefined;
+    if (!isCurrentAuthState(requestState)) return staleAuthResult();
+    const user = result.user ? cacheServerSession(result.user, true) : undefined;
+    if (!result.user) window.localStorage.setItem(LOCAL_AUTH_LAST_EMAIL_STORAGE_KEY, normalizedEmail);
     return {
       ok: true,
       status: result.status,
@@ -188,17 +241,26 @@ export async function registerLocalAccount({
 }
 
 export async function logoutLocalAccount() {
+  backupWorkspaceCache();
+  window.localStorage.setItem(LOCAL_AUTH_SIGNED_OUT_STORAGE_KEY, "true");
+  const requestState = beginAuthTransition();
   try {
     await authApi.logout();
   } catch {
     // The local session must still be cleared when the remote session expired.
   }
-  clearCachedSession();
+  if (isCurrentAuthState(requestState)) clearCachedSession();
 }
 
 function clearCachedSession() {
-  window.localStorage.setItem(LOCAL_AUTH_INITIALIZED_STORAGE_KEY, "true");
-  window.localStorage.removeItem(LOCAL_AUTH_SESSION_STORAGE_KEY);
+  authGeneration += 1;
+  activateWorkspaceCache(null, {
+    keys: AUTH_TRANSITION_KEYS,
+    write: () => {
+      window.localStorage.setItem(LOCAL_AUTH_INITIALIZED_STORAGE_KEY, "true");
+      window.localStorage.removeItem(LOCAL_AUTH_SESSION_STORAGE_KEY);
+    },
+  });
   window.dispatchEvent(new CustomEvent(LOCAL_AUTH_CHANGED_EVENT));
 }
 
@@ -223,9 +285,12 @@ export async function updateLocalAccountProfile({
   avatarColor: LocalAvatarColor;
   avatarIcon?: string;
 }) {
+  const requestState = captureAuthState();
+  if (requestState.signedOut === "true") return staleAuthResult();
   try {
     const user = await authApi.updateProfile({ name, avatarColor, avatarIcon });
-    cacheServerSession(user);
+    if (!isCurrentAuthState(requestState)) return staleAuthResult();
+    cacheServerSession(user, false);
     return { ok: true, user };
   } catch (error) {
     return { ok: false, message: apiMessage(error, "프로필을 변경하지 못했습니다.") };
@@ -233,8 +298,12 @@ export async function updateLocalAccountProfile({
 }
 
 export async function changeLocalPassword(currentPassword: string, nextPassword: string) {
+  if (new TextEncoder().encode(nextPassword).length > 72) return { ok: false, message: "비밀번호는 UTF-8 기준 72바이트 이내로 입력해 주세요." };
+  const requestState = captureAuthState();
   try {
     await authApi.changePassword(currentPassword, nextPassword);
+    if (!isCurrentAuthState(requestState)) return staleAuthResult();
+    window.localStorage.setItem(LOCAL_AUTH_SIGNED_OUT_STORAGE_KEY, "true");
     clearCachedSession();
     return { ok: true, message: "비밀번호를 변경했습니다. 다시 로그인해 주세요." };
   } catch (error) {
@@ -242,7 +311,7 @@ export async function changeLocalPassword(currentPassword: string, nextPassword:
   }
 }
 
-function cacheServerSession(user: LocalAuthUser): LocalAuthUser {
+function cacheServerSession(user: LocalAuthUser, explicitSignIn: boolean): LocalAuthUser {
   const accounts = readLocalAccounts();
   const cached: LocalAccount = {
     ...user,
@@ -250,12 +319,19 @@ function cacheServerSession(user: LocalAuthUser): LocalAuthUser {
     password: null,
     createdAt: accounts.find((account) => account.id === user.id)?.createdAt || new Date().toISOString(),
   };
-  persistLocalAccounts([cached, ...accounts.filter((account) => account.id !== user.id && !account.id.startsWith("local:"))]);
-  return createSession(cached);
+  activateWorkspaceCache(user.id, {
+    keys: AUTH_TRANSITION_KEYS,
+    write: () => {
+      persistLocalAccounts([cached, ...accounts.filter((account) => account.id !== user.id && !account.id.startsWith("local:"))]);
+      createSession(cached, explicitSignIn);
+    },
+  });
+  window.dispatchEvent(new CustomEvent(LOCAL_AUTH_CHANGED_EVENT));
+  return toAuthUser(cached);
 }
 
 function apiMessage(error: unknown, fallback: string) {
-  return error instanceof NodiApiError ? error.message : fallback;
+  return error instanceof Error ? error.message : fallback;
 }
 
 function readLocalAccounts(): LocalAccount[] {
@@ -286,17 +362,27 @@ function persistLocalAccounts(accounts: LocalAccount[]) {
   window.localStorage.setItem(LOCAL_ACCOUNTS_STORAGE_KEY, JSON.stringify(accounts));
 }
 
-function createSession(account: LocalAccount): LocalAuthUser {
+function createSession(account: LocalAccount, explicitSignIn: boolean): LocalAuthUser {
   const user = toAuthUser(account);
-  const session: LocalAuthSession = {
-    userId: account.id,
-    signedInAt: new Date().toISOString(),
-  };
-  window.localStorage.setItem(LOCAL_AUTH_SESSION_STORAGE_KEY, JSON.stringify(session));
+  let previousUserId: unknown;
+  try {
+    previousUserId = JSON.parse(window.localStorage.getItem(LOCAL_AUTH_SESSION_STORAGE_KEY) ?? "null")?.userId;
+  } catch { /* Replace malformed legacy sessions after successful authentication. */ }
   window.localStorage.setItem(LOCAL_AUTH_LAST_EMAIL_STORAGE_KEY, account.email);
   window.localStorage.setItem(LOCAL_AUTH_INITIALIZED_STORAGE_KEY, "true");
   syncLegacyProfile(user);
-  window.dispatchEvent(new CustomEvent(LOCAL_AUTH_CHANGED_EVENT));
+  // Only a completed explicit sign-in can re-enable cookie restoration after
+  // logout. Passive /me and profile responses never clear this guard.
+  if (explicitSignIn) window.localStorage.removeItem(LOCAL_AUTH_SIGNED_OUT_STORAGE_KEY);
+  // Publish the account identity only after every fallible metadata write.
+  // Other tabs use this key as the signal to reload the completed transition.
+  if (explicitSignIn || previousUserId !== account.id) {
+    const session: LocalAuthSession = {
+      userId: account.id,
+      signedInAt: new Date().toISOString(),
+    };
+    window.localStorage.setItem(LOCAL_AUTH_SESSION_STORAGE_KEY, JSON.stringify(session));
+  }
   return user;
 }
 

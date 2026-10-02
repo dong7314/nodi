@@ -10610,3 +10610,7 @@ body:has(.page-share-panel) [data-radix-popper-content-wrapper]:has(> .shadcn-se
 .database-sync-conflict fieldset { margin: 12px 0; min-width: 0; border: 1px solid currentColor; }
 .database-sync-conflict label { display: block; margin: 8px 0; }
 .database-sync-conflict pre { margin: 4px 0 8px 22px; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+
+.page-sync-conflict { margin-block: 16px; padding: 16px; border: 1px solid var(--border-color, #ccc); border-radius: 8px; font-size: 14px; }
+.page-sync-conflict p { margin-block: 8px; }
+.page-sync-conflict button { margin-right: 8px; padding: 6px 10px; border: 1px solid currentColor; border-radius: 5px; background: transparent; color: inherit; cursor: pointer; }

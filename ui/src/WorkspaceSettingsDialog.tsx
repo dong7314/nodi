@@ -34,6 +34,7 @@ import { NODI_INITIAL_AVATAR_ICON, NodiUserAvatar } from "./NodiUserAvatar";
 import { isPageIcon, PAGE_ICONS } from "./page-icons";
 import type { NodiAvatarColor, NodiUser } from "./sharing-store";
 import { authApi } from "./server-api";
+import { backupWorkspaceCache } from "./workspace-cache";
 import {
   cloneStarterPresets,
   createStarterPreset,
@@ -54,7 +55,7 @@ type WorkspaceSettingsDialogProps = {
     avatarColor: NodiAvatarColor;
     avatarIcon?: string;
   }) => void;
-  onLogout: () => void;
+  onLogout: () => void | Promise<void>;
   onClose: () => void;
 };
 
@@ -116,6 +117,7 @@ export function WorkspaceSettingsDialog({
   const [passwordConfirmation, setPasswordConfirmation] = useState("");
   const [passwordFeedback, setPasswordFeedback] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [passwordSaving, setPasswordSaving] = useState(false);
+  const passwordSavingRef = useRef(false);
   const [registrationRequests, setRegistrationRequests] = useState(readRegistrationRequests);
   const [draftStarterPresets, setDraftStarterPresets] = useState(() => cloneStarterPresets(starterPresets));
   const [selectedStarterPresetId, setSelectedStarterPresetId] = useState<string | null>(
@@ -161,26 +163,41 @@ export function WorkspaceSettingsDialog({
   };
 
   const savePassword = async () => {
+    if (passwordSavingRef.current) return;
     setPasswordFeedback(null);
     if (nextPassword.length < 8) {
       setPasswordFeedback({ kind: "error", text: "새 비밀번호는 8자 이상 입력해 주세요." });
+      return;
+    }
+    if (new TextEncoder().encode(nextPassword).length > 72) {
+      setPasswordFeedback({ kind: "error", text: "비밀번호는 UTF-8 기준 72바이트 이내로 입력해 주세요." });
       return;
     }
     if (nextPassword !== passwordConfirmation) {
       setPasswordFeedback({ kind: "error", text: "새 비밀번호 확인이 일치하지 않습니다." });
       return;
     }
+    passwordSavingRef.current = true;
     setPasswordSaving(true);
+    let passwordChanged = false;
     try {
+      // Changing the password revokes this session too. Preserve local drafts
+      // before that irreversible server change and surface backup failures.
+      backupWorkspaceCache();
       await authApi.changePassword(currentPassword, nextPassword);
-      setPasswordFeedback({ kind: "success", text: "비밀번호를 변경했어요." });
+      passwordChanged = true;
+      setPasswordFeedback({ kind: "success", text: "비밀번호를 변경했어요. 다시 로그인해 주세요." });
       setCurrentPassword("");
       setNextPassword("");
       setPasswordConfirmation("");
+      await onLogout();
     } catch (error) {
-      setPasswordFeedback({ kind: "error", text: error instanceof Error ? error.message : "비밀번호를 변경하지 못했어요." });
+      const message = error instanceof Error ? error.message : "비밀번호를 변경하지 못했어요.";
+      setPasswordFeedback({ kind: "error", text: passwordChanged ? `비밀번호는 변경됐지만 로그아웃을 완료하지 못했어요. ${message}` : message });
+    } finally {
+      passwordSavingRef.current = false;
+      setPasswordSaving(false);
     }
-    setPasswordSaving(false);
   };
 
   const decideRegistration = async (requestId: string, status: Exclude<RegistrationRequestStatus, "pending">) => {

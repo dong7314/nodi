@@ -49,7 +49,7 @@ export async function mockWorkspace(browserPage: Page) {
       const message = JSON.parse(String(raw));
       if (message.type === "page.blocks.patch") {
         pages[id] = { ...pages[id], blocks: message.blocks, revision: pages[id].revision + 1 };
-        socket.send(JSON.stringify({ type: "page.updated", page: pages[id], actorId: user.id, changedBlockIds: message.changedBlockIds, deletedBlockIds: message.deletedBlockIds }));
+        socket.send(JSON.stringify({ type: "page.updated", page: pages[id], actorId: user.id, mutationId: message.mutationId, changedBlockIds: message.changedBlockIds, deletedBlockIds: message.deletedBlockIds }));
       }
     });
     socket.send(JSON.stringify({ type: "page.snapshot", page: pages[id] }));

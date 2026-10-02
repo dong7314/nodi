@@ -1,3 +1,5 @@
+import { NodiApiError } from "./api-client";
+import { mergePageDraft, rememberPageDraft, readPageDraft, restorePageDraft, type PageConflict } from "./page-sync";
 import { insertAttachmentFiles, updateAttachmentBlock } from "./editor-attachments";
 import { jsonEqual } from "./json-equal";
 import { isComposingKey } from "./ime";
@@ -75,6 +77,7 @@ import {
   ROOT_PAGE_ID,
   persistStoredFolders,
   persistStoredPages,
+  pageWithLocalOrder,
   readStoredFolders,
   readStoredPages,
   type StoredFolder,
@@ -1445,7 +1448,7 @@ function getInitialPages(): StoredPages {
   if (storedPages?.[ROOT_PAGE_ID]) {
     let changed = false;
     const previousGeneratedHomeTitle = window.localStorage.getItem(HOME_PAGE_TITLE_STORAGE_KEY);
-    const storedHomeTitle = storedPages[ROOT_PAGE_ID].title;
+    const storedHomeTitle = restorePageDraft(storedPages[ROOT_PAGE_ID]).title;
     const shouldMigrateHomeTitle = previousGeneratedHomeTitle !== homePageTitle
       && (
         !storedHomeTitle
@@ -1456,7 +1459,8 @@ function getInitialPages(): StoredPages {
     const normalizedPages = Object.fromEntries(
       Object.values(storedPages)
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-        .map((page, index) => {
+        .map((cached, index) => {
+          const page = restorePageDraft(cached);
           const normalizedPage: StoredPage = {
             ...page,
             title: page.id === ROOT_PAGE_ID && shouldMigrateHomeTitle ? homePageTitle : page.title,
@@ -1482,11 +1486,15 @@ function getInitialPages(): StoredPages {
           return [page.id, normalizedPage];
         }),
     );
-    if (changed) {
-      persistStoredPages(normalizedPages);
-      window.localStorage.setItem(TITLE_STORAGE_KEY, normalizedPages[ROOT_PAGE_ID].title);
+    try {
+      if (changed) {
+        persistStoredPages(normalizedPages);
+        window.localStorage.setItem(TITLE_STORAGE_KEY, normalizedPages[ROOT_PAGE_ID].title);
+      }
+      window.localStorage.setItem(HOME_PAGE_TITLE_STORAGE_KEY, homePageTitle);
+    } catch {
+      // Keep recovered drafts usable even if migration cannot fit on disk.
     }
-    window.localStorage.setItem(HOME_PAGE_TITLE_STORAGE_KEY, homePageTitle);
     return normalizedPages;
   }
 
@@ -1727,11 +1735,37 @@ function getPageLink(pageId: string, isPublic: boolean) {
   return url.toString();
 }
 
+function WorkspaceCacheFailure({ message }: { message: string }) {
+  return <main className="page-sync-conflict" role="alert">
+    <strong>작업 공간을 안전하게 전환하지 못했어요</strong>
+    <p>{message}</p>
+    <button type="button" onClick={() => window.location.reload()}>다시 시도</button>
+  </main>;
+}
+
 function App() {
+  const [initialSession] = useState(() => {
+    try { return { user: bootstrapLocalAuth(), error: null }; }
+    catch (error) { return { user: null, error: error instanceof Error ? error.message : "작업 공간을 안전하게 불러오지 못했어요." }; }
+  });
+  // Do not mount stores or editors when private cache isolation failed.
+  if (initialSession.error) return <WorkspaceCacheFailure message={initialSession.error} />;
+  return <Workspace initialAuthUser={initialSession.user} />;
+}
+
+function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null }) {
+  // The editor and its in-memory stores belong to the identity they mounted
+  // with. A completed transition may precede this tab's reload/storage event.
+  const workspaceCacheIsCurrent = () => window.localStorage.getItem("nodi:workspace-owner") === (initialAuthUser?.id ?? "guest");
   const publicPageId = useMemo(() => new URLSearchParams(window.location.search).get("publicPage"), []);
   const linkedPageId = useMemo(() => new URLSearchParams(window.location.search).get("page"), []);
-  const initialAuthUser = useMemo(bootstrapLocalAuth, []);
+  const [workspaceCacheError, setWorkspaceCacheError] = useState<string | null>(null);
+  const [loggingOut, setLoggingOut] = useState(false);
+  const loggingOutRef = useRef(false);
   const initialPages = useMemo(getInitialPages, []);
+  const initialServerPages = useMemo(() => Object.fromEntries(
+    Object.entries(initialPages).map(([id, page]) => [id, readPageDraft(id)?.base ?? page]),
+  ) as StoredPages, [initialPages]);
   const initialFolders = useMemo(readStoredFolders, []);
   const initialPageShares = useMemo(readStoredPageShares, []);
   const initialBlockComments = useMemo(readStoredBlockComments, []);
@@ -1792,6 +1826,8 @@ function App() {
     },
   });
   const [pages, setPages] = useState<StoredPages>(initialPages);
+  const [pageConflicts, setPageConflicts] = useState<Record<string, PageConflict>>({});
+  const pageConflictsRef = useRef<Record<string, PageConflict>>({});
   const [folders, setFolders] = useState<StoredFolders>(initialFolders);
   const [currentPageId, setCurrentPageId] = useState(initialPageId);
   const [title, setTitle] = useState(initialPage.title);
@@ -1812,6 +1848,8 @@ function App() {
   const [drawerPageId, setDrawerPageId] = useState<string | null>(null);
   const [rightPanel, setRightPanel] = useState<"draft" | "link" | "share" | null>(null);
   const [isArchived, setIsArchived] = useState(initialPage.archived);
+  const editorMetadataRef = useRef({ pageId: currentPageId, title, settings: pageSettings, archived: isArchived });
+  editorMetadataRef.current = { pageId: currentPageId, title, settings: pageSettings, archived: isArchived };
   const [pendingPageDeletion, setPendingPageDeletion] = useState<string | null>(null);
   const [pendingPermanentPageDeletion, setPendingPermanentPageDeletion] = useState<string | "all" | null>(null);
   const [trashBusyPageId, setTrashBusyPageId] = useState<string | null>(null);
@@ -1861,7 +1899,7 @@ function App() {
   const pagesRef = useRef(initialPages);
   const foldersRef = useRef(initialFolders);
   const serverWorkspaceReadyRef = useRef(false);
-  const serverPagesSnapshotRef = useRef<StoredPages>(initialPages);
+  const serverPagesSnapshotRef = useRef<StoredPages>(initialServerPages);
   const pageSharesRef = useRef<StoredPageShares>(initialPageShares);
   const realtimeSocketRef = useRef<WebSocket | null>(null);
   const realtimeConnectedPageIdRef = useRef<string | null>(null);
@@ -1869,6 +1907,7 @@ function App() {
   const realtimeBlocksTimerRef = useRef<number | null>(null);
   const realtimeLocalBlocksRef = useRef<PartialBlock[]>(cloneRealtimeBlocks(initialPage.blocks));
   const realtimePendingBlocksRef = useRef<{ pageId: string; base: PartialBlock[]; next: PartialBlock[] } | null>(null);
+  const realtimeSentPatchesRef = useRef(new Map<string, { changedBlockIds: string[]; deletedBlockIds: string[] }>());
   const realtimeProtectedBlockIdsRef = useRef(new Set<string>());
   const realtimeProtectedDeletedBlockIdsRef = useRef(new Set<string>());
   const realtimePresenceBlockRef = useRef<string | null>(null);
@@ -1983,13 +2022,32 @@ function App() {
   useEffect(() => {
     let active = true;
     void restoreServerAuth().then((user) => {
-      if (!active) return;
+      if (!active || loggingOutRef.current) return;
+      if (user?.id !== initialAuthUser?.id) { window.location.reload(); return; }
       setAuthUser(user);
       setUserName(user?.name ?? "게스트");
+    }).catch((error) => {
+      if (!active) return;
+      serverWorkspaceReadyRef.current = false;
+      setAuthUser(null);
+      setWorkspaceCacheError(error instanceof Error ? error.message : "작업 공간을 안전하게 전환하지 못했어요.");
     });
     return () => {
       active = false;
     };
+  }, []);
+
+  useEffect(() => {
+    const changed = (event: StorageEvent) => {
+      if (event.key !== "nodi:auth:session") return;
+      const userId = (value: string | null) => {
+        try { return JSON.parse(value ?? "null")?.userId ?? null; }
+        catch { return null; }
+      };
+      if (userId(event.oldValue) !== userId(event.newValue)) window.location.reload();
+    };
+    window.addEventListener("storage", changed);
+    return () => window.removeEventListener("storage", changed);
   }, []);
 
   useEffect(() => {
@@ -2049,6 +2107,10 @@ function App() {
   }, [rightPanel, pageSettingsOpen]);
 
   const commitPages = (nextPages: StoredPages) => {
+    if (!workspaceCacheIsCurrent()) return false;
+    for (const [id, page] of Object.entries(nextPages)) {
+      if (page !== pagesRef.current[id]) pageWithLocalOrder(page, true);
+    }
     pagesRef.current = nextPages;
     setPages(nextPages);
     setLocalSaveState("saving");
@@ -2073,6 +2135,7 @@ function App() {
   };
 
   const commitFolders = (nextFolders: StoredFolders) => {
+    if (!workspaceCacheIsCurrent()) return;
     foldersRef.current = nextFolders;
     setFolders(nextFolders);
     persistStoredFolders(nextFolders);
@@ -2080,6 +2143,7 @@ function App() {
 
   const commitPageShares = (updater: (current: StoredPageShares) => StoredPageShares) => {
     setPageShares((current) => {
+      if (!workspaceCacheIsCurrent()) return current;
       const nextPageShares = updater(current);
       persistStoredPageShares(nextPageShares);
       return nextPageShares;
@@ -2088,6 +2152,7 @@ function App() {
 
   const commitBlockComments = (updater: (current: StoredBlockComments) => StoredBlockComments) => {
     setBlockComments((current) => {
+      if (!workspaceCacheIsCurrent()) return current;
       const nextComments = updater(current);
       persistStoredBlockComments(nextComments);
       return nextComments;
@@ -2098,9 +2163,10 @@ function App() {
     serverMutationQueueRef.current = serverMutationQueueRef.current
       .catch(() => undefined)
       .then(async () => {
+        if (!workspaceCacheIsCurrent()) return;
         try {
           await task();
-          setLocalSaveState("saved");
+          setLocalSaveState(Object.keys(pageConflictsRef.current).length ? "error" : "saved");
         } catch (error) {
           setLocalSaveState("error");
           setNotice(error instanceof Error ? error.message : "서버에 변경 사항을 저장하지 못했어요");
@@ -2109,12 +2175,14 @@ function App() {
   };
 
   const acknowledgePageSave = (saved: StoredPage) => {
+    if (!workspaceCacheIsCurrent()) return;
     const previous = serverPagesSnapshotRef.current[saved.id];
     // A realtime acknowledgement may have arrived before the HTTP response.
     if ((previous?.revision ?? 0) > (saved.revision ?? 0)) return;
     serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [saved.id]: saved };
     const local = pagesRef.current[saved.id];
     if (!local) return;
+    rememberPageDraft(local, saved);
     const nextPages = {
       ...pagesRef.current,
       [saved.id]: { ...local, ownerId: saved.ownerId, permission: saved.permission, revision: saved.revision },
@@ -2122,6 +2190,89 @@ function App() {
     pagesRef.current = nextPages;
     persistStoredPages(nextPages);
     setPages(nextPages);
+  };
+
+  const setPageConflict = (pageId: string, conflict: PageConflict | null) => {
+    const next = { ...pageConflictsRef.current };
+    if (conflict) next[pageId] = conflict;
+    else delete next[pageId];
+    pageConflictsRef.current = next;
+    setPageConflicts(next);
+  };
+
+  const applyMergedPage = (page: StoredPage) => {
+    if (!workspaceCacheIsCurrent()) return;
+    // Local persistence failure must not interrupt conflict registration or
+    // applying a user's resolution to the in-memory editor.
+    commitPages({ ...pagesRef.current, [page.id]: page });
+    if (page.id === currentPageIdRef.current) {
+      setTitle(page.title);
+      setPageSettings(page.settings);
+      setIsArchived(page.archived);
+      if (!sameServerValue(editor.document, page.blocks)) loadEditorPage(page.id, page.blocks);
+    }
+  };
+
+  const currentPageDraft = (pageId: string) => {
+    const cached = pagesRef.current[pageId];
+    const metadata = editorMetadataRef.current;
+    return cached && metadata.pageId === pageId
+      ? { ...cached, title: metadata.title.trim() || "제목 없음", settings: metadata.settings, archived: metadata.archived }
+      : cached;
+  };
+
+  const savePageToServer = async (pageId: string, retry = true, includeRealtimeBlocks = false): Promise<void> => {
+    if (!workspaceCacheIsCurrent()) return;
+    if (pageConflictsRef.current[pageId]) return;
+    const local = pagesRef.current[pageId];
+    const base = serverPagesSnapshotRef.current[pageId];
+    if (!local || !base || local.permission === "view") return;
+    const patch = getPageServerPatch(base, local);
+    if (pageId === ROOT_PAGE_ID) {
+      delete patch.parentId; delete patch.folderId; delete patch.order; delete patch.archived;
+    }
+    if (realtimeSocketIsReady(pageId) && !includeRealtimeBlocks) delete patch.blocks;
+    if (!Object.keys(patch).length) return;
+    patch.revision = base.revision;
+    try {
+      const saved = pageId === ROOT_PAGE_ID
+        ? storedHomeFromServer(await workspaceApi.updateHome(patch))
+        : storedPageFromServer(await workspaceApi.updatePage(pageId, patch));
+      acknowledgePageSave(saved);
+    } catch (error) {
+      if (!(error instanceof NodiApiError) || error.status !== 409) throw error;
+      const remote = pageId === ROOT_PAGE_ID
+        ? storedHomeFromServer(await workspaceApi.getHome())
+        : storedPageFromServer(await workspaceApi.getPage(pageId));
+      if (!workspaceCacheIsCurrent()) return;
+      const latest = currentPageDraft(pageId);
+      if (!latest) return;
+      const merged = mergePageDraft(base, latest, remote);
+      if (merged.conflicts.length) setPageConflict(pageId, { base, remote });
+      serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [pageId]: remote };
+      rememberPageDraft(merged.page, merged.conflicts.length ? base : remote);
+      applyMergedPage(merged.page);
+      if (merged.conflicts.length) {
+        setLocalSaveState("error");
+        setNotice(`“${latest.title || "제목 없음"}”의 변경이 겹쳤어요. 페이지에서 저장할 내용을 선택해 주세요.`);
+      } else if (retry) await savePageToServer(pageId, false, includeRealtimeBlocks);
+      else throw new Error("다른 변경이 계속 저장되고 있어요. 잠시 후 다시 저장해 주세요.");
+    }
+  };
+
+  const resolvePageConflict = (pageId: string, choice: "local" | "remote") => {
+    if (!workspaceCacheIsCurrent()) return;
+    const conflict = pageConflictsRef.current[pageId];
+    const local = currentPageDraft(pageId);
+    if (!conflict || !local) return;
+    const next = choice === "remote" ? conflict.remote : mergePageDraft(conflict.base, local, conflict.remote).page;
+    serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [pageId]: conflict.remote };
+    setPageConflict(pageId, null);
+    rememberPageDraft(next, conflict.remote);
+    applyMergedPage(next);
+    // A recovered block conflict has no pending realtime patch. Resolve it
+    // against the reviewed revision through HTTP even with an open socket.
+    enqueueServerMutation(() => savePageToServer(pageId, true, true));
   };
 
   const realtimeSocketIsReady = (pageId: string) => (
@@ -2135,7 +2286,9 @@ function App() {
       page
       && page.permission !== "view"
       && !page.settings.lockPage
-      && !publicPageId,
+      && !publicPageId
+      && workspaceCacheIsCurrent()
+      && !loggingOutRef.current && !workspaceCacheError,
     );
   };
 
@@ -2146,7 +2299,8 @@ function App() {
     }
     const pending = realtimePendingBlocksRef.current;
     realtimePendingBlocksRef.current = null;
-    if (!pending || !realtimeSocketIsReady(pending.pageId)) return false;
+    if (!pending || !workspaceCacheIsCurrent() || !realtimeSocketIsReady(pending.pageId)) return false;
+    if (pageConflictsRef.current[pending.pageId]) return false;
     const patch = buildRealtimeBlockPatch(pending.base, pending.next);
     if (!patch) return true;
     patch.changedBlockIds.forEach((id) => realtimeProtectedBlockIdsRef.current.add(id));
@@ -2154,8 +2308,11 @@ function App() {
       realtimeProtectedBlockIdsRef.current.delete(id);
       realtimeProtectedDeletedBlockIdsRef.current.add(id);
     });
+    const mutationId = makeId("change");
+    realtimeSentPatchesRef.current.set(mutationId, patch);
     realtimeSocketRef.current?.send(JSON.stringify({
       type: "page.blocks.patch",
+      mutationId,
       ...patch,
     }));
     setLocalSaveState("saving");
@@ -2165,6 +2322,7 @@ function App() {
   const queueRealtimeBlockPatch = (blocks: PartialBlock[]) => {
     if (!currentPageIsEditable()) return false;
     const pageId = currentPageIdRef.current;
+    if (pageConflictsRef.current[pageId]) return false;
     if (!realtimeSocketIsReady(pageId)) return false;
     const nextBlocks = cloneRealtimeBlocks(blocks);
     const pending = realtimePendingBlocksRef.current;
@@ -2197,6 +2355,8 @@ function App() {
       return;
     }
     let active = true;
+    const bootstrapPages = pagesRef.current;
+    const bootstrapPageId = currentPageIdRef.current;
     serverWorkspaceReadyRef.current = false;
     setInboxNotifications([]);
 
@@ -2207,7 +2367,7 @@ function App() {
     const serverSharesPromise = workspaceApi.listAllShares();
     void serverSharesPromise
       .then((serverShares) => {
-        if (!active) return;
+        if (!active || !workspaceCacheIsCurrent()) return;
         const nextPageShares = Object.fromEntries(serverShares.map((share) => [
           share.pageId,
           storedShareFromServer(share),
@@ -2301,15 +2461,20 @@ function App() {
         const serverTags = existingServerTags.length > 0
           ? existingServerTags
           : await Promise.all(DEFAULT_TAG_OPTIONS.map((tag, index) => workspaceApi.createTag(tag, index)));
-        if (!active) return;
+        if (!active || !workspaceCacheIsCurrent()) return;
 
+        let cacheWriteFailed = false;
+        const cache = (write: () => void) => {
+          try { write(); }
+          catch { cacheWriteFailed = true; }
+        };
         const backupKey = `nodi:local-workspace-backup:${authUser.id}`;
         if (!window.localStorage.getItem(backupKey)) {
-          window.localStorage.setItem(backupKey, JSON.stringify({
+          cache(() => window.localStorage.setItem(backupKey, JSON.stringify({
             pages: pagesRef.current,
             folders: foldersRef.current,
             savedAt: new Date().toISOString(),
-          }));
+          })));
         }
 
         const nextPages: StoredPages = {
@@ -2318,17 +2483,47 @@ function App() {
         details.forEach((page) => {
           nextPages[page.id] = storedPageFromServer(page);
         });
+        // The websocket can complete a save while this initial list is in
+        // flight. Never replace an already observed newer server revision.
+        for (const [id, received] of Object.entries(nextPages)) {
+          const observed = serverPagesSnapshotRef.current[id];
+          if ((observed?.revision ?? 0) > (received.revision ?? 0)) nextPages[id] = observed;
+        }
+        const serverPages = { ...nextPages };
+        const conflicts: Record<string, PageConflict> = {};
+        for (const [id, remote] of Object.entries(serverPages)) {
+          const draft = readPageDraft(id);
+          const initial = bootstrapPages[id];
+          const cached = pagesRef.current[id];
+          if (!cached || (!initial && !draft)) continue;
+          const metadata = editorMetadataRef.current;
+          const local = metadata.pageId === id ? { ...cached, title: metadata.title, settings: metadata.settings, archived: metadata.archived } : cached;
+          const base = draft?.base ?? initial;
+          const merged = mergePageDraft(base, local, remote);
+          nextPages[id] = merged.page;
+          if (merged.conflicts.length) conflicts[id] = { base, remote };
+          rememberPageDraft(merged.page, merged.conflicts.length ? base : remote);
+        }
+        for (const local of Object.values(pagesRef.current)) {
+          if (!bootstrapPages[local.id] && !nextPages[local.id]) nextPages[local.id] = local;
+        }
+        pageConflictsRef.current = conflicts;
+        setPageConflicts(conflicts);
         const nextFolders = Object.fromEntries(serverFolders.map((folder) => [
           folder.id,
           storedFolderFromServer(folder),
         ])) as StoredFolders;
 
-        serverPagesSnapshotRef.current = nextPages;
+        const displayedPage = pagesRef.current[currentPageIdRef.current];
+        serverPagesSnapshotRef.current = serverPages;
         serverFoldersSnapshotRef.current = nextFolders;
         pagesRef.current = nextPages;
         foldersRef.current = nextFolders;
-        persistStoredPages(nextPages);
-        persistStoredFolders(nextFolders);
+        // Disk failure cannot leave refs at the new server revision while the
+        // editor still displays the old version. Complete the in-memory load
+        // and permit server saves independently of this optional cache copy.
+        cache(() => persistStoredPages(nextPages));
+        cache(() => persistStoredFolders(nextFolders));
         const nextPageShares = Object.fromEntries(serverShares.map((share) => [
           share.pageId,
           storedShareFromServer(share),
@@ -2337,13 +2532,15 @@ function App() {
           thread.id,
           storedCommentFromServer(thread),
         ])) as StoredBlockComments;
-        persistStoredPageShares(nextPageShares);
-        persistStoredBlockComments(nextBlockComments);
+        cache(() => persistStoredPageShares(nextPageShares));
+        cache(() => persistStoredBlockComments(nextBlockComments));
         setPages(nextPages);
         setFolders(nextFolders);
         setPageShares(nextPageShares);
         setBlockComments(nextBlockComments);
-        setServerDirectoryUsers(directoryUsers);
+        setServerDirectoryUsers([...new Map([
+          ...directoryUsers, ...serverShares.flatMap((share) => [share.owner, ...share.members.map((member) => member.user)]),
+        ].map((user) => [user.id, user])).values()]);
         setInboxNotifications(serverNotifications.map(inboxNotificationFromServer));
         const nextPresets = serverPresets.map(({ id, name, icon, pageTitle, blocks, sourceFileName }) => ({
           id,
@@ -2355,7 +2552,7 @@ function App() {
         }));
         serverPresetsSnapshotRef.current = nextPresets;
         setStarterPresets(nextPresets);
-        persistStarterPresets(nextPresets);
+        cache(() => persistStarterPresets(nextPresets));
         setTagOptions(serverTags.map(({ id, name, color }) => ({ id, name, color })));
         serverPreferencesRef.current = serverPreferences.preferences;
         serverPreferencesRevisionRef.current = serverPreferences.revision;
@@ -2368,19 +2565,21 @@ function App() {
         }
         serverPreferencesReadyRef.current = true;
 
-        const requestedPageId = linkedPageId ?? currentPageIdRef.current;
+        const requestedPageId = currentPageIdRef.current !== bootstrapPageId
+          ? currentPageIdRef.current : linkedPageId ?? currentPageIdRef.current;
         const nextPageId = nextPages[requestedPageId] ? requestedPageId : ROOT_PAGE_ID;
         const nextPage = nextPages[nextPageId];
-        loadingPageRef.current = true;
+        const replaceDocument = currentPageIdRef.current !== nextPageId || !sameServerValue(displayedPage?.blocks, nextPage.blocks);
         currentPageIdRef.current = nextPageId;
         setCurrentPageId(nextPageId);
         setWorkspaceSection(nextPageId !== ROOT_PAGE_ID && (nextPage.permission ?? "owner") !== "owner" ? "shared-page" : "pages");
         setTitle(nextPage.title);
         setPageSettings(nextPage.settings);
         setIsArchived(nextPage.archived);
-        loadEditorPage(nextPageId, nextPage.blocks);
+        if (replaceDocument) loadEditorPage(nextPageId, nextPage.blocks);
         serverWorkspaceReadyRef.current = true;
-        setLocalSaveState("saved");
+        setLocalSaveState(cacheWriteFailed || Object.keys(conflicts).length ? "error" : "saved");
+        if (cacheWriteFailed) setNotice("로컬 저장 공간이 부족하거나 사용할 수 없어요. 최신 서버 내용은 불러왔어요.");
       } catch (error) {
         if (!active) return;
         serverWorkspaceReadyRef.current = false;
@@ -2502,60 +2701,36 @@ function App() {
         const after = pagesRef.current;
         const before = serverPagesSnapshotRef.current;
         if (sameServerValue(before, after)) return;
-        const previousHome = before[ROOT_PAGE_ID];
-        const nextHome = after[ROOT_PAGE_ID];
-        if (previousHome && nextHome) {
-          const homePatch: Partial<Pick<StoredPage, "title" | "settings" | "blocks" | "revision">> = {};
-          if (previousHome.title !== nextHome.title) homePatch.title = nextHome.title;
-          if (!sameServerValue(previousHome.settings, nextHome.settings)) homePatch.settings = nextHome.settings;
-          if (!sameServerValue(previousHome.blocks, nextHome.blocks)) homePatch.blocks = nextHome.blocks;
-          if (Object.keys(homePatch).length) {
-            homePatch.revision = previousHome.revision;
-            const savedHome = await workspaceApi.updateHome(homePatch);
-            acknowledgePageSave(storedHomeFromServer(savedHome));
-          }
-        }
-
+        let firstError: unknown;
+        const save = async (id: string) => {
+          try { await savePageToServer(id); } catch (error) { firstError ??= error; }
+        };
+        await save(ROOT_PAGE_ID);
         const created = Object.values(after)
           .filter((page) => page.id !== ROOT_PAGE_ID && !before[page.id])
           .sort((left, right) => pageDepth(after, left) - pageDepth(after, right));
         for (const page of created) {
-          const savedPage = await workspaceApi.createPage(page);
-          acknowledgePageSave(storedPageFromServer(savedPage));
+          try { acknowledgePageSave(storedPageFromServer(await workspaceApi.createPage(page))); }
+          catch (error) { firstError ??= error; }
         }
-
         for (const page of Object.values(after)) {
           if (page.id === ROOT_PAGE_ID) continue;
+          await save(page.id);
           const previous = serverPagesSnapshotRef.current[page.id];
-          if (!previous) continue;
-          const patch = getPageServerPatch(previous, page);
-          const isCollaborative = (page.permission ?? "owner") !== "owner"
-            || (pageSharesRef.current[page.id]?.members.length ?? 0) > 0
-            || realtimeSocketIsReady(page.id);
-          // While the realtime room is connected, block mutations travel only
-          // through the socket. Sending the same document through the HTTP
-          // autosave path created duplicate revisions and stale conflicts.
-          if (isCollaborative && realtimeSocketIsReady(page.id)) delete patch.blocks;
-          if (Object.keys(patch).length) {
-            if (!isCollaborative) patch.revision = previous.revision;
-            const savedPage = await workspaceApi.updatePage(page.id, patch);
-            acknowledgePageSave(storedPageFromServer(savedPage));
-          }
-          if (Boolean(previous.favoritedAt) !== Boolean(page.favoritedAt)) {
-            await workspaceApi.favoritePage(page.id, Boolean(page.favoritedAt));
-            const snapshot = serverPagesSnapshotRef.current[page.id];
-            if (snapshot) serverPagesSnapshotRef.current = {
-              ...serverPagesSnapshotRef.current,
-              [page.id]: { ...snapshot, favoritedAt: page.favoritedAt },
-            };
+          if (previous && Boolean(previous.favoritedAt) !== Boolean(page.favoritedAt)) {
+            try {
+              await workspaceApi.favoritePage(page.id, Boolean(page.favoritedAt));
+              serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [page.id]: { ...previous, favoritedAt: page.favoritedAt } };
+            } catch (error) { firstError ??= error; }
           }
         }
 
         for (const page of Object.values(before)) {
           if (page.id !== ROOT_PAGE_ID && !after[page.id] && (page.permission ?? "owner") === "owner") {
-            await workspaceApi.archivePage(page.id);
+            try { await workspaceApi.archivePage(page.id); } catch (error) { firstError ??= error; }
           }
         }
+        if (firstError) throw firstError;
       });
     }, 700);
     return () => {
@@ -2568,6 +2743,7 @@ function App() {
     patch: Partial<StoredPage>,
     options: { preserveUpdatedAt?: boolean } = {},
   ): StoredPage | null => {
+    if (!workspaceCacheIsCurrent()) return null;
     const page = pagesRef.current[pageId];
     if (!page || page.permission === "view") return null;
     const safePatch = pageId === ROOT_PAGE_ID
@@ -2595,10 +2771,13 @@ function App() {
         // legacy keys only keep older local workspaces compatible.
       }
     }
+    const baseline = pageConflictsRef.current[pageId]?.base ?? serverPagesSnapshotRef.current[pageId];
+    if (authUser && baseline) rememberPageDraft(nextPage, baseline);
     return pageSaved ? nextPage : null;
   };
 
   finishDetachedUploadRef.current = (pageId, blockId, url) => {
+    if (!workspaceCacheIsCurrent()) return;
     const source = pagesRef.current[pageId];
     if (!source || source.permission === "view" || source.settings.lockPage || source.archived) return;
     if (currentPageIdRef.current === pageId && editorPageIdRef.current === pageId) {
@@ -2630,47 +2809,15 @@ function App() {
     }
     setLocalSaveState("saving");
     enqueueServerMutation(async () => {
-      const page = pagesRef.current[pageId];
-      const previous = serverPagesSnapshotRef.current[pageId];
-      if (!previous || !page) return;
-
-      if (pageId === ROOT_PAGE_ID) {
-        const homePatch: Partial<Pick<StoredPage, "title" | "settings" | "blocks" | "revision">> = {};
-        if (previous.title !== page.title) homePatch.title = page.title;
-        if (!sameServerValue(previous.settings, page.settings)) homePatch.settings = page.settings;
-        if (!sameServerValue(previous.blocks, page.blocks)) homePatch.blocks = page.blocks;
-        if (!Object.keys(homePatch).length) {
-          if (options.notify) setNotice("메모를 서버에 저장했어요");
-          return;
-        }
-        homePatch.revision = previous.revision;
-        const savedHome = await workspaceApi.updateHome(homePatch);
-        acknowledgePageSave(storedHomeFromServer(savedHome));
-        if (options.notify) setNotice("메모를 서버에 저장했어요");
-        return;
-      }
-
-      const patch = getPageServerPatch(previous, page);
-      const isCollaborative = (page.permission ?? "owner") !== "owner"
-        || (pageSharesRef.current[page.id]?.members.length ?? 0) > 0
-        || realtimeSocketIsReady(page.id);
-      if (isCollaborative && realtimeSocketIsReady(page.id)) {
-        flushRealtimeBlockPatch();
-        delete patch.blocks;
-      }
-      if (!Object.keys(patch).length) {
-        if (options.notify) setNotice("메모를 서버에 저장했어요");
-        return;
-      }
-      if (!isCollaborative) patch.revision = previous.revision;
-      const savedPage = await workspaceApi.updatePage(pageId, patch);
-      acknowledgePageSave(storedPageFromServer(savedPage));
-      if (options.notify) setNotice("메모를 서버에 저장했어요");
+      flushRealtimeBlockPatch();
+      await savePageToServer(pageId);
+      if (options.notify && !pageConflictsRef.current[pageId]) setNotice("메모를 서버에 저장했어요");
     });
   };
 
   useEffect(() => {
     const syncUserProfile = () => {
+      if (!workspaceCacheIsCurrent()) return;
       const nextUserName = getStoredUserName();
       const nextHomeTitle = getHomePageTitle(nextUserName);
       const previousGeneratedHomeTitle = window.localStorage.getItem(HOME_PAGE_TITLE_STORAGE_KEY);
@@ -2780,17 +2927,25 @@ function App() {
   };
 
   const logout = async () => {
-    saveDocument();
-    await serverMutationQueueRef.current;
+    if (loggingOutRef.current) return;
+    loggingOutRef.current = true;
+    presetApplyVersionRef.current += 1;
     try {
-      await authApi.logout();
-    } catch {
-      // The local session is still cleared when the server is temporarily unavailable.
+      saveDocument();
+      flushRealtimeBlockPatch();
+      // A previous quota failure may have left newer edits only in memory.
+      // Never park an older disk snapshot and discard those edits on reload.
+      persistStoredPages(pagesRef.current);
+      setLoggingOut(true);
+      await serverMutationQueueRef.current;
+      persistStoredPages(pagesRef.current);
+      await logoutLocalAccount();
+      window.location.reload();
+    } catch (error) {
+      loggingOutRef.current = false;
+      setLoggingOut(false);
+      setNotice(error instanceof Error ? error.message : "로그아웃을 완료하지 못했어요.");
     }
-    await logoutLocalAccount();
-    setWorkspaceSettingsOpen(false);
-    setAuthDialogMode(null);
-    window.location.reload();
   };
 
   const openWorkspaceSearch = () => {
@@ -2806,17 +2961,29 @@ function App() {
     setWorkspaceSearchOpen(true);
   };
 
-  useEffect(() => {
-    const pageId = currentPageId;
-    if (pageId !== currentPageIdRef.current) return;
+  const persistTitleChange = (value: string) => {
+    const pageId = currentPageIdRef.current;
+    if (pageId !== editorPageIdRef.current) return;
+    // Another tab can finish an account transition before this tab processes
+    // its storage event. Never write the old account into that new workspace.
+    if (!workspaceCacheIsCurrent()) return;
     const currentPage = pagesRef.current[pageId];
-    const nextTitle = title.trim() || "제목 없음";
+    const nextTitle = value.trim() || "제목 없음";
     if (!currentPage || currentPage.title === nextTitle) return;
-    const saveTimer = window.setTimeout(() => {
-      if (pageId !== currentPageIdRef.current || pageId !== editorPageIdRef.current) return;
-      updatePage(pageId, { title: nextTitle });
-    }, 300);
-    return () => window.clearTimeout(saveTimer);
+    updatePage(pageId, { title: nextTitle });
+  };
+
+  const changeTitle = (value: string) => {
+    editorMetadataRef.current = { ...editorMetadataRef.current, title: value };
+    setTitle(value);
+    // Persist before yielding to an external logout/reload. Network writes
+    // retain the existing 700ms workspace autosave debounce.
+    persistTitleChange(value);
+  };
+
+  useEffect(() => {
+    if (currentPageId !== currentPageIdRef.current) return;
+    persistTitleChange(title);
   }, [title, currentPageId]);
 
   useEffect(() => {
@@ -2934,11 +3101,14 @@ function App() {
     if (!authUser || publicPageId) return;
     let active = true;
     let refreshing = false;
+    let refreshController: AbortController | null = null;
+    const cancelRefresh = () => refreshController?.abort();
 
     const refreshCurrentPage = async () => {
       const pageId = currentPageIdRef.current;
       if (
         refreshing
+        || document.visibilityState !== "visible"
         || !serverWorkspaceReadyRef.current
         || pageId === ROOT_PAGE_ID
         || serverPagesTimerRef.current
@@ -2947,22 +3117,23 @@ function App() {
       refreshing = true;
       try {
         await serverMutationQueueRef.current;
-        if (!active || pageId !== currentPageIdRef.current || serverPagesTimerRef.current) return;
+        if (!active || document.visibilityState !== "visible" || pageId !== currentPageIdRef.current || serverPagesTimerRef.current) return;
 
         const previous = serverPagesSnapshotRef.current[pageId];
-        const localPage = pagesRef.current[pageId];
+        const localPage = currentPageDraft(pageId);
         if (
           previous
           && localPage
           && !sameServerValue(getPageEditableSnapshot(previous), getPageEditableSnapshot(localPage))
         ) return;
 
-        const serverPage = await workspaceApi.getPage(pageId);
-        if (!active || pageId !== currentPageIdRef.current) return;
+        refreshController = new AbortController();
+        const serverPage = await workspaceApi.getPage(pageId, refreshController.signal);
+        if (!active || !workspaceCacheIsCurrent() || pageId !== currentPageIdRef.current) return;
         // Editing can resume while the GET is in flight. Recheck against the
         // latest local state instead of overwriting it with that response.
         const latestSnapshot = serverPagesSnapshotRef.current[pageId];
-        const latestLocal = pagesRef.current[pageId];
+        const latestLocal = currentPageDraft(pageId);
         if (serverPagesTimerRef.current || (latestSnapshot && latestLocal
           && !sameServerValue(getPageEditableSnapshot(latestSnapshot), getPageEditableSnapshot(latestLocal)))) return;
         if (latestSnapshot?.revision !== undefined && serverPage.revision <= latestSnapshot.revision) return;
@@ -2987,22 +3158,27 @@ function App() {
         // Background revalidation should not interrupt the editor. Explicit
         // saves still surface their server error through the mutation queue.
       } finally {
+        refreshController = null;
         refreshing = false;
       }
     };
 
     const refreshWhenVisible = () => {
       if (document.visibilityState === "visible") void refreshCurrentPage();
+      else cancelRefresh();
     };
     const initialTimer = window.setTimeout(() => void refreshCurrentPage(), 900);
     window.addEventListener("focus", refreshWhenVisible);
     window.addEventListener("pageshow", refreshWhenVisible);
+    window.addEventListener("pagehide", cancelRefresh);
     document.addEventListener("visibilitychange", refreshWhenVisible);
     return () => {
       active = false;
+      cancelRefresh();
       window.clearTimeout(initialTimer);
       window.removeEventListener("focus", refreshWhenVisible);
       window.removeEventListener("pageshow", refreshWhenVisible);
+      window.removeEventListener("pagehide", cancelRefresh);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
   }, [authUser?.id, currentPageId, editor, publicPageId]);
@@ -3020,6 +3196,7 @@ function App() {
     realtimeConnectedPageIdRef.current = null;
     realtimePresenceBlockRef.current = null;
     realtimePendingBlocksRef.current = null;
+    realtimeSentPatchesRef.current.clear();
     realtimeProtectedBlockIdsRef.current.clear();
     realtimeProtectedDeletedBlockIdsRef.current.clear();
     setRealtimeParticipants([]);
@@ -3044,6 +3221,19 @@ function App() {
     let reconnectAttempt = 0;
     let heartbeatTimer: number | null = null;
 
+    const mergeMetadata = (remote: StoredPage) => {
+      const base = serverPagesSnapshotRef.current[pageId];
+      const cached = pagesRef.current[pageId];
+      if (!base || !cached) return remote;
+      const metadata = editorMetadataRef.current;
+      const local = { ...cached, ...(metadata.pageId === pageId ? {
+        title: metadata.title, settings: metadata.settings, archived: metadata.archived,
+      } : {}), blocks: base.blocks };
+      const merged = mergePageDraft(base, local, remote);
+      if (merged.conflicts.length) setPageConflict(pageId, { base, remote });
+      return merged.page;
+    };
+
     const replaceCurrentPage = (nextPage: StoredPage, preservePendingBlocks = false) => {
       if (disposed || currentPageIdRef.current !== pageId) return;
       let editorBlocks = nextPage.blocks;
@@ -3066,7 +3256,7 @@ function App() {
           if (realtimeProtectedBlockIdsRef.current.has(id) && !included.has(id)) editorBlocks.push(block);
         });
       }
-      const localNextPage = { ...nextPage, blocks: editorBlocks };
+      const localNextPage = { ...mergeMetadata(nextPage), blocks: editorBlocks };
       const nextPages = { ...pagesRef.current, [pageId]: localNextPage };
       serverPagesSnapshotRef.current = {
         ...serverPagesSnapshotRef.current,
@@ -3076,32 +3266,64 @@ function App() {
       persistStoredPages(nextPages);
       setPages(nextPages);
 
-      loadingPageRef.current = true;
-      setTitle(nextPage.title);
-      setPageSettings(nextPage.settings);
-      setIsArchived(nextPage.archived);
-      loadEditorPage(pageId, editorBlocks);
+      setTitle(localNextPage.title);
+      setPageSettings(localNextPage.settings);
+      setIsArchived(localNextPage.archived);
+      rememberPageDraft(localNextPage, pageConflictsRef.current[pageId]?.base ?? nextPage);
+      if (!sameServerValue(editor.document, editorBlocks)) loadEditorPage(pageId, editorBlocks);
       realtimeLocalBlocksRef.current = cloneRealtimeBlocks(editorBlocks);
     };
 
+    const reconcilePageDraft = (received: StoredPage) => {
+      const currentSnapshot = serverPagesSnapshotRef.current[pageId];
+      const remote = (currentSnapshot?.revision ?? 0) > (received.revision ?? 0) ? currentSnapshot! : received;
+      const base = pageConflictsRef.current[pageId]?.base ?? currentSnapshot ?? remote;
+      const local = currentPageDraft(pageId);
+      if (!local) return;
+      const merged = mergePageDraft(base, local, remote);
+      setPageConflict(pageId, merged.conflicts.length ? { base, remote } : null);
+      serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [pageId]: remote };
+      realtimePendingBlocksRef.current = null;
+      realtimeSentPatchesRef.current.clear();
+      realtimeProtectedBlockIdsRef.current.clear();
+      realtimeProtectedDeletedBlockIdsRef.current.clear();
+      rememberPageDraft(merged.page, merged.conflicts.length ? base : remote);
+      applyMergedPage(merged.page);
+      realtimeLocalBlocksRef.current = cloneRealtimeBlocks(remote.blocks);
+      realtimeConnectedPageIdRef.current = pageId;
+      if (merged.conflicts.length) setLocalSaveState("error");
+      else if (!sameServerValue(remote.blocks, merged.page.blocks)) queueRealtimeBlockPatch(merged.page.blocks);
+    };
+
     const applyServerPage = (serverPage: ServerPage, message: ServerPageRealtimeEvent) => {
-      if (disposed || serverPage.id !== pageId || currentPageIdRef.current !== pageId) return;
+      if (disposed || !workspaceCacheIsCurrent() || serverPage.id !== pageId || currentPageIdRef.current !== pageId) return;
       const currentLocalPage = pagesRef.current[pageId];
       const currentSnapshot = serverPagesSnapshotRef.current[pageId];
       if (!currentLocalPage) return;
 
-      // A no-op patch can legitimately echo the same revision (for example,
-      // when the canonical block already contains the submitted value). Clear
-      // the optimistic protection before the revision guard so later remote
-      // edits are not hidden behind a stale local protection marker.
-      if (message.actorId === authUser.id) {
-        (message.changedBlockIds ?? []).forEach((id) => realtimeProtectedBlockIdsRef.current.delete(id));
-        (message.deletedBlockIds ?? []).forEach((id) => realtimeProtectedDeletedBlockIdsRef.current.delete(id));
-        if ((currentSnapshot?.revision ?? 0) >= serverPage.revision) {
-          setLocalSaveState("saved");
-          return;
+      if (message.type === "page.snapshot") {
+        // Reconcile recovered/offline work before this connection may send it.
+        reconcilePageDraft(storedPageFromServer(serverPage));
+        return;
+      }
+
+      const ownAcknowledgement = message.actorId === authUser.id && message.mutationId
+        && realtimeSentPatchesRef.current.has(message.mutationId);
+      if (ownAcknowledgement) {
+        realtimeSentPatchesRef.current.delete(message.mutationId!);
+        // Only the acknowledged mutation is released. Later edits to the same
+        // block remain protected, including changes still in the debounce.
+        const pending = realtimePendingBlocksRef.current;
+        const queued = pending?.pageId === pageId ? buildRealtimeBlockPatch(pending.base, pending.next) : null;
+        realtimeProtectedBlockIdsRef.current.clear();
+        realtimeProtectedDeletedBlockIdsRef.current.clear();
+        for (const patch of [...realtimeSentPatchesRef.current.values(), ...(queued ? [queued] : [])]) {
+          patch.changedBlockIds.forEach((id) => { realtimeProtectedBlockIdsRef.current.add(id); realtimeProtectedDeletedBlockIdsRef.current.delete(id); });
+          patch.deletedBlockIds.forEach((id) => { realtimeProtectedDeletedBlockIdsRef.current.add(id); realtimeProtectedBlockIdsRef.current.delete(id); });
         }
-      } else if ((currentSnapshot?.revision ?? 0) >= serverPage.revision) {
+      }
+      if ((currentSnapshot?.revision ?? 0) >= serverPage.revision) {
+        if (ownAcknowledgement && !realtimeSentPatchesRef.current.size && !pageConflictsRef.current[pageId]) setLocalSaveState("saved");
         return;
       }
 
@@ -3111,87 +3333,76 @@ function App() {
         favoritedAt: currentLocalPage.favoritedAt,
       });
 
-      // Own echoes confirm persistence without replacing the editor selection.
-      // The canonical snapshot still advances so later metadata saves never
-      // submit a stale revision.
-      if (message.actorId === authUser.id) {
-        serverPagesSnapshotRef.current = {
-          ...serverPagesSnapshotRef.current,
-          [pageId]: nextPage,
-        };
-        const localBlocks = editor.document as unknown as PartialBlock[];
-        const localPage = {
-          ...currentLocalPage,
-          revision: nextPage.revision,
-          updatedAt: nextPage.updatedAt,
-          blocks: localBlocks,
-        };
-        const nextPages = { ...pagesRef.current, [pageId]: localPage };
-        pagesRef.current = nextPages;
-        persistStoredPages(nextPages);
-        setPages(nextPages);
-        realtimeLocalBlocksRef.current = cloneRealtimeBlocks(localBlocks);
-        setLocalSaveState("saved");
+      if (Object.hasOwn(pageConflictsRef.current, pageId)) {
+        // Later broadcasts cannot bypass a still-unresolved recovered draft.
+        reconcilePageDraft(nextPage);
         return;
       }
 
       if (message.type === "page.updated" && message.changedBlockIds?.length && !message.structural) {
         // Apply remote text/property edits one top-level block at a time. This
         // preserves the local caret and any unsent work in all other blocks.
-        loadingPageRef.current = true;
-        const loadVersion = ++editorLoadVersionRef.current;
         const nextById = new Map(nextPage.blocks.map((block) => [realtimeBlockId(block), block]));
         const liveIds = new Set(editor.document.map((block) => block.id));
-        try {
-          editor.transact((transaction) => {
-            // Remote edits are not this user's undoable actions.
-            transaction.setMeta("addToHistory", false);
-            const removable = (message.deletedBlockIds ?? []).filter((id) => (
-              liveIds.has(id) && !realtimeProtectedBlockIdsRef.current.has(id)
-            ));
-            if (removable.length) editor.removeBlocks(removable);
-            (message.changedBlockIds ?? []).forEach((blockId) => {
-              if (realtimeProtectedBlockIdsRef.current.has(blockId)) return;
-              const block = nextById.get(blockId);
-              if (block && liveIds.has(blockId)) editor.updateBlock(blockId, block as never);
+        const removable = (message.deletedBlockIds ?? []).filter((id) => (
+          liveIds.has(id) && !realtimeProtectedBlockIdsRef.current.has(id)
+        ));
+        const updates = (message.changedBlockIds ?? []).filter((id) => (
+          !realtimeProtectedBlockIdsRef.current.has(id) && liveIds.has(id)
+          && nextById.has(id) && !sameServerValue(editor.getBlock(id), nextById.get(id))
+        ));
+        // A persistence acknowledgement usually changes no editor blocks. Do
+        // not suspend input (even for one frame) or touch history in that case.
+        let loadVersion: number | undefined;
+        if (removable.length || updates.length) {
+          loadingPageRef.current = true;
+          loadVersion = ++editorLoadVersionRef.current;
+          try {
+            editor.transact((transaction) => {
+              transaction.setMeta("addToHistory", false);
+              if (removable.length) editor.removeBlocks(removable);
+              updates.forEach((id) => editor.updateBlock(id, nextById.get(id) as never));
             });
-          });
-        } catch {
-          loadEditorPage(pageId, nextPage.blocks);
+          } catch {
+            replaceCurrentPage(nextPage, true);
+            return;
+          }
         }
         const localBlocks = editor.document as unknown as PartialBlock[];
         realtimeLocalBlocksRef.current = cloneRealtimeBlocks(localBlocks);
-        const mergedLocalPage = { ...nextPage, blocks: localBlocks };
+        const mergedLocalPage = { ...mergeMetadata(nextPage), blocks: localBlocks };
         const nextPages = { ...pagesRef.current, [pageId]: mergedLocalPage };
         serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [pageId]: nextPage };
         pagesRef.current = nextPages;
         persistStoredPages(nextPages);
         setPages(nextPages);
-        setTitle(nextPage.title);
-        setPageSettings(nextPage.settings);
-        setIsArchived(nextPage.archived);
-        window.requestAnimationFrame(() => {
+        setTitle(mergedLocalPage.title);
+        setPageSettings(mergedLocalPage.settings);
+        setIsArchived(mergedLocalPage.archived);
+        rememberPageDraft(mergedLocalPage, pageConflictsRef.current[pageId]?.base ?? nextPage);
+        if (!realtimeSentPatchesRef.current.size && !pageConflictsRef.current[pageId]) setLocalSaveState("saved");
+        if (loadVersion !== undefined) window.requestAnimationFrame(() => {
           if (loadVersion === editorLoadVersionRef.current) loadingPageRef.current = false;
         });
         return;
       }
 
       const blocksChanged = !currentSnapshot || !sameServerValue(currentSnapshot.blocks, nextPage.blocks);
-      if (message.type === "page.snapshot" || message.structural || blocksChanged) {
+      if (message.structural || blocksChanged) {
         replaceCurrentPage(nextPage, message.type === "page.updated");
         return;
       }
 
       // Metadata-only updates should not disturb the current editing surface.
-      const localPage = { ...nextPage, blocks: currentLocalPage.blocks };
+      const localPage = { ...mergeMetadata(nextPage), blocks: currentLocalPage.blocks };
       const nextPages = { ...pagesRef.current, [pageId]: localPage };
       serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [pageId]: nextPage };
       pagesRef.current = nextPages;
       persistStoredPages(nextPages);
       setPages(nextPages);
-      setTitle(nextPage.title);
-      setPageSettings(nextPage.settings);
-      setIsArchived(nextPage.archived);
+      setTitle(localPage.title);
+      setPageSettings(localPage.settings);
+      setIsArchived(localPage.archived);
     };
 
     const leaveUnavailablePage = (message: string) => {
@@ -3223,12 +3434,14 @@ function App() {
     };
 
     const connect = () => {
-      if (disposed) return;
+      if (disposed || !workspaceCacheIsCurrent()) return;
       const socket = new WebSocket(workspaceApi.pageRealtimeURL(pageId));
       realtimeSocketRef.current = socket;
       socket.addEventListener("open", () => {
         reconnectAttempt = 0;
-        realtimeConnectedPageIdRef.current = pageId;
+        // Socket transport readiness is not page synchronization readiness.
+        // The initial snapshot must reconcile any recovered draft first.
+        realtimeConnectedPageIdRef.current = null;
         realtimeLocalBlocksRef.current = cloneRealtimeBlocks(
           editor.document as unknown as PartialBlock[],
         );
@@ -3248,7 +3461,7 @@ function App() {
         }, 25_000);
       });
       socket.addEventListener("message", (event) => {
-        if (disposed || currentPageIdRef.current !== pageId) return;
+        if (disposed || !workspaceCacheIsCurrent() || currentPageIdRef.current !== pageId) return;
         let message: ServerPageRealtimeEvent;
         try {
           message = JSON.parse(String(event.data)) as ServerPageRealtimeEvent;
@@ -3256,7 +3469,7 @@ function App() {
           return;
         }
         if ((message.type === "page.snapshot" || message.type === "page.updated") && message.page) {
-          if (message.actorId && message.actorId !== authUser.id) flushRealtimeBlockPatch();
+          if (message.type !== "page.snapshot" && (!message.mutationId || !realtimeSentPatchesRef.current.has(message.mutationId))) flushRealtimeBlockPatch();
           applyServerPage(message.page, message);
           return;
         }
@@ -3269,7 +3482,7 @@ function App() {
           setNotice(message.message || "실시간 변경을 저장하지 못했어요");
           return;
         }
-        if (message.type === "database.updated" && message.database && message.actorId !== authUser.id) {
+        if (message.type === "database.updated" && message.database) {
           window.dispatchEvent(new CustomEvent(INLINE_DATABASE_REALTIME_EVENT, { detail: message.database }));
           return;
         }
@@ -3324,6 +3537,7 @@ function App() {
       realtimeConnectedPageIdRef.current = null;
       realtimePresenceBlockRef.current = null;
       realtimePendingBlocksRef.current = null;
+      realtimeSentPatchesRef.current.clear();
       realtimeProtectedBlockIdsRef.current.clear();
       realtimeProtectedDeletedBlockIdsRef.current.clear();
       setRealtimeParticipants([]);
@@ -3524,17 +3738,24 @@ function App() {
     }
     const targetUser = registeredNodiUsers.find((user) => user.id === userId);
     const targetPage = pagesRef.current[pageId];
-    if (!targetUser || !targetPage) return;
+    if (!targetPage) return;
     void (async () => {
       try {
         await workspaceApi.setShare(pageId, userId, permission);
         const refreshed = await workspaceApi.listShares(pageId);
+        // Search results can include approved users outside the initial directory
+        // page. Keep the returned members available for permission management.
+        setServerDirectoryUsers((current) => Array.from(new Map([
+          ...current.map((user) => [user.id, user] as const),
+          ...refreshed.members.map((member) => [member.user.id, member.user] as const),
+        ]).values()));
         commitPageShares((current) => ({
           ...current,
           [pageId]: storedShareFromServer(refreshed),
         }));
         setLocalSaveState("saved");
-        setNotice(`${targetUser.name}님에게 “${targetPage.title || "제목 없음"}” 페이지를 공유했어요`);
+        const sharedUser = refreshed.members.find((member) => member.user.id === userId)?.user ?? targetUser;
+        setNotice(`${sharedUser ? `${sharedUser.name}님에게 ` : ""}“${targetPage.title || "제목 없음"}” 페이지를 공유했어요`);
       } catch (error) {
         setLocalSaveState("error");
         setNotice(error instanceof Error ? error.message : "페이지를 공유하지 못했어요");
@@ -6238,7 +6459,7 @@ function App() {
   };
 
   const currentPage = pages[currentPageId] ?? rootPage;
-  const canEditCurrentPage = currentPage.permission !== "view" && !pageSettings.lockPage && !publicPageId;
+  const canEditCurrentPage = currentPage.permission !== "view" && !pageSettings.lockPage && !publicPageId && !loggingOut && !workspaceCacheError;
 
   useLayoutEffect(() => {
     // BlockNoteView normally mirrors the `editable` prop into the editor, but
@@ -6252,6 +6473,7 @@ function App() {
       realtimeBlocksTimerRef.current = null;
     }
     realtimePendingBlocksRef.current = null;
+    realtimeSentPatchesRef.current.clear();
     realtimeProtectedBlockIdsRef.current.clear();
     realtimeProtectedDeletedBlockIdsRef.current.clear();
     clearBlockSelection();
@@ -6328,7 +6550,6 @@ function App() {
   const isCurrentPageOwner = !currentPageShare || currentPageShare.ownerId === currentNodiUser.id;
   const isInvitedNodiMember = Boolean(currentPageShare?.members.some((member) => (
     member.userId === currentNodiUser.id
-    && registeredNodiUsers.some((user) => user.id === member.userId)
   )));
   const isSharedWithNodiMember = Boolean(currentPageShare?.members.length);
   const canCommentOnCurrentPage = Boolean(
@@ -6852,6 +7073,8 @@ function App() {
     );
   };
 
+  if (workspaceCacheError) return <WorkspaceCacheFailure message={workspaceCacheError} />;
+
   return (
     <div className="app-shell" data-theme={appTheme}>
       <aside
@@ -7285,7 +7508,7 @@ function App() {
                       ref={titleInputRef}
                       className="home-title-input"
                       value={title}
-                      onChange={(event) => setTitle(event.target.value)}
+                      onChange={(event) => changeTitle(event.target.value)}
                       aria-label="홈 제목"
                       disabled={!canEditCurrentPage}
                     />
@@ -7389,7 +7612,7 @@ function App() {
                   className="title-input"
                   value={title}
                   onChange={(event) => {
-                    setTitle(event.target.value);
+                    changeTitle(event.target.value);
                     dismissStarterDockForCurrentPage();
                   }}
                   aria-label="페이지 제목"
@@ -7406,6 +7629,12 @@ function App() {
                 </div>}
               </>
             )}
+            {pageConflicts[currentPageId] && <div className="page-sync-conflict" role="alert">
+              <strong>다른 곳에서 수정한 내용과 겹쳤어요</strong>
+              <p>내 변경은 이 기기에 보관되어 있어요. 이 페이지에 저장할 내용을 선택해 주세요.</p>
+              <button type="button" onClick={() => resolvePageConflict(currentPageId, "local")}>내 변경 저장</button>
+              <button type="button" onClick={() => resolvePageConflict(currentPageId, "remote")}>서버 내용 사용</button>
+            </div>}
             <div className={isHomePage ? "home-note-divider" : "divider"} />
             <div
               ref={editorContextRef}
