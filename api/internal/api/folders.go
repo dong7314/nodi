@@ -62,7 +62,13 @@ func (s *Server) createFolder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "VALIDATION_ERROR", "폴더 ID 또는 이름이 올바르지 않습니다.", nil)
 		return
 	}
-	if err := s.validateFolderParent(r, user.ID, "", input.ParentID); err != nil {
+	tx, err := s.beginWorkspaceWrite(r.Context(), user.ID)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if err := validateFolderParent(r, tx, user.ID, "", input.ParentID); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -71,8 +77,12 @@ func (s *Server) createFolder(w http.ResponseWriter, r *http.Request) {
 		order = *input.Order
 	}
 	var value folder
-	err := s.pool.QueryRow(r.Context(), `INSERT INTO folders(id,owner_id,parent_id,title,order_index,collapsed) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,parent_id,title,order_index,collapsed,created_at,updated_at`, input.ID, user.ID, input.ParentID, input.Title, order, input.Collapsed).Scan(&value.ID, &value.ParentID, &value.Title, &value.Order, &value.Collapsed, &value.CreatedAt, &value.UpdatedAt)
+	err = tx.QueryRow(r.Context(), `INSERT INTO folders(id,owner_id,parent_id,title,order_index,collapsed) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,parent_id,title,order_index,collapsed,created_at,updated_at`, input.ID, user.ID, input.ParentID, input.Title, order, input.Collapsed).Scan(&value.ID, &value.ParentID, &value.Title, &value.Order, &value.Collapsed, &value.CreatedAt, &value.UpdatedAt)
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -96,8 +106,16 @@ func (s *Server) updateFolder(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
+	// Serializing all folder writes for this owner protects cross-row moves as
+	// well as partial updates. Locking only the moved row cannot prevent A/B cycles.
+	tx, err := s.beginWorkspaceWrite(r.Context(), user.ID)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
 	var current folder
-	err = s.pool.QueryRow(r.Context(), `SELECT id,parent_id,title,order_index,collapsed,created_at,updated_at FROM folders WHERE id=$1 AND owner_id=$2`, folderID, user.ID).Scan(&current.ID, &current.ParentID, &current.Title, &current.Order, &current.Collapsed, &current.CreatedAt, &current.UpdatedAt)
+	err = tx.QueryRow(r.Context(), `SELECT id,parent_id,title,order_index,collapsed,created_at,updated_at FROM folders WHERE id=$1 AND owner_id=$2`, folderID, user.ID).Scan(&current.ID, &current.ParentID, &current.Title, &current.Order, &current.Collapsed, &current.CreatedAt, &current.UpdatedAt)
 	if err != nil {
 		handleError(w, err)
 		return
@@ -105,10 +123,10 @@ func (s *Server) updateFolder(w http.ResponseWriter, r *http.Request) {
 	parentID := current.ParentID
 	if input.ParentID.Set {
 		parentID = input.ParentID.Value
-	}
-	if err := s.validateFolderParent(r, user.ID, folderID, parentID); err != nil {
-		handleError(w, err)
-		return
+		if err := validateFolderParent(r, tx, user.ID, folderID, parentID); err != nil {
+			handleError(w, err)
+			return
+		}
 	}
 	title := current.Title
 	if input.Title != nil {
@@ -125,8 +143,12 @@ func (s *Server) updateFolder(w http.ResponseWriter, r *http.Request) {
 	if input.Collapsed != nil {
 		collapsed = *input.Collapsed
 	}
-	err = s.pool.QueryRow(r.Context(), `UPDATE folders SET parent_id=$1,title=$2,order_index=$3,collapsed=$4,updated_at=now() WHERE id=$5 RETURNING parent_id,title,order_index,collapsed,updated_at`, parentID, title, order, collapsed, folderID).Scan(&current.ParentID, &current.Title, &current.Order, &current.Collapsed, &current.UpdatedAt)
+	err = tx.QueryRow(r.Context(), `UPDATE folders SET parent_id=$1,title=$2,order_index=$3,collapsed=$4,updated_at=now() WHERE id=$5 RETURNING parent_id,title,order_index,collapsed,updated_at`, parentID, title, order, collapsed, folderID).Scan(&current.ParentID, &current.Title, &current.Order, &current.Collapsed, &current.UpdatedAt)
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -140,7 +162,13 @@ func (s *Server) deleteFolder(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	tag, err := s.pool.Exec(r.Context(), `DELETE FROM folders WHERE id=$1 AND owner_id=$2`, folderID, user.ID)
+	tx, err := s.beginWorkspaceWrite(r.Context(), user.ID)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	tag, err := tx.Exec(r.Context(), `DELETE FROM folders WHERE id=$1 AND owner_id=$2`, folderID, user.ID)
 	if err != nil {
 		handleError(w, err)
 		return
@@ -149,10 +177,14 @@ func (s *Server) deleteFolder(w http.ResponseWriter, r *http.Request) {
 		handleError(w, &apiError{404, "FOLDER_NOT_FOUND", "폴더를 찾을 수 없습니다.", nil})
 		return
 	}
+	if err = tx.Commit(r.Context()); err != nil {
+		handleError(w, err)
+		return
+	}
 	w.WriteHeader(204)
 }
 
-func (s *Server) validateFolderParent(r *http.Request, ownerID uuid.UUID, folderID string, parentID *string) error {
+func validateFolderParent(r *http.Request, query rowQuerier, ownerID uuid.UUID, folderID string, parentID *string) error {
 	if parentID == nil {
 		return nil
 	}
@@ -161,7 +193,12 @@ func (s *Server) validateFolderParent(r *http.Request, ownerID uuid.UUID, folder
 	}
 	var count int
 	var ownersMatch, noCycle bool
-	err := s.pool.QueryRow(r.Context(), `WITH RECURSIVE tree AS(SELECT id,owner_id,parent_id FROM folders WHERE id=$1 UNION ALL SELECT f.id,f.owner_id,f.parent_id FROM folders f JOIN tree t ON f.id=t.parent_id) SELECT count(*),coalesce(bool_and(owner_id=$2),false),coalesce(NOT bool_or(id=$3),false) FROM tree`, *parentID, ownerID, folderID).Scan(&count, &ownersMatch, &noCycle)
+	err := query.QueryRow(r.Context(), `WITH RECURSIVE tree AS (
+		SELECT id,owner_id,parent_id,ARRAY[id::text] AS path,false AS cycle FROM folders WHERE id=$1
+		UNION ALL
+		SELECT f.id,f.owner_id,f.parent_id,t.path||f.id,f.id=ANY(t.path)
+		FROM folders f JOIN tree t ON f.id=t.parent_id WHERE NOT t.cycle
+	) SELECT count(*),coalesce(bool_and(owner_id=$2),false),coalesce(NOT bool_or(id=$3 OR cycle),false) FROM tree`, *parentID, ownerID, folderID).Scan(&count, &ownersMatch, &noCycle)
 	if err != nil {
 		return err
 	}
@@ -171,7 +208,22 @@ func (s *Server) validateFolderParent(r *http.Request, ownerID uuid.UUID, folder
 	if !noCycle {
 		return &apiError{400, "FOLDER_CYCLE", "순환하는 폴더 구조는 만들 수 없습니다.", nil}
 	}
-	if count >= 3 {
+	height := 1
+	if folderID != "" {
+		var cycle bool
+		if err = query.QueryRow(r.Context(), `WITH RECURSIVE subtree AS (
+			SELECT id,1 AS depth,ARRAY[id::text] AS path,false AS cycle FROM folders WHERE id=$1
+			UNION ALL
+			SELECT f.id,t.depth+1,t.path||f.id,f.id=ANY(t.path)
+			FROM folders f JOIN subtree t ON f.parent_id=t.id WHERE NOT t.cycle
+		) SELECT coalesce(max(depth),1),coalesce(bool_or(cycle),false) FROM subtree`, folderID).Scan(&height, &cycle); err != nil {
+			return err
+		}
+		if cycle {
+			return &apiError{400, "FOLDER_CYCLE", "순환하는 폴더 구조는 만들 수 없습니다.", nil}
+		}
+	}
+	if count+height > 3 {
 		return &apiError{400, "FOLDER_DEPTH_EXCEEDED", "폴더는 최대 3단계까지 중첩할 수 있습니다.", nil}
 	}
 	return nil

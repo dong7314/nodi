@@ -95,6 +95,9 @@ func (s *Server) listNotifications(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
+	// A paginated response breaks before Next exhausts the rows. Release that
+	// connection before acquiring another one for the unread count.
+	rows.Close()
 	var unreadCount int
 	if err = s.pool.QueryRow(r.Context(), `SELECT count(*) FROM notifications WHERE recipient_id=$1 AND read_at IS NULL`, user.ID).Scan(&unreadCount); err != nil {
 		handleError(w, err)
