@@ -1,0 +1,53 @@
+# Isolated browser integration stack. Never points at the development database.
+name: nodi-browser-tests
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nodi_test
+      POSTGRES_USER: nodi_test
+      POSTGRES_PASSWORD: nodi_test
+    tmpfs: [/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U nodi_test -d nodi_test]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  minio:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: nodi_test
+      MINIO_ROOT_PASSWORD: nodi-test-only-secret
+      MINIO_API_CORS_ALLOW_ORIGIN: http://127.0.0.1:4184
+    tmpfs: [/data]
+    ports: ["127.0.0.1:19000:9000"]
+    healthcheck:
+      test: [CMD, curl, -f, http://localhost:9000/minio/health/live]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://nodi_test:nodi_test@postgres:5432/nodi_test?sslmode=disable
+      PUBLIC_BASE_URL: http://127.0.0.1:18787
+      CORS_ORIGINS: http://127.0.0.1:4184
+      ATTACHMENT_STORAGE: minio
+      MINIO_ENDPOINT: minio:9000
+      MINIO_PUBLIC_ENDPOINT: 127.0.0.1:19000
+      MINIO_ACCESS_KEY: nodi_test
+      MINIO_SECRET_KEY: nodi-test-only-secret
+      MINIO_BUCKET: nodi-test-attachments
+      MINIO_USE_SSL: "false"
+      MINIO_PUBLIC_USE_SSL: "false"
+      RATE_LIMIT_ENABLED: "false"
+      AUTO_MIGRATE: "true"
+    ports: ["127.0.0.1:18787:8787"]
+    read_only: true
+    tmpfs: [/tmp]

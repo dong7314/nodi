@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -567,6 +568,21 @@ func validPresetInput(input presetInput) bool {
 	return nonEmpty(input.Name, 24) && nonEmpty(input.Icon, 32) && nonEmpty(input.PageTitle, 80) && validJSONArray(input.Blocks) && (input.SourceFileName == nil || len([]rune(*input.SourceFileName)) <= 120)
 }
 
+// Serialize account bootstrap writes so retries preserve existing data and
+// concurrent preset creation cannot exceed the per-account limit.
+func (s *Server) beginWorkspaceWrite(ctx context.Context, ownerID uuid.UUID) (pgx.Tx, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var id uuid.UUID
+	if err = tx.QueryRow(ctx, `SELECT id FROM users WHERE id=$1 FOR UPDATE`, ownerID).Scan(&id); err != nil {
+		tx.Rollback(ctx)
+		return nil, err
+	}
+	return tx, nil
+}
+
 func (s *Server) createPreset(w http.ResponseWriter, r *http.Request) {
 	user, _ := userFromContext(r.Context())
 	var input presetInput
@@ -581,8 +597,27 @@ func (s *Server) createPreset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "프리셋 값이 올바르지 않습니다.", nil)
 		return
 	}
+	tx, err := s.beginWorkspaceWrite(r.Context(), user.ID)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	existing, err := scanPreset(tx.QueryRow(r.Context(), `SELECT id,name,icon,page_title,blocks_json,source_file_name,order_index,created_at,updated_at FROM starter_presets WHERE owner_id=$1 AND id=$2`, user.ID, input.ID))
+	if err == nil {
+		if err = tx.Commit(r.Context()); err != nil {
+			handleError(w, err)
+			return
+		}
+		writeData(w, http.StatusOK, existing)
+		return
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		handleError(w, err)
+		return
+	}
 	var count int
-	if err := s.pool.QueryRow(r.Context(), `SELECT count(*) FROM starter_presets WHERE owner_id=$1`, user.ID).Scan(&count); err != nil {
+	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM starter_presets WHERE owner_id=$1`, user.ID).Scan(&count); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -590,9 +625,13 @@ func (s *Server) createPreset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "PRESET_LIMIT", "시작 프리셋은 최대 5개까지 저장할 수 있습니다.", nil)
 		return
 	}
-	value, err := scanPreset(s.pool.QueryRow(r.Context(), `INSERT INTO starter_presets(id,owner_id,name,icon,page_title,blocks_json,source_file_name,order_index)
+	value, err := scanPreset(tx.QueryRow(r.Context(), `INSERT INTO starter_presets(id,owner_id,name,icon,page_title,blocks_json,source_file_name,order_index)
 		VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,name,icon,page_title,blocks_json,source_file_name,order_index,created_at,updated_at`, input.ID, user.ID, strings.TrimSpace(input.Name), input.Icon, strings.TrimSpace(input.PageTitle), input.Blocks, input.SourceFileName, input.OrderIndex))
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -702,10 +741,33 @@ func (s *Server) createTag(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "태그 값이 올바르지 않습니다.", nil)
 		return
 	}
+	tx, err := s.beginWorkspaceWrite(r.Context(), user.ID)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
 	var value tag
-	err := s.pool.QueryRow(r.Context(), `INSERT INTO tags(id,owner_id,name,color,order_index) VALUES($1,$2,$3,$4,$5)
+	err = tx.QueryRow(r.Context(), `SELECT id,name,color,order_index,created_at,updated_at FROM tags WHERE owner_id=$1 AND id=$2`, user.ID, input.ID).Scan(&value.ID, &value.Name, &value.Color, &value.OrderIndex, &value.CreatedAt, &value.UpdatedAt)
+	if err == nil {
+		if err = tx.Commit(r.Context()); err != nil {
+			handleError(w, err)
+			return
+		}
+		writeData(w, http.StatusOK, value)
+		return
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		handleError(w, err)
+		return
+	}
+	err = tx.QueryRow(r.Context(), `INSERT INTO tags(id,owner_id,name,color,order_index) VALUES($1,$2,$3,$4,$5)
 		RETURNING id,name,color,order_index,created_at,updated_at`, input.ID, user.ID, strings.TrimSpace(input.Name), input.Color, input.OrderIndex).Scan(&value.ID, &value.Name, &value.Color, &value.OrderIndex, &value.CreatedAt, &value.UpdatedAt)
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}

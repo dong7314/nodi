@@ -1,0 +1,35 @@
+name: nodi-api-tests
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nodi_test
+      POSTGRES_USER: nodi_test
+      POSTGRES_PASSWORD: test-only
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nodi_test -d nodi_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  tests:
+    image: golang:1.24-alpine
+    working_dir: /src
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TEST_DATABASE_URL: postgres://nodi_test:test-only@postgres:5432/nodi_test?sslmode=disable
+      CGO_ENABLED: "1"
+    volumes:
+      - .:/src:ro
+    command:
+      - sh
+      - -ec
+      - |
+        apk add --no-cache gcc musl-dev
+        go test -race -count=1 ./...
+        go vet ./...

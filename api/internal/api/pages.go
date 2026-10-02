@@ -1,9 +1,9 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -33,6 +33,10 @@ type page struct {
 }
 
 type rowScanner interface{ Scan(...any) error }
+
+type rowQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
 
 const (
 	pagePublicAccessSetting = "publicAccess"
@@ -193,7 +197,7 @@ func (s *Server) createPage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "INVALID_ID", "페이지 ID가 올바르지 않습니다.", nil)
 		return
 	}
-	if err := s.validatePageLocation(r, user.ID, "", input.ParentID, input.FolderID); err != nil {
+	if err := s.validatePageLocation(r, s.pool, user.ID, "", input.ParentID, input.FolderID); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -270,7 +274,13 @@ func (s *Server) updatePage(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	current, err := s.pageForAccess(r, user.ID, pageID, "edit")
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	current, err := scanPageForAccess(tx.QueryRow(r.Context(), pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived)) FOR UPDATE OF p`, user.ID, pageID), "edit")
 	if err != nil {
 		handleError(w, err)
 		return
@@ -292,7 +302,7 @@ func (s *Server) updatePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if structural {
-		if err := s.validatePageLocation(r, current.OwnerID, pageID, parentID, folderID); err != nil {
+		if err := s.validatePageLocation(r, tx, current.OwnerID, pageID, parentID, folderID); err != nil {
 			handleError(w, err)
 			return
 		}
@@ -303,6 +313,10 @@ func (s *Server) updatePage(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.Title != nil {
 		title = strings.TrimSpace(*input.Title)
+		if len([]rune(title)) > 500 {
+			writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "페이지 제목이 너무 깁니다.", nil)
+			return
+		}
 	}
 	if input.Settings != nil {
 		if !validJSONObject(input.Settings) {
@@ -329,20 +343,15 @@ func (s *Server) updatePage(w http.ResponseWriter, r *http.Request) {
 	if input.Archived != nil {
 		archived = *input.Archived
 	}
-	if input.Revision == nil {
-		// Collaborative editors intentionally omit a revision. Their updates use
-		// last-write-wins semantics and the resulting snapshot is broadcast to
-		// every connected participant. Private pages continue to use optimistic
-		// revision checks below.
-		err = s.pool.QueryRow(r.Context(), `UPDATE pages SET parent_id=$1,folder_id=$2,order_index=$3,title=$4,settings_json=$5,blocks_json=$6,archived=$7,revision=revision+1,updated_at=now() WHERE id=$8 RETURNING revision,updated_at`, parentID, folderID, order, title, settings, blocks, archived, pageID).Scan(&current.Revision, &current.UpdatedAt)
-	} else {
-		err = s.pool.QueryRow(r.Context(), `UPDATE pages SET parent_id=$1,folder_id=$2,order_index=$3,title=$4,settings_json=$5,blocks_json=$6,archived=$7,revision=revision+1,updated_at=now() WHERE id=$8 AND revision=$9 RETURNING revision,updated_at`, parentID, folderID, order, title, settings, blocks, archived, pageID, current.Revision).Scan(&current.Revision, &current.UpdatedAt)
-	}
-	if errors.Is(err, pgx.ErrNoRows) {
-		s.writePageRevisionConflict(w, r, pageID)
+	// Read and apply the patch under the same lock used by realtime merges.
+	// Missing fields now retain the latest stored values, even when a shared
+	// editor omits revision while another request edits blocks or metadata.
+	err = tx.QueryRow(r.Context(), `UPDATE pages SET parent_id=$1,folder_id=$2,order_index=$3,title=$4,settings_json=$5,blocks_json=$6,archived=$7,revision=revision+1,updated_at=now() WHERE id=$8 RETURNING revision,updated_at`, parentID, folderID, order, title, settings, blocks, archived, pageID).Scan(&current.Revision, &current.UpdatedAt)
+	if err != nil {
+		handleError(w, err)
 		return
 	}
-	if err != nil {
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -370,7 +379,13 @@ func (s *Server) updatePageBlocks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "VALIDATION_ERROR", "블록은 JSON 배열이어야 합니다.", nil)
 		return
 	}
-	current, err := s.pageForAccess(r, user.ID, pageID, "edit")
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	current, err := scanPageForAccess(tx.QueryRow(r.Context(), pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived)) FOR UPDATE OF p`, user.ID, pageID), "edit")
 	if err != nil {
 		handleError(w, err)
 		return
@@ -383,31 +398,18 @@ func (s *Server) updatePageBlocks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 409, "REVISION_CONFLICT", "페이지가 다른 위치에서 변경되었습니다.", map[string]any{"currentRevision": current.Revision})
 		return
 	}
-	if input.Revision == nil {
-		err = s.pool.QueryRow(r.Context(), `UPDATE pages SET blocks_json=$1,revision=revision+1,updated_at=now() WHERE id=$2 RETURNING revision,updated_at`, input.Blocks, pageID).Scan(&current.Revision, &current.UpdatedAt)
-	} else {
-		err = s.pool.QueryRow(r.Context(), `UPDATE pages SET blocks_json=$1,revision=revision+1,updated_at=now() WHERE id=$2 AND revision=$3 RETURNING revision,updated_at`, input.Blocks, pageID, current.Revision).Scan(&current.Revision, &current.UpdatedAt)
-	}
-	if errors.Is(err, pgx.ErrNoRows) {
-		s.writePageRevisionConflict(w, r, pageID)
+	err = tx.QueryRow(r.Context(), `UPDATE pages SET blocks_json=$1,revision=revision+1,updated_at=now() WHERE id=$2 RETURNING revision,updated_at`, input.Blocks, pageID).Scan(&current.Revision, &current.UpdatedAt)
+	if err != nil {
+		handleError(w, err)
 		return
 	}
-	if err != nil {
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}
 	current.Blocks = input.Blocks
 	s.realtime.broadcast(pageID, pageRealtimeEvent{Type: "page.updated", Page: &current, ActorID: user.ID.String()})
 	writeData(w, 200, current)
-}
-
-func (s *Server) writePageRevisionConflict(w http.ResponseWriter, r *http.Request, pageID string) {
-	var revision int64
-	if err := s.pool.QueryRow(r.Context(), `SELECT revision FROM pages WHERE id=$1`, pageID).Scan(&revision); err != nil {
-		handleError(w, err)
-		return
-	}
-	writeError(w, http.StatusConflict, "REVISION_CONFLICT", "페이지가 다른 위치에서 변경되었습니다.", map[string]any{"currentRevision": revision})
 }
 
 func (s *Server) setPageFavorite(w http.ResponseWriter, r *http.Request) {
@@ -497,11 +499,16 @@ func (s *Server) getPublicPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	refs, err := pageResourceIDs(value.Blocks)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
 	databases := make([]inlineDatabase, 0)
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT id,owner_id,page_id,state_json,revision,created_at,updated_at
-		FROM inline_databases WHERE page_id=$1 ORDER BY created_at
-	`, pageID)
+		FROM inline_databases WHERE page_id=$1 AND id=ANY($2::text[]) ORDER BY created_at
+	`, pageID, refs.databases)
 	if err != nil {
 		handleError(w, err)
 		return
@@ -509,6 +516,12 @@ func (s *Server) getPublicPage(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var database inlineDatabase
 		if err = rows.Scan(&database.ID, &database.OwnerID, &database.PageID, &database.State, &database.Revision, &database.CreatedAt, &database.UpdatedAt); err != nil {
+			rows.Close()
+			handleError(w, err)
+			return
+		}
+		database.State, err = publicDatabaseState(database.State)
+		if err != nil {
 			rows.Close()
 			handleError(w, err)
 			return
@@ -528,8 +541,11 @@ func (s *Server) getPublicPage(w http.ResponseWriter, r *http.Request) {
 	}
 	childPages := make([]publicChildPage, 0)
 	childRows, err := s.pool.Query(r.Context(), `
-		SELECT id,title FROM pages WHERE parent_id=$1 AND NOT archived ORDER BY order_index,created_at
-	`, pageID)
+		SELECT id,title FROM pages
+		WHERE (parent_id=$1 OR id=ANY($2::text[])) AND NOT archived
+		  AND settings_json @> '{"publicAccess":true}'::jsonb
+		ORDER BY order_index,created_at
+	`, pageID, refs.childPages)
 	if err != nil {
 		handleError(w, err)
 		return
@@ -544,6 +560,15 @@ func (s *Server) getPublicPage(w http.ResponseWriter, r *http.Request) {
 		childPages = append(childPages, child)
 	}
 	if err = childRows.Err(); err != nil {
+		handleError(w, err)
+		return
+	}
+	childTitles := make(map[string]string, len(childPages))
+	for _, child := range childPages {
+		childTitles[child.ID] = child.Title
+	}
+	value.Blocks, err = publicPageBlocks(value.Blocks, childTitles)
+	if err != nil {
 		handleError(w, err)
 		return
 	}
@@ -588,7 +613,11 @@ func (s *Server) searchPages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pageForAccess(r *http.Request, userID uuid.UUID, pageID, required string) (page, error) {
-	value, err := scanPage(s.pool.QueryRow(r.Context(), pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived))`, userID, pageID))
+	return scanPageForAccess(s.pool.QueryRow(r.Context(), pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived))`, userID, pageID), required)
+}
+
+func scanPageForAccess(scanner rowScanner, required string) (page, error) {
+	value, err := scanPage(scanner)
 	if err != nil {
 		return page{}, err
 	}
@@ -629,13 +658,13 @@ func (s *Server) authorizePage(r *http.Request, userID uuid.UUID, pageID, requir
 	return access, nil
 }
 
-func (s *Server) validatePageLocation(r *http.Request, ownerID uuid.UUID, pageID string, parentID, folderID *string) error {
+func (s *Server) validatePageLocation(r *http.Request, query rowQuerier, ownerID uuid.UUID, pageID string, parentID, folderID *string) error {
 	if parentID != nil {
 		if *parentID == pageID {
 			return &apiError{400, "PAGE_CYCLE", "순환하는 페이지 구조는 만들 수 없습니다.", nil}
 		}
 		var valid bool
-		err := s.pool.QueryRow(r.Context(), `WITH RECURSIVE tree AS(SELECT id,owner_id,parent_id FROM pages WHERE id=$1 UNION ALL SELECT p.id,p.owner_id,p.parent_id FROM pages p JOIN tree t ON p.id=t.parent_id) SELECT count(*)>0 AND bool_and(owner_id=$2) AND NOT bool_or(id=$3) FROM tree`, *parentID, ownerID, pageID).Scan(&valid)
+		err := query.QueryRow(r.Context(), `WITH RECURSIVE tree AS(SELECT id,owner_id,parent_id FROM pages WHERE id=$1 UNION ALL SELECT p.id,p.owner_id,p.parent_id FROM pages p JOIN tree t ON p.id=t.parent_id) SELECT count(*)>0 AND bool_and(owner_id=$2) AND NOT bool_or(id=$3) FROM tree`, *parentID, ownerID, pageID).Scan(&valid)
 		if err != nil {
 			return err
 		}
@@ -645,7 +674,7 @@ func (s *Server) validatePageLocation(r *http.Request, ownerID uuid.UUID, pageID
 	}
 	if folderID != nil {
 		var exists bool
-		if err := s.pool.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM folders WHERE id=$1 AND owner_id=$2)`, *folderID, ownerID).Scan(&exists); err != nil {
+		if err := query.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM folders WHERE id=$1 AND owner_id=$2)`, *folderID, ownerID).Scan(&exists); err != nil {
 			return err
 		}
 		if !exists {
