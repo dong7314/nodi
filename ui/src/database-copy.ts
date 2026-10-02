@@ -1,28 +1,28 @@
 import type { PartialBlock } from "@blocknote/core";
 import type { DatabaseState } from "./InlineDatabase";
 import { makeId } from "./types";
+import { cacheDatabaseSnapshot, DATABASE_NOT_READY_MESSAGE, isDatabaseState, readDatabaseSnapshot } from "./database-cache";
 
 type ResourceBlock = { id?: string; type?: string; props?: { databaseId?: string }; children?: PartialBlock[] };
-const storageKey = (id: string) => `nodi:database:${id}`;
-
 export function copyDatabase(sourceId: string, snapshot?: DatabaseState) {
-  const state = snapshot ?? JSON.parse(localStorage.getItem(storageKey(sourceId)) ?? "null") as DatabaseState | null;
-  if (!state || !Array.isArray(state.properties) || !Array.isArray(state.records) || !Array.isArray(state.views)) {
-    throw new Error("표 내용을 불러온 뒤 다시 복사해 주세요.");
+  const state = snapshot ?? readDatabaseSnapshot(sourceId);
+  if (!isDatabaseState(state)) {
+    throw new Error(DATABASE_NOT_READY_MESSAGE);
   }
   const id = makeId("database");
-  localStorage.setItem(storageKey(id), JSON.stringify(state));
+  cacheDatabaseSnapshot(id, state);
   return id;
 }
 
-export function collectDatabaseSnapshots(blocks: PartialBlock[]): Record<string, DatabaseState> {
+export function collectDatabaseSnapshots(blocks: PartialBlock[], requireAll = false): Record<string, DatabaseState> {
   const snapshots: Record<string, DatabaseState> = {};
   const visit = (values: PartialBlock[]) => values.forEach((value) => {
     const block = value as ResourceBlock;
     if (block.type === "database") {
       const id = block.props?.databaseId || `database-${block.id}`;
-      const raw = localStorage.getItem(storageKey(id));
-      if (raw) snapshots[id] = JSON.parse(raw) as DatabaseState;
+      const state = readDatabaseSnapshot(id);
+      if (state) snapshots[id] = state;
+      else if (requireAll) throw new Error(DATABASE_NOT_READY_MESSAGE);
     }
     if (block.children) visit(block.children);
   });

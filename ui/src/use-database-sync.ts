@@ -4,6 +4,7 @@ import { NodiApiError } from "./api-client";
 import { workspaceApi, type ServerInlineDatabase } from "./server-api";
 import { mergeDatabase, type ConflictChoices, type DatabaseConflict } from "./database-merge";
 import type { DatabaseState } from "./InlineDatabase";
+import { cacheDatabaseSnapshot, readDatabaseDraft } from "./database-cache";
 
 // A returning editor must wait for saves from the editor that just unmounted.
 const queues = new Map<string, Promise<unknown>>();
@@ -42,8 +43,13 @@ export function useDatabaseSync({
     let collision: Conflict | null = null;
     let pendingRemote: ServerInlineDatabase<DatabaseState> | null = null;
     let timer: number | undefined;
+    const cache = (state: DatabaseState) => {
+      try { cacheDatabaseSnapshot(databaseId, state); }
+      catch { if (active) latest.current.onNotice("표의 임시 저장 공간이 부족하거나 사용할 수 없어요"); }
+    };
     const show = (state: DatabaseState) => {
       desired = state;
+      cache(state);
       if (active) latest.current.onLoad(state);
     };
     const remember = () => {
@@ -124,8 +130,10 @@ export function useDatabaseSync({
       initializing = true;
       void enqueueDatabaseSync(databaseId, async () => {
         if (!active) return;
-        let draft: Draft | null = null;
-        try { draft = JSON.parse(localStorage.getItem(draftKey(databaseId)) ?? "null"); } catch { /* Ignore malformed storage. */ }
+        const draft: Draft | null = readDatabaseDraft(databaseId);
+        // A durable local draft is real data even while its server is offline.
+        // Show/cache it before fetching; never cache the initial placeholder.
+        if (draft && !latest.current.readOnly) show(draft.state);
         let value: ServerInlineDatabase<DatabaseState>;
         try {
           value = await workspaceApi.getDatabase<DatabaseState>(databaseId);
@@ -156,7 +164,9 @@ export function useDatabaseSync({
       flush,
       retry: () => ready ? flush() : initialize(),
       schedule: (state) => {
-        if (!ready || latest.current.readOnly || collision || same(state, desired)) return;
+        if (!ready) return;
+        cache(state);
+        if (latest.current.readOnly || collision || same(state, desired)) return;
         desired = state;
         remember();
         if (timer !== undefined) window.clearTimeout(timer);
@@ -207,10 +217,12 @@ export function useDatabaseSync({
   }, [databaseId, enabled, pageId, readOnly, realtimeEvent]);
 
   useEffect(() => {
-    try { localStorage.setItem(`nodi:database:${databaseId}`, JSON.stringify(database)); }
-    catch { latest.current.onNotice("표의 임시 저장 공간이 부족하거나 사용할 수 없어요"); }
-    sessionRef.current?.schedule(database);
-  }, [database, databaseId]);
+    if (enabled) sessionRef.current?.schedule(database);
+    else {
+      try { cacheDatabaseSnapshot(databaseId, database); }
+      catch { latest.current.onNotice("표의 임시 저장 공간이 부족하거나 사용할 수 없어요"); }
+    }
+  }, [database, databaseId, enabled]);
 
   return { loading, error, conflict, flush: () => sessionRef.current?.flush(),
     retry: () => sessionRef.current?.retry(), resolve: (choices: ConflictChoices) => sessionRef.current?.resolve(choices) };

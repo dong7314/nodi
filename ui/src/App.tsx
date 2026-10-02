@@ -12,7 +12,7 @@ import type {
 } from "react";
 import { createPortal } from "react-dom";
 import { TextSelection } from "prosemirror-state";
-import { BlockNoteSchema, createCodeBlockSpec, defaultBlockSpecs, type BlockNoteEditor, type PartialBlock } from "@blocknote/core";
+import { BlockNoteSchema, createCodeBlockSpec, defaultBlockSpecs, prosemirrorSliceToSlicedBlocks, type BlockNoteEditor, type PartialBlock } from "@blocknote/core";
 import { filterSuggestionItems, insertOrUpdateBlockForSlashMenu } from "@blocknote/core/extensions";
 import { ko } from "@blocknote/core/locales";
 import { BlockNoteView } from "@blocknote/mantine";
@@ -683,6 +683,72 @@ function clipboardBlockWithoutId(value: unknown): PartialBlock | null {
     if (children.length > 0) partialBlock.children = children;
   }
   return partialBlock as unknown as PartialBlock;
+}
+
+function writeEditorBlocksToClipboard(
+  clipboardData: DataTransfer,
+  activeEditor: BlockNoteEditor<any, any, any>,
+  blocks: PartialBlock[],
+) {
+  const payload = JSON.stringify({ version: 1, blocks, databases: collectDatabaseSnapshots(blocks, true) });
+  const externalHtml = activeEditor.blocksToHTMLLossy(blocks);
+  const blockNoteHtml = activeEditor.blocksToFullHTML(blocks);
+  clipboardData.clearData();
+  clipboardData.setData(NODI_BLOCK_CLIPBOARD_MIME, payload);
+  clipboardData.setData("blocknote/html", blockNoteHtml);
+  clipboardData.setData("text/html", externalHtml);
+  clipboardData.setData("text/plain", clipboardBlocksPlainText(blocks));
+}
+
+function copySelectedDatabaseBlocks(
+  event: Pick<ClipboardEvent, "target" | "clipboardData" | "preventDefault" | "stopPropagation">,
+  activeEditor: BlockNoteEditor<any, any, any>,
+  cut = false,
+) {
+  if (!event.clipboardData) return false;
+  // Cell inputs and other native controls own their text selection even while
+  // ProseMirror retains an earlier whole-document selection.
+  const target = event.target instanceof Element ? event.target : null;
+  if (target?.closest("input, textarea, select")) return false;
+  const view = activeEditor.prosemirrorView;
+  const { state } = view;
+  let { from, to } = state.selection;
+  const nativeSelection = window.getSelection();
+  if (nativeSelection?.rangeCount && !nativeSelection.isCollapsed
+    && view.dom.contains(nativeSelection.anchorNode) && view.dom.contains(nativeSelection.focusNode)) {
+    const range = nativeSelection.getRangeAt(0);
+    const parent = range.commonAncestorContainer instanceof Element
+      ? range.commonAncestorContainer : range.commonAncestorContainer.parentElement;
+    const island = parent?.closest('[contenteditable="false"]');
+    if (island && island !== view.dom && view.dom.contains(island)) return false;
+    // Capture runs before ProseMirror observes the native selection. This also
+    // handles native selections in a read-only preview without changing it.
+    from = view.posAtDOM(range.startContainer, range.startOffset);
+    to = view.posAtDOM(range.endContainer, range.endOffset);
+  }
+  if (from === to) return false;
+  const slice = state.doc.slice(from, to, true);
+  let includesDatabase = false;
+  slice.content.descendants((node) => {
+    if (node.type.name === "database") includesDatabase = true;
+  });
+  if (!includesDatabase) return false;
+
+  event.preventDefault();
+  event.stopPropagation();
+  try {
+    // Keep partial paragraphs at either edge instead of copying whole blocks.
+    const blocks = prosemirrorSliceToSlicedBlocks(slice).blocks as PartialBlock[];
+    writeEditorBlocksToClipboard(event.clipboardData, activeEditor, blocks);
+    if (cut && activeEditor.isEditable) {
+      view.dispatch(state.tr.deleteRange(from, to).scrollIntoView().setMeta("uiEvent", "cut"));
+    }
+  } catch (error) {
+    window.dispatchEvent(new CustomEvent(APP_NOTICE_EVENT, {
+      detail: error instanceof Error ? error.message : "블록을 클립보드에 복사하지 못했어요",
+    }));
+  }
+  return true;
 }
 
 function parseNodiClipboardBlocks(clipboardData: DataTransfer | null, copyDatabases = false): PartialBlock[] | null {
@@ -1766,6 +1832,7 @@ function App() {
   const [tagOptions, setTagOptions] = useState<TagOption[]>(DEFAULT_TAG_OPTIONS);
   const [starterDockPageId, setStarterDockPageId] = useState<string | null>(null);
   const [selectedStarterPreset, setSelectedStarterPreset] = useState<string | null>(null);
+  const presetApplyVersionRef = useRef(0);
   const [pendingBlockDeletion, setPendingBlockDeletion] = useState<string[] | null>(null);
   const [activeCommentBlockId, setActiveCommentBlockId] = useState<string | null>(null);
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
@@ -3706,19 +3773,50 @@ function App() {
     if (starterDockPageId === currentPageIdRef.current) dismissStarterDock();
   };
 
-  const startWithSelectedPreset = () => {
+  const startWithSelectedPreset = async () => {
     if (!selectedStarterPreset) return;
     const preset = starterPresets.find((item) => item.id === selectedStarterPreset);
     if (!preset) return;
 
-    const blocks = JSON.parse(JSON.stringify(
-      preset.blocks.length > 0 ? preset.blocks : [{ type: "paragraph", content: "" }],
-    )) as PartialBlock[];
-    editor.replaceBlocks(editor.document, blocks);
-    setTitle(preset.pageTitle.trim() || "제목 없음");
-    setNotice(`“${preset.name}” 프리셋을 적용했어요`);
-    dismissStarterDock();
-    window.requestAnimationFrame(() => editor.focus());
+    const requestVersion = ++presetApplyVersionRef.current;
+    const pageId = currentPageIdRef.current;
+    const loadVersion = editorLoadVersionRef.current;
+    const initialBlocks = editor.document;
+    const initialTitle = titleInputRef.current?.value;
+    const isCurrentRequest = () => requestVersion === presetApplyVersionRef.current
+      && currentPageIdRef.current === pageId && readLocalAuthUser()?.id === authUser?.id;
+    try {
+      const sourceBlocks = JSON.parse(JSON.stringify(
+        preset.blocks.length > 0 ? preset.blocks : [{ type: "paragraph", content: "" }],
+      )) as PartialBlock[];
+      const snapshots = collectDatabaseSnapshots(sourceBlocks);
+      const missing = new Set<string>();
+      const collectMissing = (blocks: PartialBlock[]) => blocks.forEach((value) => {
+        const block = value as { id?: string; type?: string; props?: { databaseId?: string }; children?: PartialBlock[] };
+        if (block.type === "database") {
+          const id = block.props?.databaseId || `database-${block.id}`;
+          if (!snapshots[id]) missing.add(id);
+        }
+        if (block.children) collectMissing(block.children);
+      });
+      collectMissing(sourceBlocks);
+      if (missing.size) await Promise.all([...missing].map(async (id) => {
+        snapshots[id] = (await workspaceApi.getDatabase<DatabaseState>(id)).state;
+      }));
+      // A slow resource lookup cannot replace edits made while it was pending,
+      // nor apply to another page/account or supersede a newer preset request.
+      if (!isCurrentRequest() || loadVersion !== editorLoadVersionRef.current
+        || !currentPageIsEditable() || initialTitle !== titleInputRef.current?.value
+        || !sameServerValue(initialBlocks, editor.document)) return;
+      const blocks = copyDatabaseReferences(sourceBlocks, snapshots);
+      editor.replaceBlocks(editor.document, blocks);
+      setTitle(preset.pageTitle.trim() || "제목 없음");
+      setNotice(`“${preset.name}” 프리셋을 적용했어요`);
+      dismissStarterDock();
+      window.requestAnimationFrame(() => editor.focus());
+    } catch (error) {
+      if (isCurrentRequest()) setNotice(error instanceof Error ? error.message : "프리셋의 표 내용을 불러오지 못했어요");
+    }
   };
 
   const exportJson = () => {
@@ -5426,19 +5524,7 @@ function App() {
       .map((blockId) => editor.getBlock(blockId))
       .filter((block): block is EditorBlock => block !== undefined);
     if (blocks.length === 0) return [];
-    const clipboardBlocks = blocks as unknown as PartialBlock[];
-    const plainText = clipboardBlocksPlainText(clipboardBlocks);
-    const externalHtml = editor.blocksToHTMLLossy(clipboardBlocks);
-    const blockNoteHtml = editor.blocksToFullHTML(clipboardBlocks);
-    event.clipboardData.clearData();
-    event.clipboardData.setData(NODI_BLOCK_CLIPBOARD_MIME, JSON.stringify({
-      version: 1,
-      blocks: clipboardBlocks,
-      databases: collectDatabaseSnapshots(clipboardBlocks),
-    }));
-    event.clipboardData.setData("blocknote/html", blockNoteHtml);
-    event.clipboardData.setData("text/html", externalHtml);
-    event.clipboardData.setData("text/plain", plainText);
+    writeEditorBlocksToClipboard(event.clipboardData, editor, blocks as unknown as PartialBlock[]);
     return blocks;
   };
 
@@ -5459,6 +5545,7 @@ function App() {
       return;
     }
 
+    if (copySelectedDatabaseBlocks(event, editor)) return;
     const { state } = editor.prosemirrorView;
     const { selection } = state;
     if (!selection.empty) {
@@ -5523,6 +5610,7 @@ function App() {
 
   const handleEditorCut = (event: ReactClipboardEvent<HTMLDivElement>) => {
     if (!currentPageIsEditable()) return;
+    if (!blockSelectionModeRef.current && copySelectedDatabaseBlocks(event, editor, true)) return;
     // 텍스트를 드래그해 선택한 상태에서는 BlockNote/브라우저의 기본
     // 잘라내기를 그대로 사용한다. 이전 블록 선택 상태가 남아 있더라도
     // 네이티브 텍스트 선택을 우선해야 현재 문장만 정확히 잘린다.
@@ -8572,7 +8660,15 @@ function PagePreviewDrawer({
     schema: editorSchema,
     initialContent: (page.blocks.length ? page.blocks : [{ type: "paragraph", content: "" }]) as never,
     dictionary: ko,
-    pasteHandler: ({ event, editor, defaultPasteHandler }) => insertAttachmentFiles(event, editor) || defaultPasteHandler(),
+    pasteHandler: ({ event, editor, defaultPasteHandler }) => {
+      if (insertAttachmentFiles(event, editor)) return true;
+      const isCodeBlock = editor.transact((transaction) => (
+        transaction.selection.$from.parent.type.spec.code === true
+        && transaction.selection.$to.parent.type.spec.code === true
+      ));
+      return (!event.clipboardData?.files.length && !isCodeBlock && pasteNodiClipboardBlocks(editor, event.clipboardData))
+        || defaultPasteHandler();
+    },
     uploadFile: async (file, blockId) => {
       let url: string;
       try { url = await uploadNodiAttachment(file, { authenticated: serverEnabled, pageId: page.id }); }
@@ -8589,6 +8685,23 @@ function PagePreviewDrawer({
     },
   });
   const canEditPreviewPage = page.permission !== "view" && !page.settings.lockPage;
+  useEffect(() => {
+    const handleClipboard = (event: ClipboardEvent) => {
+      const root = previewEditor.prosemirrorView.dom;
+      const selection = window.getSelection();
+      if (!selection?.anchorNode || !selection.focusNode
+        || !root.contains(selection.anchorNode) || !root.contains(selection.focusNode)) return;
+      // Read-only native selections can dispatch copy on the body or the
+      // previously focused editor. The selected range identifies its owner.
+      copySelectedDatabaseBlocks(event, previewEditor, event.type === "cut" && canEditPreviewPage);
+    };
+    document.addEventListener("copy", handleClipboard, true);
+    document.addEventListener("cut", handleClipboard, true);
+    return () => {
+      document.removeEventListener("copy", handleClipboard, true);
+      document.removeEventListener("cut", handleClipboard, true);
+    };
+  }, [canEditPreviewPage, previewEditor]);
   const [previewTitle, setPreviewTitle] = useState(page.title);
   const previewDocumentRef = useRef(page.blocks);
   const previewLoadingRef = useRef(false);
