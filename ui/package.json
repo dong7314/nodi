@@ -6,8 +6,10 @@
   "packageManager": "pnpm@10.29.2",
   "scripts": {
     "dev": "vite",
+    "test": "playwright test",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:integration": "playwright test -c playwright.integration.config.ts"
   },
   "dependencies": {
     "@blocknote/core": "latest",
@@ -28,6 +30,7 @@
     "shiki": "4.3.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/react": "latest",
     "@types/react-dom": "latest",
     "@vitejs/plugin-react": "latest",

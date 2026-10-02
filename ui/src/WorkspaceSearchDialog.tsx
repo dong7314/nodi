@@ -1,3 +1,4 @@
+import { isComposingKey } from "./ime";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { ArrowUpRight, FileText, Search, X } from "lucide-react";
@@ -249,6 +250,7 @@ export function WorkspaceSearchDialog({
   };
 
   const handleDialogKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (isComposingKey(event.nativeEvent)) return;
     if (event.key === "Escape") {
       event.preventDefault();
       closeWithAnimation(onClose);

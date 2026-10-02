@@ -1,3 +1,4 @@
+import { isComposingKey } from "./ime";
 import { createContext, useContext, useEffect, useRef, useState, type Dispatch, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction } from "react";
 import * as Popover from "@radix-ui/react-popover";
 import { ArrowDownAZ, ArrowUpAZ, CalendarDays, Check, ChevronLeft, ChevronRight, Columns3, Copy, Eye, EyeOff, Filter, Link2, Mail, MoreHorizontal, Phone, Plus, RotateCcw, Search, SlidersHorizontal, Table2, Tags, Timeline, Trash2, X } from "lucide-react";
@@ -5,8 +6,10 @@ import { DatePicker } from "./components/ui/date-picker";
 import { Select } from "./components/ui/select";
 import { ConfirmDialog } from "./components/ui/confirm-dialog";
 import { makeId, TAG_COLORS, toDateInput, type TagColor } from "./types";
+import { enqueueDatabaseSync, useDatabaseSync } from "./use-database-sync";
+import { conflictLabel, type ConflictChoices, type DatabaseConflict } from "./database-merge";
 import { NodiApiError } from "./api-client";
-import { workspaceApi, type ServerInlineDatabase } from "./server-api";
+import { workspaceApi } from "./server-api";
 
 export const INLINE_DATABASE_REALTIME_EVENT = "nodi:inline-database-realtime";
 export const DATABASE_COLUMN_RESIZE_START_EVENT = "nodi:database-column-resize-start";
@@ -274,23 +277,24 @@ function recordsForView(records: DatabaseRecord[], properties: DatabaseProperty[
 
 export function InlineDatabase({ databaseId, locked: editorLocked, onNotice, onRemove }: { databaseId: string; locked: boolean; onNotice: (message: string) => void; onRemove: () => void }) {
   const serverSync = useContext(InlineDatabaseSyncContext);
-  const locked = editorLocked || Boolean(serverSync.readOnly);
   const [database, setDatabase] = useState<DatabaseState>(() => serverSync.initialStates?.[databaseId] ?? loadDatabase(databaseId));
   const [pendingDeletion, setPendingDeletion] = useState<DatabaseRecord | null>(null);
   const [pendingDatabaseRemoval, setPendingDatabaseRemoval] = useState(false);
   const [timelineStart, setTimelineStart] = useState(() => beginningOfWeek(new Date()));
   const [openPopoverId, setOpenPopoverId] = useState<string | null>(null);
   const [searchQueries, setSearchQueries] = useState<Record<string, string>>({});
-  const databaseRef = useRef(database);
-  const serverRevisionRef = useRef<number | undefined>(undefined);
-  const serverReadyRef = useRef(!serverSync.enabled);
-  const serverSaveTimerRef = useRef<number | null>(null);
-  const applyingRealtimeStateRef = useRef(false);
-  const noticeRef = useRef(onNotice);
-
-  useEffect(() => {
-    databaseRef.current = database;
-  }, [database]);
+  const sync = useDatabaseSync({
+    databaseId,
+    database,
+    onLoad: setDatabase,
+    onNotice,
+    enabled: serverSync.enabled,
+    pageId: serverSync.pageId,
+    readOnly: editorLocked || Boolean(serverSync.readOnly),
+    realtimeEvent: INLINE_DATABASE_REALTIME_EVENT,
+  });
+  const flushDatabase = sync.flush;
+  const locked = editorLocked || Boolean(serverSync.readOnly) || sync.loading || Boolean(sync.conflict);
 
   useEffect(() => {
     if (serverSync.enabled) return;
@@ -299,109 +303,11 @@ export function InlineDatabase({ databaseId, locked: editorLocked, onNotice, onR
   }, [databaseId, serverSync.enabled, serverSync.initialStates]);
 
   useEffect(() => {
-    noticeRef.current = onNotice;
-  }, [onNotice]);
-
-  useEffect(() => {
     if (!locked) return;
     setOpenPopoverId(null);
     setPendingDeletion(null);
     setPendingDatabaseRemoval(false);
-    if (serverSaveTimerRef.current) {
-      window.clearTimeout(serverSaveTimerRef.current);
-      serverSaveTimerRef.current = null;
-    }
   }, [locked]);
-
-  useEffect(() => {
-    if (!serverSync.enabled) {
-      serverReadyRef.current = true;
-      serverRevisionRef.current = undefined;
-      return;
-    }
-
-    let active = true;
-    serverReadyRef.current = false;
-    serverRevisionRef.current = undefined;
-    void workspaceApi.getDatabase<DatabaseState>(databaseId).then((value) => {
-      if (!active) return;
-      serverRevisionRef.current = value.revision;
-      serverReadyRef.current = true;
-      setDatabase(value.state);
-    }).catch(async (error) => {
-      if (!active) return;
-      if (error instanceof NodiApiError && error.status === 404 && !locked) {
-        try {
-          const created = await workspaceApi.putDatabase(databaseId, {
-            pageId: serverSync.pageId,
-            state: databaseRef.current,
-          });
-          if (!active) return;
-          serverRevisionRef.current = created.revision;
-          serverReadyRef.current = true;
-          return;
-        } catch (createError) {
-          if (!active) return;
-          noticeRef.current(createError instanceof Error ? createError.message : "데이터베이스를 서버에 저장하지 못했어요");
-        }
-      } else {
-        noticeRef.current(error instanceof Error ? error.message : "데이터베이스를 서버에서 불러오지 못했어요");
-      }
-      serverReadyRef.current = false;
-    });
-
-    return () => {
-      active = false;
-      if (serverSaveTimerRef.current) window.clearTimeout(serverSaveTimerRef.current);
-    };
-  }, [databaseId, locked, serverSync.enabled, serverSync.pageId]);
-
-  useEffect(() => {
-    if (!serverSync.enabled) return;
-    const applyRealtimeState = (event: Event) => {
-      const value = (event as CustomEvent<ServerInlineDatabase<DatabaseState>>).detail;
-      if (!value || value.id !== databaseId || value.revision <= (serverRevisionRef.current ?? 0)) return;
-      serverRevisionRef.current = value.revision;
-      applyingRealtimeStateRef.current = true;
-      setDatabase(value.state);
-    };
-    window.addEventListener(INLINE_DATABASE_REALTIME_EVENT, applyRealtimeState);
-    return () => window.removeEventListener(INLINE_DATABASE_REALTIME_EVENT, applyRealtimeState);
-  }, [databaseId, serverSync.enabled]);
-
-  useEffect(() => {
-    window.localStorage.setItem(databaseStorageKey(databaseId), JSON.stringify(database));
-    if (applyingRealtimeStateRef.current) {
-      applyingRealtimeStateRef.current = false;
-      return;
-    }
-    if (locked || !serverSync.enabled || !serverReadyRef.current) return;
-    if (serverSaveTimerRef.current) window.clearTimeout(serverSaveTimerRef.current);
-    serverSaveTimerRef.current = window.setTimeout(() => {
-      void workspaceApi.putDatabase(databaseId, {
-        pageId: serverSync.pageId,
-        state: database,
-        revision: serverSync.collaborative ? undefined : serverRevisionRef.current,
-      }).then((value) => {
-        serverRevisionRef.current = value.revision;
-      }).catch((error) => {
-        if (error instanceof NodiApiError && error.status === 409) {
-          void workspaceApi.getDatabase<DatabaseState>(databaseId).then((latest) => {
-            serverRevisionRef.current = latest.revision;
-            setDatabase(latest.state);
-            noticeRef.current("다른 위치에서 변경된 최신 데이터베이스를 불러왔어요");
-          }).catch((reloadError) => {
-            noticeRef.current(reloadError instanceof Error ? reloadError.message : "최신 데이터베이스를 불러오지 못했어요");
-          });
-          return;
-        }
-        noticeRef.current(error instanceof Error ? error.message : "데이터베이스를 서버에 저장하지 못했어요");
-      });
-    }, 500);
-    return () => {
-      if (serverSaveTimerRef.current) window.clearTimeout(serverSaveTimerRef.current);
-    };
-  }, [database, databaseId, locked, serverSync.collaborative, serverSync.enabled, serverSync.pageId]);
 
   useEffect(() => {
     if (!openPopoverId) return;
@@ -565,6 +471,8 @@ export function InlineDatabase({ databaseId, locked: editorLocked, onNotice, onR
       <div><span className="database-icon"><Columns3 size={15} /></span><input aria-label="데이터베이스 이름" disabled={locked} value={database.name} onChange={(event) => updateDatabase((current) => ({ ...current, name: event.target.value }))} /></div>
     </header>
 
+    {sync.error && <p className="database-sync-status" role="status">표를 서버에 저장하지 못했어요. <button type="button" onClick={sync.retry}>다시 시도</button></p>}
+    {sync.conflict && <DatabaseConflictPanel key={sync.conflict.remote.revision} items={sync.conflict.items} database={sync.conflict.local} disabled={editorLocked || Boolean(serverSync.readOnly)} onResolve={sync.resolve} />}
     <div className={`database-view-bar ${activeView ? "" : "is-empty"}`}>
       <DatabaseViewTabs views={database.views} activeViewId={activeView?.id ?? null} disabled={locked} onSelect={(viewId) => updateDatabase((current) => ({ ...current, activeViewId: viewId }))} onRename={(viewId, name) => updateView(viewId, { name })} onDeleteView={deleteView} onAddView={addView} />
       {activeView && <DatabaseViewToolbar view={activeView} properties={database.properties} trash={database.trash} disabled={locked} searchQuery={activeSearchQuery} resultCount={visibleRecords.length} totalCount={database.records.length} onSearchQueryChange={(query) => setSearchQueries((current) => ({ ...current, [activeView.id]: query }))} onAddRecord={addRecord} onAddDateProperty={addDateProperty} onUpdateView={(patch) => updateView(activeView.id, patch)} onDuplicateView={() => duplicateView(activeView.id)} onDeleteView={() => deleteView(activeView.id)} onRestoreRecord={restoreRecord} onRequestDatabaseRemoval={() => setPendingDatabaseRemoval(true)} />}
@@ -575,9 +483,10 @@ export function InlineDatabase({ databaseId, locked: editorLocked, onNotice, onR
     {pendingDeletion && <RecordDeleteConfirm recordName={recordLabel(pendingDeletion, database.properties, Math.max(0, database.records.findIndex((record) => record.id === pendingDeletion.id)))} onCancel={() => setPendingDeletion(null)} onConfirm={moveToTrash} />}
     {pendingDatabaseRemoval && <DatabaseDeleteConfirm databaseName={database.name} onCancel={() => setPendingDatabaseRemoval(false)} onConfirm={() => {
       if (serverSync.enabled) {
-        void workspaceApi.deleteDatabase(databaseId).catch((error) => {
+        flushDatabase();
+        void enqueueDatabaseSync(databaseId, () => workspaceApi.deleteDatabase(databaseId)).catch((error) => {
           if (!(error instanceof NodiApiError && error.status === 404)) {
-            noticeRef.current(error instanceof Error ? error.message : "데이터베이스를 서버에서 삭제하지 못했어요");
+            onNotice(error instanceof Error ? error.message : "데이터베이스를 서버에서 삭제하지 못했어요");
           }
         });
       }
@@ -587,12 +496,32 @@ export function InlineDatabase({ databaseId, locked: editorLocked, onNotice, onR
   </section></DatabasePopoverContext.Provider>;
 }
 
+function DatabaseConflictPanel({ items, database, disabled, onResolve }: { items: DatabaseConflict[]; database: DatabaseState; disabled: boolean; onResolve: (choices: ConflictChoices) => void }) {
+  const [open, setOpen] = useState(false);
+  const [choices, setChoices] = useState<ConflictChoices>({});
+  const value = (input: unknown) => input === undefined ? "삭제됨" : typeof input === "string" ? input || "빈 값" : JSON.stringify(input, null, 2);
+  return <section className="database-sync-conflict" aria-label="표 변경 충돌">
+    <p role="status">동시에 변경한 내용이 있어요. 선택한 내용을 저장하기 전까지 초안을 보관합니다.</p>
+    <button type="button" aria-expanded={open} onClick={() => setOpen(!open)}>{open ? "비교 접기" : "변경 비교"}</button>
+    {open && <form onSubmit={(event) => { event.preventDefault(); onResolve(choices); }}>
+      {items.map((item, index) => <fieldset key={item.key} disabled={disabled}>
+        <legend>{conflictLabel(item, database)}</legend>
+        {(["local", "remote"] as const).map((side) => <label key={side}>
+          <input type="radio" name={`conflict-${index}`} checked={choices[item.key] === side} onChange={() => setChoices((current) => ({ ...current, [item.key]: side }))} />
+          {side === "local" ? "내 변경" : "서버 변경"}<pre>{value(item[side])}</pre>
+        </label>)}
+      </fieldset>)}
+      <button type="submit" disabled={disabled || items.some((item) => !choices[item.key])}>선택한 내용 저장</button>
+    </form>}
+  </section>;
+}
+
 function DatabaseViewTabs({ views, activeViewId, disabled, onSelect, onRename, onDeleteView, onAddView }: { views: DatabaseView[]; activeViewId: string | null; disabled: boolean; onSelect: (viewId: string) => void; onRename: (viewId: string, name: string) => void; onDeleteView: (viewId: string) => void; onAddView: (type: ViewType) => void }) {
   const [editingViewId, setEditingViewId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
   const startRenaming = (view: DatabaseView) => { if (disabled) return; setEditingViewId(view.id); setEditingName(view.name); };
   const finishRenaming = (view: DatabaseView) => { if (editingViewId !== view.id) return; const name = editingName.trim(); if (name && name !== view.name) onRename(view.id, name); setEditingViewId(null); };
-  return <div className={`database-view-tabs ${views.length === 0 ? "is-empty" : ""}`}><div className="database-tabs" role="tablist">{views.map((view) => <div key={view.id} className={`database-tab-item ${view.id === activeViewId ? "is-active" : ""} ${editingViewId === view.id ? "is-editing" : ""}`}>{editingViewId === view.id ? <input className="database-tab-name-input" aria-label={`${view.name} 탭 이름`} autoFocus value={editingName} onFocus={(event) => { const cursor = event.currentTarget.value.length; event.currentTarget.setSelectionRange(cursor, cursor); }} onChange={(event) => setEditingName(event.target.value)} onBlur={() => finishRenaming(view)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); finishRenaming(view); } if (event.key === "Escape") { event.preventDefault(); setEditingViewId(null); } }} /> : <button className="database-tab-select" type="button" role="tab" aria-selected={view.id === activeViewId} disabled={disabled} onClick={() => onSelect(view.id)} onDoubleClick={(event) => { event.preventDefault(); startRenaming(view); }}>{view.type === "table" ? <Table2 size={14} /> : <Timeline size={14} />}<span>{view.name}</span></button>}<button className="database-tab-close" type="button" disabled={disabled} aria-label={`${view.name} 탭 삭제`} onClick={(event) => { event.stopPropagation(); onDeleteView(view.id); }}><X size={12} /></button></div>)}</div><ViewAddPopover disabled={disabled} onAddView={onAddView} /></div>;
+  return <div className={`database-view-tabs ${views.length === 0 ? "is-empty" : ""}`}><div className="database-tabs" role="tablist">{views.map((view) => <div key={view.id} className={`database-tab-item ${view.id === activeViewId ? "is-active" : ""} ${editingViewId === view.id ? "is-editing" : ""}`}>{editingViewId === view.id ? <input className="database-tab-name-input" aria-label={`${view.name} 탭 이름`} autoFocus value={editingName} onFocus={(event) => { const cursor = event.currentTarget.value.length; event.currentTarget.setSelectionRange(cursor, cursor); }} onChange={(event) => setEditingName(event.target.value)} onBlur={() => finishRenaming(view)} onKeyDown={(event) => { if (isComposingKey(event.nativeEvent)) return; if (event.key === "Enter") { event.preventDefault(); finishRenaming(view); } if (event.key === "Escape") { event.preventDefault(); setEditingViewId(null); } }} /> : <button className="database-tab-select" type="button" role="tab" aria-selected={view.id === activeViewId} disabled={disabled} onClick={() => onSelect(view.id)} onDoubleClick={(event) => { event.preventDefault(); startRenaming(view); }}>{view.type === "table" ? <Table2 size={14} /> : <Timeline size={14} />}<span>{view.name}</span></button>}<button className="database-tab-close" type="button" disabled={disabled} aria-label={`${view.name} 탭 삭제`} onClick={(event) => { event.stopPropagation(); onDeleteView(view.id); }}><X size={12} /></button></div>)}</div><ViewAddPopover disabled={disabled} onAddView={onAddView} /></div>;
 }
 
 function ViewAddPopover({ disabled, onAddView, label = "새 탭 추가", className = "", showLabel = false }: { disabled: boolean; onAddView: (type: ViewType) => void; label?: string; className?: string; showLabel?: boolean }) {
@@ -611,7 +540,7 @@ function DatabaseViewToolbar({ view, properties, trash, disabled, searchQuery, r
 
 function DatabaseSearchPopover({ query, resultCount, onQueryChange }: { query: string; resultCount: number; onQueryChange: (query: string) => void }) {
   const { open, onOpenChange } = useDatabasePopover("database-search");
-  return <Popover.Root open={open} onOpenChange={onOpenChange}><Popover.Trigger asChild><button className={`database-toolbar-icon ${query ? "is-active" : ""}`} type="button" aria-label="데이터베이스 검색"><Search size={15} /></button></Popover.Trigger><Popover.Portal><Popover.Content className="database-search-popover" side="bottom" align="end" sideOffset={7} onCloseAutoFocus={(event) => event.preventDefault()}><div><Search size={15} /><input autoFocus value={query} onChange={(event) => onQueryChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") onOpenChange(false); }} placeholder="이 뷰에서 검색" aria-label="데이터베이스 검색어" />{query && <button type="button" aria-label="검색어 지우기" onClick={() => onQueryChange("")}><X size={14} /></button>}</div><small>{query ? `${resultCount}개의 항목을 찾았습니다.` : "제목과 모든 속성을 검색합니다."}</small></Popover.Content></Popover.Portal></Popover.Root>;
+  return <Popover.Root open={open} onOpenChange={onOpenChange}><Popover.Trigger asChild><button className={`database-toolbar-icon ${query ? "is-active" : ""}`} type="button" aria-label="데이터베이스 검색"><Search size={15} /></button></Popover.Trigger><Popover.Portal><Popover.Content className="database-search-popover" side="bottom" align="end" sideOffset={7} onCloseAutoFocus={(event) => event.preventDefault()}><div><Search size={15} /><input autoFocus value={query} onChange={(event) => onQueryChange(event.target.value)} onKeyDown={(event) => { if (isComposingKey(event.nativeEvent)) return; if (event.key === "Escape") onOpenChange(false); }} placeholder="이 뷰에서 검색" aria-label="데이터베이스 검색어" />{query && <button type="button" aria-label="검색어 지우기" onClick={() => onQueryChange("")}><X size={14} /></button>}</div><small>{query ? `${resultCount}개의 항목을 찾았습니다.` : "제목과 모든 속성을 검색합니다."}</small></Popover.Content></Popover.Portal></Popover.Root>;
 }
 
 function DatabaseFilterPopover({ view, properties, disabled, onUpdateView }: { view: DatabaseView; properties: DatabaseProperty[]; disabled: boolean; onUpdateView: (patch: Partial<DatabaseView>) => void }) {
@@ -786,7 +715,7 @@ function PropertyCreatorPopover({ disabled, onAdd, label, className = "" }: { di
     onOpenChange(false);
     window.setTimeout(() => { creatingRef.current = false; }, 0);
   };
-  return <Popover.Root open={open} onOpenChange={onOpenChange}><Popover.Trigger asChild><button className={`database-add-property-trigger ${className}`} type="button" disabled={disabled} aria-label="새 속성 추가"><Plus size={16} />{label && <span>{label}</span>}</button></Popover.Trigger><Popover.Portal><Popover.Content className="database-property-popover" side="bottom" align="start" sideOffset={7} onCloseAutoFocus={(event) => event.preventDefault()}><label>속성 이름<input autoFocus value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) { event.preventDefault(); event.stopPropagation(); createProperty(); } }} placeholder="예: 마감일" /></label><div><span>유형 선택</span><div className="property-type-grid">{propertyTypeOptions.map((option) => <button key={option.value} type="button" className={option.value === type ? "active" : ""} onClick={() => setType(option.value)}><b>{option.glyph}</b>{option.label}</button>)}</div></div><button className="create-property-button" type="button" disabled={!name.trim()} onClick={createProperty}>속성 만들기</button></Popover.Content></Popover.Portal></Popover.Root>;
+  return <Popover.Root open={open} onOpenChange={onOpenChange}><Popover.Trigger asChild><button className={`database-add-property-trigger ${className}`} type="button" disabled={disabled} aria-label="새 속성 추가"><Plus size={16} />{label && <span>{label}</span>}</button></Popover.Trigger><Popover.Portal><Popover.Content className="database-property-popover" side="bottom" align="start" sideOffset={7} onCloseAutoFocus={(event) => event.preventDefault()}><label>속성 이름<input autoFocus value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (isComposingKey(event.nativeEvent)) return; if (event.key === "Enter" && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) { event.preventDefault(); event.stopPropagation(); createProperty(); } }} placeholder="예: 마감일" /></label><div><span>유형 선택</span><div className="property-type-grid">{propertyTypeOptions.map((option) => <button key={option.value} type="button" className={option.value === type ? "active" : ""} onClick={() => setType(option.value)}><b>{option.glyph}</b>{option.label}</button>)}</div></div><button className="create-property-button" type="button" disabled={!name.trim()} onClick={createProperty}>속성 만들기</button></Popover.Content></Popover.Portal></Popover.Root>;
 }
 
 function PropertyHeaderPopover({ property, disabled, onUpdate, onRemove, onAddOption, onRemoveOption }: { property: DatabaseProperty; disabled: boolean; onUpdate: (propertyId: string, patch: Partial<DatabaseProperty>) => void; onRemove: (propertyId: string) => void; onAddOption: (propertyId: string, name: string) => void; onRemoveOption: (propertyId: string, optionId: string) => void }) {

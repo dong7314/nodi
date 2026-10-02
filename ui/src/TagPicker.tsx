@@ -1,3 +1,4 @@
+import { isComposingKey } from "./ime";
 import { useState } from "react";
 import * as Popover from "@radix-ui/react-popover";
 import { Check, Plus, Tag, X } from "lucide-react";
@@ -61,7 +62,7 @@ export function TagPicker({ value, options, onChange, onCreate, disabled = false
             const checked = value.includes(option.name);
             return <button type="button" className="tag-picker-option" key={option.id} onClick={() => toggleTag(option.name)}><span className={`tag-chip tag-${option.color}`}>{option.name}</span>{checked && <Check size={14} />}</button>;
           })}
-          {onCreate && <div className="tag-create"><input value={newTag} onChange={(event) => setNewTag(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addTag(); } }} placeholder="새 칩 만들기" /><button type="button" aria-label="새 태그 추가" onClick={addTag}><Plus size={14} /></button></div>}
+          {onCreate && <div className="tag-create"><input value={newTag} onChange={(event) => setNewTag(event.target.value)} onKeyDown={(event) => { if (isComposingKey(event.nativeEvent)) return; if (event.key === "Enter") { event.preventDefault(); addTag(); } }} placeholder="새 칩 만들기" /><button type="button" aria-label="새 태그 추가" onClick={addTag}><Plus size={14} /></button></div>}
         </Popover.Content>
       </Popover.Portal>}
       </div>

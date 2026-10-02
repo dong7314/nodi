@@ -1,3 +1,4 @@
+import { isComposingKey } from "./ime";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2,
@@ -122,6 +123,7 @@ export function BlockCommentPanel({
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (isComposingKey(event)) return;
       if (event.key === "Escape" && !pendingDeleteCommentId) closeWithAnimation();
     };
     window.addEventListener("keydown", handleKeyDown);
@@ -303,6 +305,7 @@ export function BlockCommentPanel({
                 aria-label={replyTarget ? "답글 입력" : "댓글 입력"}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
+                  if (isComposingKey(event.nativeEvent)) return;
                   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
                     event.preventDefault();
                     submitComment();

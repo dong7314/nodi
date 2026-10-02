@@ -1,3 +1,6 @@
+import { insertAttachmentFiles, updateAttachmentBlock } from "./editor-attachments";
+import { jsonEqual } from "./json-equal";
+import { isComposingKey } from "./ime";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
   ClipboardEvent as ReactClipboardEvent,
@@ -47,6 +50,8 @@ import { DatePicker } from "./components/ui/date-picker";
 import { Select } from "./components/ui/select";
 import { ConfirmDialog } from "./components/ui/confirm-dialog";
 import { ChildPageBlock } from "./ChildPageBlock";
+import { replacePageDocument } from "./editor-document";
+import { collectDatabaseSnapshots, copyDatabase, copyDatabaseReferences } from "./database-copy";
 import {
   persistStoredBlockComments,
   readStoredBlockComments,
@@ -680,17 +685,24 @@ function clipboardBlockWithoutId(value: unknown): PartialBlock | null {
   return partialBlock as unknown as PartialBlock;
 }
 
-function parseNodiClipboardBlocks(clipboardData: DataTransfer | null): PartialBlock[] | null {
+function parseNodiClipboardBlocks(clipboardData: DataTransfer | null, copyDatabases = false): PartialBlock[] | null {
   const rawPayload = clipboardData?.getData(NODI_BLOCK_CLIPBOARD_MIME);
   if (!rawPayload) return null;
   try {
-    const payload = JSON.parse(rawPayload) as { version?: unknown; blocks?: unknown };
+    const payload = JSON.parse(rawPayload) as { version?: unknown; blocks?: unknown; databases?: Record<string, DatabaseState> };
     if (payload.version !== 1 || !Array.isArray(payload.blocks)) return null;
-    const blocks = payload.blocks
+    const sourceBlocks = copyDatabases ? copyDatabaseReferences(payload.blocks, payload.databases) : payload.blocks;
+    const blocks = sourceBlocks
       .map(clipboardBlockWithoutId)
       .filter((block): block is PartialBlock => block !== null);
     return blocks.length > 0 ? blocks : null;
-  } catch {
+  } catch (error) {
+    if (copyDatabases) {
+      window.dispatchEvent(new CustomEvent(APP_NOTICE_EVENT, {
+        detail: error instanceof Error ? error.message : "복사한 표를 불러오지 못했어요",
+      }));
+      return [];
+    }
     return null;
   }
 }
@@ -699,8 +711,9 @@ function pasteNodiClipboardBlocks(
   activeEditor: BlockNoteEditor<any, any, any>,
   clipboardData: DataTransfer | null,
 ) {
-  const blocks = parseNodiClipboardBlocks(clipboardData);
+  const blocks = parseNodiClipboardBlocks(clipboardData, true);
   if (!blocks) return false;
+  if (blocks.length === 0) return true;
 
   return pasteClipboardBlocks(activeEditor, blocks);
 }
@@ -1046,6 +1059,7 @@ const nodiCodeBlockRender: typeof baseCodeBlockRender = function (block, editor)
       removeLanguageMenu();
     };
     const handleLanguageMenuKeyDown = (event: KeyboardEvent) => {
+      if (isComposingKey(event)) return;
       if (event.key === "Escape") {
         event.preventDefault();
         removeLanguageMenu();
@@ -1204,6 +1218,7 @@ const nodiCodeBlockRender: typeof baseCodeBlockRender = function (block, editor)
       else openLanguageMenu();
     };
     const handleLanguageTriggerKeyDown = (event: KeyboardEvent) => {
+      if (isComposingKey(event)) return;
       event.stopPropagation();
       if (event.key === "Enter" || event.key === " " || event.key === "ArrowDown") {
         event.preventDefault();
@@ -1430,9 +1445,7 @@ function getInitialPages(): StoredPages {
   return pages;
 }
 
-function sameServerValue(left: unknown, right: unknown) {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
+const sameServerValue = jsonEqual;
 
 type PageServerPatch = Partial<Pick<
   StoredPage,
@@ -1659,7 +1672,7 @@ function App() {
   const initialPageId = linkedPageId && initialPages[linkedPageId] ? linkedPageId : ROOT_PAGE_ID;
   const rootPage = initialPages[ROOT_PAGE_ID];
   const initialPage = initialPages[initialPageId] ?? rootPage;
-  const removeFailedUploadBlockRef = useRef<(blockId?: string) => void>(() => undefined);
+  const finishDetachedUploadRef = useRef<(pageId: string, blockId: string, url: string | null) => void>(() => undefined);
   const editor = useCreateBlockNote({
     schema: editorSchema,
     initialContent: initialPage.blocks as never,
@@ -1667,6 +1680,7 @@ function App() {
     pasteHandler: ({ event, editor: activeEditor, defaultPasteHandler }) => {
       const plainText = event.clipboardData?.getData("text/plain") ?? "";
       const hasFiles = event.clipboardData?.files.length;
+      if (hasFiles && insertAttachmentFiles(event, activeEditor)) return true;
       const isCodeBlock = activeEditor.transact((transaction) => (
         transaction.selection.$from.parent.type.spec.code === true
         && transaction.selection.$to.parent.type.spec.code === true
@@ -1691,24 +1705,26 @@ function App() {
       return defaultPasteHandler();
     },
     uploadFile: async (file, blockId) => {
+      const ownerPageId = currentPageIdRef.current;
+      let url: string;
       try {
-        return await uploadNodiAttachment(file, {
+        url = await uploadNodiAttachment(file, {
           authenticated: Boolean(readLocalAuthUser()),
-          pageId: currentPageIdRef.current === ROOT_PAGE_ID ? null : currentPageIdRef.current,
+          pageId: ownerPageId === ROOT_PAGE_ID ? null : ownerPageId,
         });
-      } catch {
-        // BlockNote's clipboard upload path does not catch a rejected upload.
-        // Resolve with an empty value, then discard the temporary media block
-        // after BlockNote has completed its own update cycle.
-        window.setTimeout(() => removeFailedUploadBlockRef.current(blockId), 0);
-        return { props: { name: file.name, url: "" } };
+      } catch (error) {
+        if (blockId) finishDetachedUploadRef.current(ownerPageId, blockId, null);
+        throw error;
       }
+      if (ownerPageId !== currentPageIdRef.current || !blockId || !editor.getBlock(blockId)) {
+        if (blockId) finishDetachedUploadRef.current(ownerPageId, blockId, url);
+        // FilePanel catches this too; it must not update the reused editor.
+        throw new Error("첨부를 원래 페이지에 반영했습니다.");
+      }
+      if (!currentPageIsEditable()) throw new Error("페이지를 편집할 수 없습니다.");
+      return url;
     },
   });
-  removeFailedUploadBlockRef.current = (blockId) => {
-    if (!blockId || !editor.getBlock(blockId)) return;
-    editor.removeBlocks([blockId]);
-  };
   const [pages, setPages] = useState<StoredPages>(initialPages);
   const [folders, setFolders] = useState<StoredFolders>(initialFolders);
   const [currentPageId, setCurrentPageId] = useState(initialPageId);
@@ -1785,7 +1801,7 @@ function App() {
   const realtimeReconnectTimerRef = useRef<number | null>(null);
   const realtimeBlocksTimerRef = useRef<number | null>(null);
   const realtimeLocalBlocksRef = useRef<PartialBlock[]>(cloneRealtimeBlocks(initialPage.blocks));
-  const realtimePendingBlocksRef = useRef<{ base: PartialBlock[]; next: PartialBlock[] } | null>(null);
+  const realtimePendingBlocksRef = useRef<{ pageId: string; base: PartialBlock[]; next: PartialBlock[] } | null>(null);
   const realtimeProtectedBlockIdsRef = useRef(new Set<string>());
   const realtimeProtectedDeletedBlockIdsRef = useRef(new Set<string>());
   const realtimePresenceBlockRef = useRef<string | null>(null);
@@ -1819,6 +1835,8 @@ function App() {
   const sidebarSuppressClickRef = useRef(false);
   const currentPageIdRef = useRef(initialPageId);
   const openPageRef = useRef<(pageId: string, options?: PageNavigationOptions) => void>(() => undefined);
+  const editorPageIdRef = useRef(initialPageId);
+  const editorLoadVersionRef = useRef(0);
   const loadingPageRef = useRef(false);
   const blockSelectionModeRef = useRef(false);
   const blockSelectionAnchorRef = useRef<string | null>(null);
@@ -1851,6 +1869,19 @@ function App() {
   const suppressEditorClickRef = useRef(false);
   const isDarkMode = appTheme === "dark";
   const primaryShortcutLabel = useMemo(getPrimaryShortcutLabel, []);
+
+  const loadEditorPage = (pageId: string, blocks: PartialBlock[], focusTitle = false) => {
+    const version = ++editorLoadVersionRef.current;
+    loadingPageRef.current = true;
+    editorPageIdRef.current = pageId;
+    replacePageDocument(editor, blocks);
+    window.requestAnimationFrame(() => {
+      // An older navigation must not finish a newer document's load.
+      if (version !== editorLoadVersionRef.current) return;
+      loadingPageRef.current = false;
+      if (focusTitle) titleInputRef.current?.focus();
+    });
+  };
 
   const blockSelectionActionMenuPositionKey = blockSelectionActionMenu
     ? [
@@ -1929,11 +1960,8 @@ function App() {
         setIsArchived(false);
         setWorkspaceSection("pages");
         setSidebarOpen(false);
-        editor.replaceBlocks(editor.document, publicPage.blocks as never);
+        loadEditorPage(publicPage.id, publicPage.blocks);
         setLocalSaveState("saved");
-        window.requestAnimationFrame(() => {
-          loadingPageRef.current = false;
-        });
       })
       .catch((error: unknown) => {
         if (!active) return;
@@ -2013,6 +2041,22 @@ function App() {
       });
   };
 
+  const acknowledgePageSave = (saved: StoredPage) => {
+    const previous = serverPagesSnapshotRef.current[saved.id];
+    // A realtime acknowledgement may have arrived before the HTTP response.
+    if ((previous?.revision ?? 0) > (saved.revision ?? 0)) return;
+    serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [saved.id]: saved };
+    const local = pagesRef.current[saved.id];
+    if (!local) return;
+    const nextPages = {
+      ...pagesRef.current,
+      [saved.id]: { ...local, ownerId: saved.ownerId, permission: saved.permission, revision: saved.revision },
+    };
+    pagesRef.current = nextPages;
+    persistStoredPages(nextPages);
+    setPages(nextPages);
+  };
+
   const realtimeSocketIsReady = (pageId: string) => (
     realtimeConnectedPageIdRef.current === pageId
     && realtimeSocketRef.current?.readyState === WebSocket.OPEN
@@ -2035,8 +2079,7 @@ function App() {
     }
     const pending = realtimePendingBlocksRef.current;
     realtimePendingBlocksRef.current = null;
-    const pageId = currentPageIdRef.current;
-    if (!pending || !realtimeSocketIsReady(pageId)) return false;
+    if (!pending || !realtimeSocketIsReady(pending.pageId)) return false;
     const patch = buildRealtimeBlockPatch(pending.base, pending.next);
     if (!patch) return true;
     patch.changedBlockIds.forEach((id) => realtimeProtectedBlockIdsRef.current.add(id));
@@ -2058,9 +2101,9 @@ function App() {
     if (!realtimeSocketIsReady(pageId)) return false;
     const nextBlocks = cloneRealtimeBlocks(blocks);
     const pending = realtimePendingBlocksRef.current;
-    realtimePendingBlocksRef.current = pending
+    realtimePendingBlocksRef.current = pending?.pageId === pageId
       ? { ...pending, next: nextBlocks }
-      : { base: cloneRealtimeBlocks(realtimeLocalBlocksRef.current), next: nextBlocks };
+      : { pageId, base: cloneRealtimeBlocks(realtimeLocalBlocksRef.current), next: nextBlocks };
     realtimeLocalBlocksRef.current = nextBlocks;
     if (!realtimeBlocksTimerRef.current) {
       realtimeBlocksTimerRef.current = window.setTimeout(flushRealtimeBlockPatch, 70);
@@ -2268,10 +2311,7 @@ function App() {
         setTitle(nextPage.title);
         setPageSettings(nextPage.settings);
         setIsArchived(nextPage.archived);
-        editor.replaceBlocks(editor.document, nextPage.blocks as never);
-        window.requestAnimationFrame(() => {
-          loadingPageRef.current = false;
-        });
+        loadEditorPage(nextPageId, nextPage.blocks);
         serverWorkspaceReadyRef.current = true;
         setLocalSaveState("saved");
       } catch (error) {
@@ -2386,14 +2426,11 @@ function App() {
     if (serverPagesTimerRef.current) window.clearTimeout(serverPagesTimerRef.current);
     serverPagesTimerRef.current = window.setTimeout(() => {
       serverPagesTimerRef.current = null;
-      const after = pages;
       enqueueServerMutation(async () => {
+        // Queued work must use the latest draft, not the render that scheduled it.
+        const after = pagesRef.current;
         const before = serverPagesSnapshotRef.current;
         if (sameServerValue(before, after)) return;
-        const synchronized = Object.fromEntries(Object.entries(after).map(([pageId, page]) => [
-          pageId,
-          { ...page, revision: before[pageId]?.revision ?? page.revision },
-        ])) as StoredPages;
         const previousHome = before[ROOT_PAGE_ID];
         const nextHome = after[ROOT_PAGE_ID];
         if (previousHome && nextHome) {
@@ -2404,7 +2441,7 @@ function App() {
           if (Object.keys(homePatch).length) {
             homePatch.revision = previousHome.revision;
             const savedHome = await workspaceApi.updateHome(homePatch);
-            synchronized[ROOT_PAGE_ID] = { ...synchronized[ROOT_PAGE_ID], revision: savedHome.revision };
+            acknowledgePageSave(storedHomeFromServer(savedHome));
           }
         }
 
@@ -2413,12 +2450,12 @@ function App() {
           .sort((left, right) => pageDepth(after, left) - pageDepth(after, right));
         for (const page of created) {
           const savedPage = await workspaceApi.createPage(page);
-          synchronized[page.id] = { ...synchronized[page.id], revision: savedPage.revision };
+          acknowledgePageSave(storedPageFromServer(savedPage));
         }
 
         for (const page of Object.values(after)) {
           if (page.id === ROOT_PAGE_ID) continue;
-          const previous = before[page.id];
+          const previous = serverPagesSnapshotRef.current[page.id];
           if (!previous) continue;
           const patch = getPageServerPatch(previous, page);
           const isCollaborative = (page.permission ?? "owner") !== "owner"
@@ -2431,10 +2468,15 @@ function App() {
           if (Object.keys(patch).length) {
             if (!isCollaborative) patch.revision = previous.revision;
             const savedPage = await workspaceApi.updatePage(page.id, patch);
-            synchronized[page.id] = { ...synchronized[page.id], revision: savedPage.revision };
+            acknowledgePageSave(storedPageFromServer(savedPage));
           }
           if (Boolean(previous.favoritedAt) !== Boolean(page.favoritedAt)) {
             await workspaceApi.favoritePage(page.id, Boolean(page.favoritedAt));
+            const snapshot = serverPagesSnapshotRef.current[page.id];
+            if (snapshot) serverPagesSnapshotRef.current = {
+              ...serverPagesSnapshotRef.current,
+              [page.id]: { ...snapshot, favoritedAt: page.favoritedAt },
+            };
           }
         }
 
@@ -2443,7 +2485,6 @@ function App() {
             await workspaceApi.archivePage(page.id);
           }
         }
-        serverPagesSnapshotRef.current = synchronized;
       });
     }, 700);
     return () => {
@@ -2486,9 +2527,22 @@ function App() {
     return pageSaved ? nextPage : null;
   };
 
+  finishDetachedUploadRef.current = (pageId, blockId, url) => {
+    const source = pagesRef.current[pageId];
+    if (!source || source.permission === "view" || source.settings.lockPage || source.archived) return;
+    if (currentPageIdRef.current === pageId && editorPageIdRef.current === pageId) {
+      const block = editor.getBlock(blockId);
+      if (!block) return;
+      if (url !== null) editor.updateBlock(blockId, { props: { url } } as never);
+      else if (!(block.props as { url?: string }).url) editor.removeBlocks([blockId]);
+    } else {
+      const blocks = updateAttachmentBlock(source.blocks, blockId, url);
+      if (!sameServerValue(blocks, source.blocks)) updatePage(pageId, { blocks });
+    }
+  };
+
   const syncPageImmediately = (
     pageId: string,
-    page: StoredPage,
     options: { notify?: boolean } = {},
   ) => {
     if (!authUser || !serverWorkspaceReadyRef.current) {
@@ -2505,8 +2559,9 @@ function App() {
     }
     setLocalSaveState("saving");
     enqueueServerMutation(async () => {
+      const page = pagesRef.current[pageId];
       const previous = serverPagesSnapshotRef.current[pageId];
-      if (!previous) return;
+      if (!previous || !page) return;
 
       if (pageId === ROOT_PAGE_ID) {
         const homePatch: Partial<Pick<StoredPage, "title" | "settings" | "blocks" | "revision">> = {};
@@ -2519,24 +2574,7 @@ function App() {
         }
         homePatch.revision = previous.revision;
         const savedHome = await workspaceApi.updateHome(homePatch);
-        serverPagesSnapshotRef.current = {
-          ...serverPagesSnapshotRef.current,
-          [ROOT_PAGE_ID]: storedHomeFromServer(savedHome),
-        };
-        const latestLocalPage = pagesRef.current[ROOT_PAGE_ID];
-        if (latestLocalPage) {
-          const nextPages = {
-            ...pagesRef.current,
-            [ROOT_PAGE_ID]: {
-              ...latestLocalPage,
-              revision: savedHome.revision,
-              updatedAt: savedHome.updatedAt,
-            },
-          };
-          pagesRef.current = nextPages;
-          persistStoredPages(nextPages);
-          setPages(nextPages);
-        }
+        acknowledgePageSave(storedHomeFromServer(savedHome));
         if (options.notify) setNotice("메모를 서버에 저장했어요");
         return;
       }
@@ -2555,24 +2593,7 @@ function App() {
       }
       if (!isCollaborative) patch.revision = previous.revision;
       const savedPage = await workspaceApi.updatePage(pageId, patch);
-      serverPagesSnapshotRef.current = {
-        ...serverPagesSnapshotRef.current,
-        [pageId]: storedPageFromServer(savedPage),
-      };
-      const latestLocalPage = pagesRef.current[pageId];
-      if (latestLocalPage) {
-        const nextPages = {
-          ...pagesRef.current,
-          [pageId]: {
-            ...latestLocalPage,
-            revision: savedPage.revision,
-            updatedAt: savedPage.updatedAt,
-          },
-        };
-        pagesRef.current = nextPages;
-        persistStoredPages(nextPages);
-        setPages(nextPages);
-      }
+      acknowledgePageSave(storedPageFromServer(savedPage));
       if (options.notify) setNotice("메모를 서버에 저장했어요");
     });
   };
@@ -2623,7 +2644,9 @@ function App() {
   }, []);
 
   const saveDocument = (options: { notify?: boolean } = {}) => {
-    const currentPage = pagesRef.current[currentPageIdRef.current];
+    const pageId = currentPageId;
+    if (loadingPageRef.current || pageId !== currentPageIdRef.current || pageId !== editorPageIdRef.current) return;
+    const currentPage = pagesRef.current[pageId];
     const nextTitle = title.trim() || "제목 없음";
     const hasMetadataChanges = Boolean(
       currentPage
@@ -2633,13 +2656,13 @@ function App() {
         || currentPage.archived !== isArchived
       )
     );
-    const savedPage = updatePage(currentPageIdRef.current, {
+    const savedPage = updatePage(pageId, {
       blocks: editor.document as unknown as PartialBlock[],
       title: nextTitle,
       settings: pageSettings,
       archived: isArchived,
     }, { preserveUpdatedAt: !hasMetadataChanges });
-    if (savedPage) syncPageImmediately(currentPageIdRef.current, savedPage, options);
+    if (savedPage) syncPageImmediately(pageId, options);
   };
 
   const updateUserProfile = ({
@@ -2713,25 +2736,30 @@ function App() {
   };
 
   useEffect(() => {
-    const currentPage = pagesRef.current[currentPageIdRef.current];
+    const pageId = currentPageId;
+    if (pageId !== currentPageIdRef.current) return;
+    const currentPage = pagesRef.current[pageId];
     const nextTitle = title.trim() || "제목 없음";
     if (!currentPage || currentPage.title === nextTitle) return;
     const saveTimer = window.setTimeout(() => {
-      updatePage(currentPageIdRef.current, { title: nextTitle });
+      if (pageId !== currentPageIdRef.current || pageId !== editorPageIdRef.current) return;
+      updatePage(pageId, { title: nextTitle });
     }, 300);
     return () => window.clearTimeout(saveTimer);
   }, [title, currentPageId]);
 
   useEffect(() => {
-    const currentPage = pagesRef.current[currentPageIdRef.current];
+    if (currentPageId !== currentPageIdRef.current) return;
+    const currentPage = pagesRef.current[currentPageId];
     if (!currentPage || arePageSettingsEqual(currentPage.settings, pageSettings)) return;
-    updatePage(currentPageIdRef.current, { settings: pageSettings });
+    updatePage(currentPageId, { settings: pageSettings });
   }, [pageSettings, currentPageId]);
 
   useEffect(() => {
-    const currentPage = pagesRef.current[currentPageIdRef.current];
+    if (currentPageId !== currentPageIdRef.current) return;
+    const currentPage = pagesRef.current[currentPageId];
     if (!currentPage || currentPage.archived === isArchived) return;
-    updatePage(currentPageIdRef.current, { archived: isArchived });
+    updatePage(currentPageId, { archived: isArchived });
   }, [isArchived, currentPageId]);
 
   const openPage = (pageId: string, options: PageNavigationOptions = {}) => {
@@ -2755,6 +2783,8 @@ function App() {
     // may already hold a newer server copy of the currently selected page.
     // Saving the stale editor again here would overwrite that remote change.
     if (!isCurrentPage && !options.skipCurrentPageSave) saveDocument();
+    // Flush while the socket and document still belong to the page we leave.
+    flushRealtimeBlockPatch();
 
     const targetPage = pagesRef.current[pageId];
     if (!targetPage) {
@@ -2795,15 +2825,8 @@ function App() {
     setSelectedBlockIds([]);
     setBlockSelectionActionMenu(null);
     setBlockSelectionMarquee(null);
-    editor.replaceBlocks(
-      editor.document,
-      (targetPage.blocks.length ? targetPage.blocks : [{ type: "paragraph", content: "" }]) as never,
-    );
+    loadEditorPage(pageId, targetPage.blocks, true);
     editorStageRef.current?.scrollTo({ top: 0 });
-    window.requestAnimationFrame(() => {
-      loadingPageRef.current = false;
-      titleInputRef.current?.focus();
-    });
   };
   openPageRef.current = openPage;
 
@@ -2865,7 +2888,13 @@ function App() {
 
         const serverPage = await workspaceApi.getPage(pageId);
         if (!active || pageId !== currentPageIdRef.current) return;
-        if (previous?.revision !== undefined && serverPage.revision <= previous.revision) return;
+        // Editing can resume while the GET is in flight. Recheck against the
+        // latest local state instead of overwriting it with that response.
+        const latestSnapshot = serverPagesSnapshotRef.current[pageId];
+        const latestLocal = pagesRef.current[pageId];
+        if (serverPagesTimerRef.current || (latestSnapshot && latestLocal
+          && !sameServerValue(getPageEditableSnapshot(latestSnapshot), getPageEditableSnapshot(latestLocal)))) return;
+        if (latestSnapshot?.revision !== undefined && serverPage.revision <= latestSnapshot.revision) return;
 
         const latestPage = storedPageFromServer(serverPage);
         const nextPages = { ...pagesRef.current, [pageId]: latestPage };
@@ -2881,13 +2910,7 @@ function App() {
         setTitle(latestPage.title);
         setPageSettings(latestPage.settings);
         setIsArchived(latestPage.archived);
-        editor.replaceBlocks(
-          editor.document,
-          (latestPage.blocks.length ? latestPage.blocks : [{ type: "paragraph", content: "" }]) as never,
-        );
-        window.requestAnimationFrame(() => {
-          loadingPageRef.current = false;
-        });
+        loadEditorPage(pageId, latestPage.blocks);
         setNotice("다른 위치의 최신 변경 내용을 불러왔어요");
       } catch {
         // Background revalidation should not interrupt the editor. Explicit
@@ -2912,6 +2935,8 @@ function App() {
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
   }, [authUser?.id, currentPageId, editor, publicPageId]);
+
+  const currentPageHasShares = (pageShares[currentPageId]?.members.length ?? 0) > 0;
 
   useEffect(() => {
     flushRealtimeBlockPatch();
@@ -2984,14 +3009,8 @@ function App() {
       setTitle(nextPage.title);
       setPageSettings(nextPage.settings);
       setIsArchived(nextPage.archived);
-      editor.replaceBlocks(
-        editor.document,
-        (editorBlocks.length ? editorBlocks : [{ type: "paragraph", content: "" }]) as never,
-      );
+      loadEditorPage(pageId, editorBlocks);
       realtimeLocalBlocksRef.current = cloneRealtimeBlocks(editorBlocks);
-      window.requestAnimationFrame(() => {
-        loadingPageRef.current = false;
-      });
     };
 
     const applyServerPage = (serverPage: ServerPage, message: ServerPageRealtimeEvent) => {
@@ -3049,23 +3068,25 @@ function App() {
         // Apply remote text/property edits one top-level block at a time. This
         // preserves the local caret and any unsent work in all other blocks.
         loadingPageRef.current = true;
+        const loadVersion = ++editorLoadVersionRef.current;
         const nextById = new Map(nextPage.blocks.map((block) => [realtimeBlockId(block), block]));
         const liveIds = new Set(editor.document.map((block) => block.id));
         try {
-          const removable = (message.deletedBlockIds ?? []).filter((id) => (
-            liveIds.has(id) && !realtimeProtectedBlockIdsRef.current.has(id)
-          ));
-          if (removable.length) editor.removeBlocks(removable);
-          message.changedBlockIds.forEach((blockId) => {
-            if (realtimeProtectedBlockIdsRef.current.has(blockId)) return;
-            const block = nextById.get(blockId);
-            if (block && liveIds.has(blockId)) editor.updateBlock(blockId, block as never);
+          editor.transact((transaction) => {
+            // Remote edits are not this user's undoable actions.
+            transaction.setMeta("addToHistory", false);
+            const removable = (message.deletedBlockIds ?? []).filter((id) => (
+              liveIds.has(id) && !realtimeProtectedBlockIdsRef.current.has(id)
+            ));
+            if (removable.length) editor.removeBlocks(removable);
+            (message.changedBlockIds ?? []).forEach((blockId) => {
+              if (realtimeProtectedBlockIdsRef.current.has(blockId)) return;
+              const block = nextById.get(blockId);
+              if (block && liveIds.has(blockId)) editor.updateBlock(blockId, block as never);
+            });
           });
         } catch {
-          editor.replaceBlocks(
-            editor.document,
-            (nextPage.blocks.length ? nextPage.blocks : [{ type: "paragraph", content: "" }]) as never,
-          );
+          loadEditorPage(pageId, nextPage.blocks);
         }
         const localBlocks = editor.document as unknown as PartialBlock[];
         realtimeLocalBlocksRef.current = cloneRealtimeBlocks(localBlocks);
@@ -3079,7 +3100,7 @@ function App() {
         setPageSettings(nextPage.settings);
         setIsArchived(nextPage.archived);
         window.requestAnimationFrame(() => {
-          loadingPageRef.current = false;
+          if (loadVersion === editorLoadVersionRef.current) loadingPageRef.current = false;
         });
         return;
       }
@@ -3123,6 +3144,7 @@ function App() {
         setPageSettings(homePage.settings);
         setIsArchived(homePage.archived);
       }
+      loadEditorPage(ROOT_PAGE_ID, homePage?.blocks ?? []);
       const url = new URL(window.location.href);
       url.searchParams.delete("page");
       window.history.replaceState(null, "", url);
@@ -3155,6 +3177,7 @@ function App() {
         }, 25_000);
       });
       socket.addEventListener("message", (event) => {
+        if (disposed || currentPageIdRef.current !== pageId) return;
         let message: ServerPageRealtimeEvent;
         try {
           message = JSON.parse(String(event.data)) as ServerPageRealtimeEvent;
@@ -3234,10 +3257,11 @@ function App() {
       realtimeProtectedDeletedBlockIdsRef.current.clear();
       setRealtimeParticipants([]);
     };
-  }, [authUser?.id, currentPageId, editor, pageShares, publicPageId, workspaceSection]);
+  }, [authUser?.id, currentPageId, editor, currentPageHasShares, publicPageId, workspaceSection]);
 
   const refreshSharedPages = async () => {
     if (!authUser) return;
+    const requestedSnapshot = serverPagesSnapshotRef.current;
     try {
       const [serverPages, serverShares, serverComments] = await Promise.all([
         workspaceApi.listPages(true, true),
@@ -3246,9 +3270,26 @@ function App() {
       ]);
       const currentPages = pagesRef.current;
       const nextPages: StoredPages = {};
+      const nextSnapshot: StoredPages = { ...serverPagesSnapshotRef.current };
       if (currentPages[ROOT_PAGE_ID]) nextPages[ROOT_PAGE_ID] = currentPages[ROOT_PAGE_ID];
       serverPages.forEach((page) => {
-        nextPages[page.id] = storedPageFromServer(page);
+        const local = currentPages[page.id];
+        const snapshot = serverPagesSnapshotRef.current[page.id];
+        const dirty = local && (!snapshot || !sameServerValue(getPageEditableSnapshot(local), getPageEditableSnapshot(snapshot)));
+        const newerSnapshot = (snapshot?.revision ?? 0) > page.revision;
+        const nextPage = storedPageFromServer(page);
+        nextPages[page.id] = local && (dirty || newerSnapshot) ? local : nextPage;
+        if (!newerSnapshot) nextSnapshot[page.id] = nextPage;
+      });
+      Object.values(currentPages).forEach((page) => {
+        if (nextPages[page.id]) return;
+        const snapshot = serverPagesSnapshotRef.current[page.id];
+        if (!requestedSnapshot[page.id] || snapshot !== requestedSnapshot[page.id]
+          || !sameServerValue(getPageEditableSnapshot(page), getPageEditableSnapshot(snapshot ?? page))) {
+          nextPages[page.id] = page;
+        } else {
+          delete nextSnapshot[page.id];
+        }
       });
       const nextPageShares = Object.fromEntries(serverShares.map((share) => [
         share.pageId,
@@ -3259,7 +3300,7 @@ function App() {
         storedCommentFromServer(thread),
       ])) as StoredBlockComments;
 
-      serverPagesSnapshotRef.current = nextPages;
+      serverPagesSnapshotRef.current = nextSnapshot;
       pagesRef.current = nextPages;
       persistStoredPages(nextPages);
       persistStoredPageShares(nextPageShares);
@@ -3317,7 +3358,7 @@ function App() {
       const folderIsAvailable = !page.folderId || Boolean(foldersRef.current[page.folderId]);
       const patch: Partial<Pick<StoredPage, "parentId" | "folderId" | "archived" | "revision">> = {
         archived: false,
-        revision: page.revision,
+        revision: serverPagesSnapshotRef.current[pageId]?.revision ?? page.revision,
       };
       if (!parentIsAvailable) patch.parentId = null;
       if (!folderIsAvailable) patch.folderId = null;
@@ -3383,6 +3424,7 @@ function App() {
       setAuthDialogMode("login");
       return;
     }
+    if (publicPageId || pagesRef.current[currentPageIdRef.current]?.permission === "view") return;
     setRightPanel(null);
     setActiveCommentBlockId(null);
     setPageSettingsOpen(true);
@@ -3544,6 +3586,7 @@ function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (isComposingKey(event)) return;
       const hasPrimaryModifier = event.metaKey || event.ctrlKey;
       if (hasPrimaryModifier && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "k") {
         event.preventDefault();
@@ -3599,6 +3642,7 @@ function App() {
       setContextMenu(null);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
+      if (isComposingKey(event)) return;
       if (event.key === "Escape") setContextMenu(null);
     };
     window.addEventListener("mousedown", closeOnPointerDown);
@@ -3617,6 +3661,7 @@ function App() {
       setSidebarCreateMenuOpen(false);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
+      if (isComposingKey(event)) return;
       if (event.key !== "Escape") return;
       setSidebarContextMenu(null);
       setSidebarCreateMenuOpen(false);
@@ -3637,6 +3682,7 @@ function App() {
       setInboxOpen(false);
     };
     const closeInboxOnEscape = (event: KeyboardEvent) => {
+      if (isComposingKey(event)) return;
       if (event.key === "Escape") setInboxOpen(false);
     };
     document.addEventListener("pointerdown", closeInbox, true);
@@ -5288,16 +5334,19 @@ function App() {
     const cloneBlock = (block: EditorBlock): PartialBlock => ({
       type: block.type,
       props: block.type === "database"
-        ? { ...block.props, databaseId: makeId("database") }
+        ? { ...block.props, databaseId: copyDatabase(block.props.databaseId || `database-${block.id}`) }
         : block.props,
       content: block.content,
       children: block.children.map((child) => cloneBlock(child as EditorBlock)),
     } as unknown as PartialBlock);
-    const insertedBlocks = editor.insertBlocks(
-      blocks.map((block) => cloneBlock(block)),
-      referenceBlock.id,
-      "after",
-    );
+    let copiedBlocks: PartialBlock[];
+    try {
+      copiedBlocks = blocks.map((block) => cloneBlock(block));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "블록을 복제하지 못했어요");
+      return;
+    }
+    const insertedBlocks = editor.insertBlocks(copiedBlocks, referenceBlock.id, "after");
     if (insertedBlocks.length > 0) {
       const insertedIds = insertedBlocks.map((block) => block.id);
       setBlockSelectionState(insertedIds, insertedIds[0]);
@@ -5381,6 +5430,7 @@ function App() {
     event.clipboardData.setData(NODI_BLOCK_CLIPBOARD_MIME, JSON.stringify({
       version: 1,
       blocks: clipboardBlocks,
+      databases: collectDatabaseSnapshots(clipboardBlocks),
     }));
     event.clipboardData.setData("blocknote/html", blockNoteHtml);
     event.clipboardData.setData("text/html", externalHtml);
@@ -5544,6 +5594,7 @@ function App() {
   };
 
   const handleEditorKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (isComposingKey(event.nativeEvent)) return;
     if (!currentPageIsEditable()) return;
     const target = event.target as HTMLElement;
     const isEditorEvent = Boolean(target.closest(".bn-editor"));
@@ -5964,6 +6015,7 @@ function App() {
       setBlockSelectionActionMenu(null);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
+      if (isComposingKey(event)) return;
       if (event.key === "Escape") setBlockSelectionActionMenu(null);
     };
     const closeOnViewportChange = () => setBlockSelectionActionMenu(null);
@@ -6668,6 +6720,7 @@ function App() {
             toggleFolder(folder.id);
           }}
           onKeyDown={(event) => {
+            if (isComposingKey(event.nativeEvent)) return;
             if (event.key === "Enter" || event.key === " ") toggleFolder(folder.id);
           }}
           onContextMenu={(event) => openSidebarContextMenu(event, { kind: "folder", folderId: folder.id })}
@@ -7089,7 +7142,7 @@ function App() {
                       <Share2 size={18} />
                     </button>
                   )}
-                  {canEditCurrentPage && <button className="page-settings-trigger" type="button" aria-label="페이지 설정" onClick={openPageSettingsPanel}><Settings2 size={16} /> 설정</button>}
+                  {currentPage.permission !== "view" && <button className="page-settings-trigger" type="button" aria-label="페이지 설정" onClick={openPageSettingsPanel}><Settings2 size={16} /> 설정</button>}
                   <button className="more-button" type="button" aria-label="더 보기" onClick={exportJson}><Download size={16} /> 내보내기</button>
                 </> : (
                   <button className="guest-topbar-login" type="button" onClick={() => setAuthDialogMode("login")}>
@@ -7276,6 +7329,7 @@ function App() {
               onPointerUpCapture={finishEditorPointerInteraction}
               onPointerCancelCapture={finishEditorPointerInteraction}
               onKeyDownCapture={handleEditorKeyDown}
+              onDropCapture={(event) => { if (canEditCurrentPage) insertAttachmentFiles(event.nativeEvent, editor); }}
               onCopyCapture={handleEditorCopy}
               onCutCapture={handleEditorCut}
               onInputCapture={dismissStarterDockForCurrentPage}
@@ -7510,10 +7564,11 @@ function App() {
               <BlockNoteView
                 editor={editor}
                 onChange={() => {
-                  if (!canEditCurrentPage || loadingPageRef.current) return;
+                  if (!canEditCurrentPage || loadingPageRef.current
+                    || currentPageId !== currentPageIdRef.current || currentPageId !== editorPageIdRef.current) return;
                   dismissStarterDockForCurrentPage();
                   const nextBlocks = editor.document as unknown as PartialBlock[];
-                  updatePage(currentPageIdRef.current, {
+                  updatePage(currentPageId, {
                     blocks: nextBlocks,
                   });
                   try {
@@ -7647,9 +7702,20 @@ function App() {
           parentTitle={pages[pages[drawerPageId].parentId || ""]?.title}
           theme={appTheme}
           serverEnabled={isAuthenticated}
+          onAttachmentComplete={(blockId, url) => finishDetachedUploadRef.current(drawerPageId, blockId, url)}
           onClose={() => setDrawerPageId(null)}
           onOpenPage={() => openPage(drawerPageId)}
-          onChange={(patch) => updatePage(drawerPageId, patch)}
+          onChange={(patch) => {
+            updatePage(drawerPageId, patch);
+            if (drawerPageId !== currentPageIdRef.current) return;
+            // Two editor surfaces can show the same document. Keep the main
+            // surface current before any shortcut or navigation saves it.
+            if (patch.title !== undefined) setTitle(patch.title);
+            if (patch.blocks) {
+              loadEditorPage(drawerPageId, patch.blocks);
+              queueRealtimeBlockPatch(patch.blocks);
+            }
+          }}
         />
       )}
 
@@ -8064,6 +8130,7 @@ function NodiTooltipLayer() {
       scheduleHide();
     };
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (isComposingKey(event)) return;
       suppressHoverAfterPointerDown = false;
       pointerDownPosition = null;
       if (event.key === "Escape") hideNow();
@@ -8204,6 +8271,7 @@ function InlineNavRename({ value, ariaLabel, onSubmit, onCancel }: { value: stri
         if (!cancelledRef.current) onSubmit(draft);
       }}
       onKeyDown={(event) => {
+        if (isComposingKey(event.nativeEvent)) return;
         event.stopPropagation();
         if (event.key === "Enter") {
           event.preventDefault();
@@ -8481,6 +8549,7 @@ function PagePreviewDrawer({
   onClose,
   onOpenPage,
   onChange,
+  onAttachmentComplete,
 }: {
   page: StoredPage;
   parentTitle?: string;
@@ -8489,18 +8558,36 @@ function PagePreviewDrawer({
   onClose: () => void;
   onOpenPage: () => void;
   onChange: (patch: Partial<StoredPage>) => void;
+  onAttachmentComplete: (blockId: string, url: string | null) => void;
 }) {
+  const mountedRef = useRef(true);
+  const attachmentCompleteRef = useRef(onAttachmentComplete);
+  attachmentCompleteRef.current = onAttachmentComplete;
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
   const previewEditor = useCreateBlockNote({
     schema: editorSchema,
     initialContent: (page.blocks.length ? page.blocks : [{ type: "paragraph", content: "" }]) as never,
     dictionary: ko,
-    uploadFile: (file) => uploadNodiAttachment(file, {
-      authenticated: serverEnabled,
-      pageId: page.id,
-    }),
+    pasteHandler: ({ event, editor, defaultPasteHandler }) => insertAttachmentFiles(event, editor) || defaultPasteHandler(),
+    uploadFile: async (file, blockId) => {
+      let url: string;
+      try { url = await uploadNodiAttachment(file, { authenticated: serverEnabled, pageId: page.id }); }
+      catch (error) {
+        if (blockId) attachmentCompleteRef.current(blockId, null);
+        throw error;
+      }
+      if (!mountedRef.current || !blockId || !previewEditor.getBlock(blockId)) {
+        if (blockId) attachmentCompleteRef.current(blockId, url);
+        throw new Error("첨부를 원래 페이지에 반영했습니다.");
+      }
+      if (!previewEditor.isEditable) throw new Error("페이지를 편집할 수 없습니다.");
+      return url;
+    },
   });
   const canEditPreviewPage = page.permission !== "view" && !page.settings.lockPage;
   const [previewTitle, setPreviewTitle] = useState(page.title);
+  const previewDocumentRef = useRef(page.blocks);
+  const previewLoadingRef = useRef(false);
   const [drawerWidth, setDrawerWidth] = useState(() => {
     const savedWidth = Number(window.localStorage.getItem(PAGE_DRAWER_WIDTH_STORAGE_KEY));
     const preferredWidth = Number.isFinite(savedWidth) && savedWidth > 0 ? savedWidth : 680;
@@ -8521,6 +8608,20 @@ function PagePreviewDrawer({
     previewEditor.isEditable = canEditPreviewPage;
   }, [canEditPreviewPage, previewEditor]);
 
+  useEffect(() => { setPreviewTitle(page.title); }, [page.title]);
+
+  useEffect(() => {
+    if (sameServerValue(previewDocumentRef.current, page.blocks)) return;
+    previewDocumentRef.current = page.blocks;
+    previewLoadingRef.current = true;
+    replacePageDocument(previewEditor, page.blocks);
+    const frame = window.requestAnimationFrame(() => { previewLoadingRef.current = false; });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      previewLoadingRef.current = false;
+    };
+  }, [page.blocks, previewEditor]);
+
   const closeWithAnimation = (afterClose?: () => void) => {
     if (isClosingRef.current) return;
     isClosingRef.current = true;
@@ -8538,6 +8639,7 @@ function PagePreviewDrawer({
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
+      if (isComposingKey(event)) return;
       if (event.key === "Escape") closeWithAnimation();
     };
     window.addEventListener("keydown", closeOnEscape);
@@ -8630,6 +8732,7 @@ function PagePreviewDrawer({
           onPointerCancel={endDrawerResize}
           onLostPointerCapture={endDrawerResize}
           onKeyDown={(event) => {
+            if (isComposingKey(event.nativeEvent)) return;
             if (event.key === "ArrowLeft") {
               event.preventDefault();
               resizeDrawer(drawerWidth + 24, true);
@@ -8696,11 +8799,14 @@ function PagePreviewDrawer({
             >
             <BlockNoteView
               editor={previewEditor}
+              onDropCapture={(event) => { if (canEditPreviewPage) insertAttachmentFiles(event.nativeEvent, previewEditor); }}
               theme={theme}
               editable={canEditPreviewPage}
               onChange={() => {
-                if (!canEditPreviewPage) return;
-                onChange({ blocks: previewEditor.document as unknown as PartialBlock[] });
+                if (!canEditPreviewPage || previewLoadingRef.current) return;
+                const blocks = previewEditor.document as unknown as PartialBlock[];
+                previewDocumentRef.current = blocks;
+                onChange({ blocks });
               }}
               data-theming-css-variables-demo
             />

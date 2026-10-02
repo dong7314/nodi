@@ -1,3 +1,4 @@
+import { isComposingKey } from "./ime";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -218,6 +219,7 @@ export function WorkspaceSettingsDialog({
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (isComposingKey(event)) return;
       if (event.key === "Escape") closeWithAnimation();
     };
     window.addEventListener("keydown", handleKeyDown);
@@ -550,6 +552,7 @@ function AccountSettings({
             maxLength={40}
             onChange={(event) => onNameChange(event.target.value)}
             onKeyDown={(event) => {
+              if (isComposingKey(event.nativeEvent)) return;
               if (event.key === "Enter") onSaveProfile();
             }}
           />
@@ -594,6 +597,7 @@ function AccountSettings({
               value={passwordConfirmation}
               onChange={(event) => onPasswordConfirmationChange(event.target.value)}
               onKeyDown={(event) => {
+                if (isComposingKey(event.nativeEvent)) return;
                 if (event.key === "Enter") onSavePassword();
               }}
               placeholder="새 비밀번호 다시 입력"

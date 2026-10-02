@@ -1,3 +1,4 @@
+import { isComposingKey } from "./ime";
 import { useEffect, useRef, useState } from "react";
 import { CalendarDays, Check, CircleDotDashed, Columns3, Eye, EyeOff, Lock, Palette, Settings2, Tags, Type, Unlock, X } from "lucide-react";
 import { DatePicker } from "./components/ui/date-picker";
@@ -59,7 +60,7 @@ export function PageSettingsPanel({ settings, tagOptions = DEFAULT_TAG_OPTIONS, 
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeWithAnimation();
+      if (!isComposingKey(event) && event.key === "Escape") closeWithAnimation();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => {

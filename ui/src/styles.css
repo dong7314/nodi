@@ -10600,3 +10600,13 @@ body:has(.page-share-panel) [data-radix-popper-content-wrapper]:has(> .shadcn-se
   .block-comment-panel,
   .block-comment-panel.is-closing { animation: none; }
 }
+
+/* Storage failures and conflicts use the existing table palette. */
+.database-sync-status, .database-sync-conflict { margin: 8px 12px; font-size: 12px; }
+.database-sync-conflict { padding: 12px; border: 1px solid currentColor; border-radius: 6px; }
+.database-sync-conflict p { margin: 0 0 8px; }
+.database-sync-status button, .database-sync-conflict button { padding: 5px 9px; border: 1px solid currentColor; border-radius: 4px; background: transparent; color: inherit; }
+.database-sync-conflict button:disabled { opacity: .45; }
+.database-sync-conflict fieldset { margin: 12px 0; min-width: 0; border: 1px solid currentColor; }
+.database-sync-conflict label { display: block; margin: 8px 0; }
+.database-sync-conflict pre { margin: 4px 0 8px 22px; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }

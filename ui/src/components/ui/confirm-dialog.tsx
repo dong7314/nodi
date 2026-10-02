@@ -1,3 +1,4 @@
+import { isComposingKey } from "../../ime";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
@@ -37,7 +38,7 @@ export function ConfirmDialog({
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || isClosing) return;
+      if (isComposingKey(event) || event.key !== "Escape" || isClosing) return;
       event.preventDefault();
       closeWithAnimation(onCancel);
     };
