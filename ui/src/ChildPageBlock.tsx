@@ -1,28 +1,15 @@
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 import { ChevronRight, FileText } from "lucide-react";
-import { OPEN_PAGE_EVENT, PAGES_CHANGED_EVENT, readStoredPages } from "./page-store";
+import { OPEN_PAGE_EVENT } from "./page-store";
+import { getPageTitle, subscribePageTitles } from "./child-page-titles";
 
 type ChildPageBlockProps = {
   pageId: string;
   fallbackTitle: string;
 };
 
-function getPageTitle(pageId: string, fallbackTitle: string) {
-  return readStoredPages()?.[pageId]?.title || fallbackTitle || "제목 없음";
-}
-
 export function ChildPageBlock({ pageId, fallbackTitle }: ChildPageBlockProps) {
-  const [title, setTitle] = useState(() => getPageTitle(pageId, fallbackTitle));
-
-  useEffect(() => {
-    const refresh = () => setTitle(getPageTitle(pageId, fallbackTitle));
-    window.addEventListener(PAGES_CHANGED_EVENT, refresh);
-    window.addEventListener("storage", refresh);
-    return () => {
-      window.removeEventListener(PAGES_CHANGED_EVENT, refresh);
-      window.removeEventListener("storage", refresh);
-    };
-  }, [fallbackTitle, pageId]);
+  const title = useSyncExternalStore(subscribePageTitles, () => getPageTitle(pageId, fallbackTitle));
 
   return (
     <button

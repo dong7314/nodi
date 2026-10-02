@@ -51,7 +51,7 @@ export function readStoredPages(): StoredPages | null {
 
 export function persistStoredPages(pages: StoredPages) {
   window.localStorage.setItem(PAGES_STORAGE_KEY, JSON.stringify(pages));
-  window.dispatchEvent(new CustomEvent(PAGES_CHANGED_EVENT));
+  window.dispatchEvent(new CustomEvent(PAGES_CHANGED_EVENT, { detail: { pages } }));
 }
 
 export function readStoredFolders(): StoredFolders {
