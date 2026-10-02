@@ -1,5 +1,5 @@
 import type { PartialBlock } from "@blocknote/core";
-import { apiRequest, apiWebSocketURL } from "./api-client";
+import { apiRequest, apiRequestEnvelope, apiWebSocketURL } from "./api-client";
 import type { PageSettings } from "./PageSettings";
 import type { LocalAuthUser, LocalAvatarColor, RegistrationRequest } from "./account-store";
 import type { StoredFolder, StoredPage } from "./page-store";
@@ -28,6 +28,7 @@ export type ServerPageRealtimeEvent = {
   databaseId?: string;
   permission?: SharePermission;
   actorId?: string;
+  mutationId?: string;
   message?: string;
   code?: string;
   participants?: ServerRealtimeParticipant[];
@@ -170,8 +171,20 @@ export const authApi = {
 
 export const workspaceApi = {
   getPublicPage: (pageId: string) => apiRequest<ServerPublicPage>(`/public/pages/${encodeURIComponent(pageId)}`),
-  listPages: (includeArchived = true, includeBlocks = false) => apiRequest<ServerPage[]>(`/pages?includeArchived=${includeArchived}&includeBlocks=${includeBlocks}&limit=500`),
-  getPage: (pageId: string) => apiRequest<ServerPage>(`/pages/${encodeURIComponent(pageId)}`),
+  listPages: async (includeArchived = true, includeBlocks = false) => {
+    const pages = new Map<string, ServerPage>();
+    const seen = new Set<string>();
+    let cursor: string | null | undefined;
+    do {
+      const response = await apiRequestEnvelope<ServerPage[]>(`/pages?includeArchived=${includeArchived}&includeBlocks=${includeBlocks}&limit=500${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+      response.data.forEach((page) => pages.set(page.id, page));
+      cursor = response.meta?.nextCursor;
+      if (cursor && seen.has(cursor)) throw new Error("페이지 목록 커서가 반복되었습니다. 다시 시도해 주세요.");
+      if (cursor) seen.add(cursor);
+    } while (cursor);
+    return [...pages.values()];
+  },
+  getPage: (pageId: string, signal?: AbortSignal) => apiRequest<ServerPage>(`/pages/${encodeURIComponent(pageId)}`, { signal }),
   pageRealtimeURL: (pageId: string) => apiWebSocketURL(`/pages/${encodeURIComponent(pageId)}/realtime`),
   createPage: (page: StoredPage) => apiRequest<ServerPage>("/pages", {
     method: "POST",
@@ -213,7 +226,7 @@ export const workspaceApi = {
       collapsed: folder.collapsed,
     }),
   }),
-  updateFolder: (folder: StoredFolder) => apiRequest<ServerFolder>(`/folders/${encodeURIComponent(folder.id)}`, {
+  updateFolder: (folder: Pick<StoredFolder, "id"> & Partial<StoredFolder>) => apiRequest<ServerFolder>(`/folders/${encodeURIComponent(folder.id)}`, {
     method: "PATCH",
     body: JSON.stringify({
       parentId: folder.parentId,

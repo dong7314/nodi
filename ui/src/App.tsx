@@ -2408,7 +2408,11 @@ function App() {
         for (const folder of Object.values(after)) {
           const previous = before[folder.id];
           if (!previous || sameServerValue(previous, folder)) continue;
-          await workspaceApi.updateFolder(folder);
+          const patch: Pick<StoredFolder, "id"> & Partial<StoredFolder> = { id: folder.id };
+          for (const key of ["parentId", "title", "order", "collapsed"] as const) {
+            if (!sameServerValue(previous[key], folder[key])) Object.assign(patch, { [key]: folder[key] });
+          }
+          await workspaceApi.updateFolder(patch);
         }
         for (const folder of Object.values(before)) {
           if (!after[folder.id]) await workspaceApi.deleteFolder(folder.id);

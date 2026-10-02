@@ -14,7 +14,7 @@ export function apiWebSocketURL(path: string) {
   return base.toString();
 }
 
-type ApiEnvelope<T> = { data: T };
+export type ApiEnvelope<T> = { data: T; meta?: { nextCursor?: string | null } };
 type ApiErrorEnvelope = {
   error?: {
     code?: string;
@@ -37,10 +37,10 @@ export class NodiApiError extends Error {
   }
 }
 
-export async function apiRequest<T>(
+export async function apiRequestEnvelope<T>(
   path: string,
   init: RequestInit = {},
-): Promise<T> {
+): Promise<ApiEnvelope<T>> {
   const headers = new Headers(init.headers);
   if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
@@ -53,7 +53,7 @@ export async function apiRequest<T>(
     credentials: "include",
   });
 
-  if (response.status === 204) return undefined as T;
+  if (response.status === 204) return { data: undefined as T };
 
   let payload: ApiEnvelope<T> | ApiErrorEnvelope | null = null;
   try {
@@ -74,8 +74,12 @@ export async function apiRequest<T>(
     );
   }
 
-  if (payload && "data" in payload) return payload.data;
-  return payload as T;
+  if (payload && "data" in payload) return payload;
+  return { data: payload as T };
+}
+
+export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return (await apiRequestEnvelope<T>(path, init)).data;
 }
 
 export function isAuthenticationError(error: unknown) {
