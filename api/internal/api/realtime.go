@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"golang.org/x/net/websocket"
 )
 
@@ -25,6 +28,7 @@ type pageRealtimeEvent struct {
 	DatabaseID      string                    `json:"databaseId,omitempty"`
 	Permission      string                    `json:"permission,omitempty"`
 	ActorID         string                    `json:"actorId,omitempty"`
+	MutationID      string                    `json:"mutationId,omitempty"`
 	Message         string                    `json:"message,omitempty"`
 	Code            string                    `json:"code,omitempty"`
 	Participants    []pageRealtimeParticipant `json:"participants,omitempty"`
@@ -34,18 +38,72 @@ type pageRealtimeEvent struct {
 }
 
 type pageRealtimeClient struct {
-	pageID        string
-	user          authUser
-	activeBlockID string
-	conn          *websocket.Conn
-	writeMu       sync.Mutex
+	pageID         string
+	user           authUser
+	activeBlockID  string
+	conn           *websocket.Conn
+	writeMu        sync.Mutex
+	sessionHash    []byte
+	sendAuthorized func(pageRealtimeEvent) error
 }
 
 func (c *pageRealtimeClient) send(event pageRealtimeEvent) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	if c.sendAuthorized != nil {
+		return c.sendAuthorized(event)
+	}
 	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	return websocket.JSON.Send(c.conn, event)
+}
+
+func (s *Server) sendRealtimeEvent(r *http.Request, client *pageRealtimeClient, event pageRealtimeEvent) error {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+	expires, err := realtimeSession(ctx, tx, client.sessionHash, client.user.ID, true)
+	if err != nil {
+		return err
+	}
+	ctx, cancelExpiry := context.WithDeadline(ctx, expires)
+	defer cancelExpiry()
+	switch event.Type {
+	case "access.revoked", "page.archived", "page.deleted":
+		// These terminal signals must reach clients that just lost access, but
+		// must never carry the old page body or other private event fields.
+		event = pageRealtimeEvent{Type: event.Type, Message: event.Message}
+	default:
+		var id string
+		if err = tx.QueryRow(ctx, `SELECT id FROM pages WHERE id=$1 FOR SHARE`, client.pageID).Scan(&id); err != nil {
+			return err
+		}
+		// Sharing changes lock the same page. Read the ACL after waiting, and
+		// retain the lock through the network write so revocation cannot finish
+		// before a frame authorized by the old ACL has been sent.
+		if _, err = authorizePageWith(r.WithContext(ctx), tx, client.user.ID, client.pageID, "view"); err != nil {
+			return err
+		}
+		if event.Type == "page.snapshot" {
+			value, readErr := scanPageForAccess(tx.QueryRow(ctx, pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived))`, client.user.ID, client.pageID), "view")
+			if readErr != nil {
+				return readErr
+			}
+			event.Page = &value
+		}
+	}
+	deadline, _ := ctx.Deadline()
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	_ = client.conn.SetWriteDeadline(deadline)
+	if err = websocket.JSON.Send(client.conn, event); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 type pageRealtimeHub struct {
@@ -172,6 +230,61 @@ func (h *pageRealtimeHub) revoke(pageID string, userID uuid.UUID) {
 		_ = client.conn.Close()
 	}
 	h.broadcastPresence(pageID)
+}
+
+func (h *pageRealtimeHub) disconnectMatching(matches func(*pageRealtimeClient) bool) {
+	h.mu.Lock()
+	var clients []*pageRealtimeClient
+	for pageID, room := range h.rooms {
+		for client := range room {
+			if matches(client) {
+				clients = append(clients, client)
+				delete(room, client)
+			}
+		}
+		if len(room) == 0 {
+			delete(h.rooms, pageID)
+		}
+	}
+	h.mu.Unlock()
+	for _, client := range clients {
+		_ = client.conn.Close()
+	}
+}
+
+func (h *pageRealtimeHub) revokeSession(hash []byte) {
+	h.disconnectMatching(func(client *pageRealtimeClient) bool { return equalBytes(client.sessionHash, hash) })
+}
+
+func (h *pageRealtimeHub) revokeUser(userID uuid.UUID) {
+	h.disconnectMatching(func(client *pageRealtimeClient) bool { return client.user.ID == userID })
+}
+
+func realtimeSession(ctx context.Context, query rowQuerier, hash []byte, userID uuid.UUID, lock bool) (time.Time, error) {
+	if lock {
+		// Password changes lock the user before deleting its sessions. Use the
+		// same order here to avoid a user/session lock inversion.
+		var id uuid.UUID
+		if err := query.QueryRow(ctx, `SELECT id FROM users WHERE id=$1 AND status='approved' FOR SHARE`, userID).Scan(&id); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return time.Time{}, &apiError{Status: http.StatusUnauthorized, Code: "INVALID_SESSION", Message: "로그인 세션이 만료되었습니다."}
+			}
+			return time.Time{}, err
+		}
+	}
+	sql := `SELECT ss.expires_at FROM sessions ss JOIN users u ON u.id=ss.user_id
+		WHERE ss.token_hash=$1 AND ss.user_id=$2 AND ss.expires_at>clock_timestamp() AND u.status='approved'`
+	if lock {
+		// Revoking a session/account waits for an already authorized mutation to
+		// commit, so no write can finish after the revocation response.
+		sql += ` FOR SHARE OF ss`
+	}
+	var expires time.Time
+	err := query.QueryRow(ctx, sql, hash, userID).Scan(&expires)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, &apiError{Status: http.StatusUnauthorized, Code: "INVALID_SESSION", Message: "로그인 세션이 만료되었습니다."}
+	}
+	return expires, err
 }
 
 type realtimeBlockEnvelope struct {
@@ -320,15 +433,20 @@ func (s *Server) applyRealtimeBlocks(r *http.Request, user authUser, pageID stri
 		return page{}, err
 	}
 	defer tx.Rollback(r.Context())
-	// Serialize merges for this page. Without the row lock, two participants
-	// could both read revision N and the second UPDATE would erase the first
-	// participant's freshly merged block.
-	current, err := scanPage(tx.QueryRow(r.Context(), pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived)) FOR UPDATE OF p`, user.ID, pageID))
+	expires, err := realtimeSession(r.Context(), tx, tokenHash(sessionToken(r)), user.ID, true)
 	if err != nil {
 		return page{}, err
 	}
-	if current.Permission == "view" {
-		return page{}, &apiError{Status: http.StatusForbidden, Code: "PAGE_EDIT_REQUIRED", Message: "페이지 편집 권한이 필요합니다."}
+	// A patch may wait for a page lock. Its authorization must not outlive the
+	// session while it is queued, or while PostgreSQL is processing the write.
+	ctx, cancel := context.WithDeadline(r.Context(), expires)
+	defer cancel()
+	// Serialize merges for this page. Without the row lock, two participants
+	// could both read revision N and the second UPDATE would erase the first
+	// participant's freshly merged block.
+	current, err := pageForUpdate(ctx, tx, user.ID, pageID, "edit")
+	if err != nil {
+		return page{}, err
 	}
 	if pageSettingsLocked(current.Settings) {
 		return page{}, &apiError{Status: http.StatusLocked, Code: "PAGE_LOCKED", Message: "잠긴 페이지의 블록은 변경할 수 없습니다."}
@@ -338,16 +456,16 @@ func (s *Server) applyRealtimeBlocks(r *http.Request, user authUser, pageID stri
 		return page{}, &apiError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "실시간 블록 변경 형식이 올바르지 않습니다."}
 	}
 	if jsonValuesEqual(current.Blocks, merged) {
-		if err = tx.Commit(r.Context()); err != nil {
+		if err = tx.Commit(ctx); err != nil {
 			return page{}, err
 		}
 		return current, nil
 	}
-	if err = tx.QueryRow(r.Context(), `UPDATE pages SET blocks_json=$1,revision=revision+1,updated_at=now() WHERE id=$2 RETURNING revision,updated_at`, merged, pageID).Scan(&current.Revision, &current.UpdatedAt); err != nil {
+	if err = tx.QueryRow(ctx, `UPDATE pages SET blocks_json=$1,revision=revision+1,updated_at=now() WHERE id=$2 RETURNING revision,updated_at`, merged, pageID).Scan(&current.Revision, &current.UpdatedAt); err != nil {
 		return page{}, err
 	}
 	current.Blocks = merged
-	if err = tx.Commit(r.Context()); err != nil {
+	if err = tx.Commit(ctx); err != nil {
 		return page{}, err
 	}
 	return current, nil
@@ -360,7 +478,13 @@ func (s *Server) pageRealtime(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	value, err := s.pageForAccess(r, user.ID, pageID, "view")
+	_, err = s.authorizePage(r, user.ID, pageID, "view")
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	sessionHash := tokenHash(sessionToken(r))
+	expires, err := realtimeSession(r.Context(), s.pool, sessionHash, user.ID, false)
 	if err != nil {
 		handleError(w, err)
 		return
@@ -372,15 +496,24 @@ func (s *Server) pageRealtime(w http.ResponseWriter, r *http.Request) {
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(conn *websocket.Conn) {
 			conn.MaxPayloadBytes = int(s.config.MaxBodyBytes)
-			client := &pageRealtimeClient{pageID: pageID, user: user, conn: conn}
+			validSession := func() bool {
+				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+				defer cancel()
+				_, err := realtimeSession(ctx, s.pool, sessionHash, user.ID, false)
+				return err == nil
+			}
+			client := &pageRealtimeClient{pageID: pageID, user: user, conn: conn, sessionHash: sessionHash}
+			client.sendAuthorized = func(event pageRealtimeEvent) error { return s.sendRealtimeEvent(r, client, event) }
 			s.realtime.register(client)
+			expiry := time.AfterFunc(time.Until(expires), func() { _ = conn.Close() })
+			defer expiry.Stop()
 			defer func() {
 				s.realtime.unregister(client)
 				s.realtime.broadcastPresence(pageID)
 				_ = conn.Close()
 			}()
 
-			if err := client.send(pageRealtimeEvent{Type: "page.snapshot", Page: &value}); err != nil {
+			if err := client.send(pageRealtimeEvent{Type: "page.snapshot"}); err != nil {
 				return
 			}
 			s.realtime.broadcastPresence(pageID)
@@ -392,9 +525,21 @@ func (s *Server) pageRealtime(w http.ResponseWriter, r *http.Request) {
 					DeletedBlockIDs []string        `json:"deletedBlockIds"`
 					Structural      bool            `json:"structural"`
 					ActiveBlockID   string          `json:"activeBlockId"`
+					MutationID      string          `json:"mutationId"`
 				}
 				if err := websocket.JSON.Receive(conn, &message); err != nil {
 					return
+				}
+				// Block patches validate and lock their session inside the mutation
+				// transaction; other messages need an explicit authentication check.
+				if message.Type != "page.blocks.patch" && !validSession() {
+					return
+				}
+				if len(message.MutationID) > 128 {
+					if err := client.send(pageRealtimeEvent{Type: "page.error", Code: "VALIDATION_ERROR", Message: "변경 식별자가 너무 깁니다."}); err != nil {
+						return
+					}
+					continue
 				}
 				switch message.Type {
 				case "ping":
@@ -420,7 +565,7 @@ func (s *Server) pageRealtime(w http.ResponseWriter, r *http.Request) {
 						if apiErr, ok := updateErr.(*apiError); ok {
 							code, text = apiErr.Code, apiErr.Message
 						}
-						if err := client.send(pageRealtimeEvent{Type: "page.error", Code: code, Message: text}); err != nil {
+						if err := client.send(pageRealtimeEvent{Type: "page.error", Code: code, Message: text, MutationID: message.MutationID}); err != nil {
 							return
 						}
 						continue
@@ -429,6 +574,7 @@ func (s *Server) pageRealtime(w http.ResponseWriter, r *http.Request) {
 						Type:            "page.updated",
 						Page:            &updated,
 						ActorID:         user.ID.String(),
+						MutationID:      message.MutationID,
 						ChangedBlockIDs: message.ChangedBlockIDs,
 						DeletedBlockIDs: message.DeletedBlockIDs,
 						Structural:      message.Structural,

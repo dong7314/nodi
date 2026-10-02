@@ -280,7 +280,7 @@ func (s *Server) updatePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
-	current, err := scanPageForAccess(tx.QueryRow(r.Context(), pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived)) FOR UPDATE OF p`, user.ID, pageID), "edit")
+	current, err := pageForUpdate(r.Context(), tx, user.ID, pageID, "edit")
 	if err != nil {
 		handleError(w, err)
 		return
@@ -385,7 +385,7 @@ func (s *Server) updatePageBlocks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
-	current, err := scanPageForAccess(tx.QueryRow(r.Context(), pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived)) FOR UPDATE OF p`, user.ID, pageID), "edit")
+	current, err := pageForUpdate(r.Context(), tx, user.ID, pageID, "edit")
 	if err != nil {
 		handleError(w, err)
 		return
@@ -466,7 +466,18 @@ func (s *Server) deletePage(w http.ResponseWriter, r *http.Request) {
 			handleError(w, err)
 			return
 		}
-		_, err = s.pool.Exec(r.Context(), `DELETE FROM pages WHERE id=$1`, current.ID)
+		// Database moves acquire their source/destination owners before pages.
+		// Serialize the cascade (including child parent_id updates) with them.
+		tx, beginErr := s.beginWorkspaceWrite(r.Context(), user.ID)
+		if beginErr != nil {
+			handleError(w, beginErr)
+			return
+		}
+		defer tx.Rollback(r.Context())
+		_, err = tx.Exec(r.Context(), `DELETE FROM pages WHERE id=$1`, current.ID)
+		if err == nil {
+			err = tx.Commit(r.Context())
+		}
 	} else {
 		err = s.pool.QueryRow(r.Context(), `UPDATE pages SET archived=true,revision=revision+1,updated_at=now() WHERE id=$1 RETURNING revision,updated_at`, current.ID).Scan(&current.Revision, &current.UpdatedAt)
 		current.Archived = true
@@ -636,11 +647,33 @@ type pageAccess struct {
 	UpdatedAt  time.Time
 }
 
+// Page edits and sharing changes serialize on this row. NO KEY UPDATE still
+// permits foreign-key checks by comments, notifications and child pages.
+// Callers that need user/session locks must acquire those before this lock.
+func lockPageForWrite(ctx context.Context, tx pgx.Tx, pageID string) error {
+	var id string
+	return tx.QueryRow(ctx, `SELECT id FROM pages WHERE id=$1 FOR NO KEY UPDATE`, pageID).Scan(&id)
+}
+
+func pageForUpdate(ctx context.Context, tx pgx.Tx, userID uuid.UUID, pageID, required string) (page, error) {
+	if err := lockPageForWrite(ctx, tx, pageID); err != nil {
+		return page{}, err
+	}
+	// A locking JOIN can retain a share's pre-wait snapshot. Read the ACL in a
+	// separate statement after locking, so a completed revocation or downgrade
+	// is visible even when this request started before the permission change.
+	return scanPageForAccess(tx.QueryRow(ctx, pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived))`, userID, pageID), required)
+}
+
 // authorizePage avoids reading blocks_json for requests that only need an ACL
 // check, such as comments, favorites, shares, and attachment uploads.
 func (s *Server) authorizePage(r *http.Request, userID uuid.UUID, pageID, required string) (pageAccess, error) {
+	return authorizePageWith(r, s.pool, userID, pageID, required)
+}
+
+func authorizePageWith(r *http.Request, query rowQuerier, userID uuid.UUID, pageID, required string) (pageAccess, error) {
 	var access pageAccess
-	err := s.pool.QueryRow(r.Context(), `
+	err := query.QueryRow(r.Context(), `
 		SELECT p.owner_id,CASE WHEN p.owner_id=$1 THEN 'owner' ELSE ps.permission END,p.updated_at
 		FROM pages p
 		LEFT JOIN page_shares ps ON ps.page_id=p.id AND ps.user_id=$1

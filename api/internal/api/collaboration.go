@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -392,7 +394,7 @@ func (s *Server) deleteCommentMessage(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	if _, err = s.authorizePage(r, user.ID, pageID, "view"); err != nil {
+	if _, err = authorizePageWith(r, tx, user.ID, pageID, "view"); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -616,6 +618,21 @@ func (s *Server) setPageShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	// Share/notification inserts check both user foreign keys. Take these locks
+	// before the page lock, matching user -> page writes (folders and realtime),
+	// rather than letting an FK check invert that order while holding the page.
+	if _, err = tx.Exec(r.Context(), `SELECT id FROM users WHERE id IN ($1,$2) ORDER BY id FOR KEY SHARE`, user.ID, targetID); err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = lockPageForWrite(r.Context(), tx, pageID); err != nil {
+		handleError(w, err)
+		return
+	}
+	if _, err = authorizePageWith(r, tx, user.ID, pageID, "owner"); err != nil {
+		handleError(w, err)
+		return
+	}
 	var sharedAt time.Time
 	err = tx.QueryRow(r.Context(), `INSERT INTO page_shares(page_id,user_id,permission) VALUES($1,$2,$3) ON CONFLICT(page_id,user_id) DO UPDATE SET permission=excluded.permission,shared_at=now() RETURNING shared_at`, pageID, targetID, input.Permission).Scan(&sharedAt)
 	var pageTitle string
@@ -627,7 +644,8 @@ func (s *Server) setPageShare(w http.ResponseWriter, r *http.Request) {
 		if input.Permission == "edit" {
 			permissionLabel = "편집"
 		}
-		_, err = tx.Exec(r.Context(), `INSERT INTO notifications(recipient_id,actor_id,kind,page_id,title,description) VALUES($1,$2,'share',$3,$4,$5)`, targetID, user.ID, pageID, user.Name+"님이 “"+pageTitle+"” 페이지를 공유했어요", permissionLabel+" 권한으로 초대되었습니다.")
+		title := notificationExcerpt(user.Name+"님이 “"+pageTitle+"” 페이지를 공유했어요", 499)
+		_, err = tx.Exec(r.Context(), `INSERT INTO notifications(recipient_id,actor_id,kind,page_id,title,description) VALUES($1,$2,'share',$3,$4,$5)`, targetID, user.ID, pageID, title, permissionLabel+" 권한으로 초대되었습니다.")
 	}
 	if err != nil {
 		handleError(w, err)
@@ -662,8 +680,26 @@ func (s *Server) deletePageShare(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	_, err = s.pool.Exec(r.Context(), `DELETE FROM page_shares WHERE page_id=$1 AND user_id=$2`, pageID, targetID)
+	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if err = lockPageForWrite(r.Context(), tx, pageID); err != nil {
+		handleError(w, err)
+		return
+	}
+	if _, err = authorizePageWith(r, tx, user.ID, pageID, "owner"); err != nil {
+		handleError(w, err)
+		return
+	}
+	_, err = tx.Exec(r.Context(), `DELETE FROM page_shares WHERE page_id=$1 AND user_id=$2`, pageID, targetID)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -718,6 +754,65 @@ func (s *Server) getInlineDatabase(w http.ResponseWriter, r *http.Request) {
 	}
 	writeData(w, 200, value)
 }
+
+// Serialize the database identity before reading its current page. This covers
+// creation and moves even when no database row exists yet. Page rows are then
+// locked in ID order, before any database row write, matching page deletion's
+// page -> cascading database order. User FK locks always precede page locks.
+func (s *Server) beginDatabaseWrite(r *http.Request, userID uuid.UUID, databaseID string, target optionalString) (pgx.Tx, inlineDatabase, bool, error) {
+	ctx := r.Context()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, inlineDatabase{}, false, err
+	}
+	fail := func(err error) (pgx.Tx, inlineDatabase, bool, error) {
+		tx.Rollback(context.Background())
+		return nil, inlineDatabase{}, false, err
+	}
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('inline_database:' || $1, 0))`, databaseID); err != nil {
+		return fail(err)
+	}
+	var current inlineDatabase
+	err = tx.QueryRow(ctx, `SELECT id,owner_id,page_id,state_json,revision,created_at,updated_at FROM inline_databases WHERE id=$1`, databaseID).Scan(&current.ID, &current.OwnerID, &current.PageID, &current.State, &current.Revision, &current.CreatedAt, &current.UpdatedAt)
+	exists := err == nil
+	if err != nil && !errorsIsNoRows(err) {
+		return fail(err)
+	}
+	if exists && current.PageID == nil && current.OwnerID != userID {
+		return fail(pgx.ErrNoRows)
+	}
+	pageIDs := make([]string, 0, 2)
+	if current.PageID != nil {
+		pageIDs = append(pageIDs, *current.PageID)
+	}
+	if target.Set && target.Value != nil && (current.PageID == nil || *target.Value != *current.PageID) {
+		pageIDs = append(pageIDs, *target.Value)
+	}
+	sort.Strings(pageIDs)
+	// Hard deletion also touches child pages through ON DELETE SET NULL.
+	// Guard every involved owner before locking pages so deletion cannot hold
+	// a parent while a database move holds its child (possibly in another order).
+	if _, err = tx.Exec(ctx, `SELECT id FROM users WHERE id=$1 OR id IN (SELECT owner_id FROM pages WHERE id=ANY($2::text[])) ORDER BY id FOR KEY SHARE`, userID, pageIDs); err != nil {
+		return fail(err)
+	}
+	for _, pageID := range pageIDs {
+		if err = lockPageForWrite(ctx, tx, pageID); err != nil {
+			return fail(err)
+		}
+		if _, err = authorizePageWith(r, tx, userID, pageID, "edit"); err != nil {
+			return fail(err)
+		}
+		var settings json.RawMessage
+		if err = tx.QueryRow(ctx, `SELECT settings_json FROM pages WHERE id=$1`, pageID).Scan(&settings); err != nil {
+			return fail(err)
+		}
+		if pageSettingsLocked(settings) {
+			return fail(&apiError{Status: http.StatusLocked, Code: "PAGE_LOCKED", Message: "잠긴 페이지의 데이터베이스는 변경할 수 없습니다."})
+		}
+	}
+	return tx, current, exists, nil
+}
+
 func (s *Server) putInlineDatabase(w http.ResponseWriter, r *http.Request) {
 	user, _ := userFromContext(r.Context())
 	databaseID, err := routeResourceID(r, "databaseID")
@@ -738,25 +833,23 @@ func (s *Server) putInlineDatabase(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "VALIDATION_ERROR", "데이터베이스 상태는 JSON 객체여야 합니다.", nil)
 		return
 	}
-	current, err := s.databaseForAccess(r, user.ID, databaseID, "edit")
-	if errorsIsNoRows(err) {
+	tx, current, exists, err := s.beginDatabaseWrite(r, user.ID, databaseID, input.PageID)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if !exists {
 		var pageID *string
 		if input.PageID.Set {
 			pageID = input.PageID.Value
 		}
-		if pageID != nil {
-			pageValue, accessErr := s.pageForAccess(r, user.ID, *pageID, "edit")
-			if accessErr != nil {
-				handleError(w, accessErr)
-				return
-			}
-			if pageSettingsLocked(pageValue.Settings) {
-				writeError(w, http.StatusLocked, "PAGE_LOCKED", "잠긴 페이지의 데이터베이스는 변경할 수 없습니다.", nil)
-				return
-			}
-		}
-		err = s.pool.QueryRow(r.Context(), `INSERT INTO inline_databases(id,owner_id,page_id,state_json) VALUES($1,$2,$3,$4) RETURNING id,owner_id,page_id,state_json,revision,created_at,updated_at`, databaseID, user.ID, pageID, input.State).Scan(&current.ID, &current.OwnerID, &current.PageID, &current.State, &current.Revision, &current.CreatedAt, &current.UpdatedAt)
+		err = tx.QueryRow(r.Context(), `INSERT INTO inline_databases(id,owner_id,page_id,state_json) VALUES($1,$2,$3,$4) RETURNING id,owner_id,page_id,state_json,revision,created_at,updated_at`, databaseID, user.ID, pageID, input.State).Scan(&current.ID, &current.OwnerID, &current.PageID, &current.State, &current.Revision, &current.CreatedAt, &current.UpdatedAt)
 		if err != nil {
+			handleError(w, err)
+			return
+		}
+		if err = tx.Commit(r.Context()); err != nil {
 			handleError(w, err)
 			return
 		}
@@ -764,10 +857,6 @@ func (s *Server) putInlineDatabase(w http.ResponseWriter, r *http.Request) {
 			s.realtime.broadcast(*current.PageID, pageRealtimeEvent{Type: "database.updated", Database: &current, ActorID: user.ID.String()})
 		}
 		writeData(w, 201, current)
-		return
-	}
-	if err != nil {
-		handleError(w, err)
 		return
 	}
 	if input.Revision != nil && *input.Revision != current.Revision {
@@ -778,22 +867,10 @@ func (s *Server) putInlineDatabase(w http.ResponseWriter, r *http.Request) {
 	if input.PageID.Set {
 		pageID = input.PageID.Value
 	}
-	if pageID != nil && current.PageID != pageID {
-		pageValue, accessErr := s.pageForAccess(r, user.ID, *pageID, "edit")
-		if accessErr != nil {
-			err = accessErr
-			handleError(w, err)
-			return
-		}
-		if pageSettingsLocked(pageValue.Settings) {
-			writeError(w, http.StatusLocked, "PAGE_LOCKED", "잠긴 페이지의 데이터베이스는 변경할 수 없습니다.", nil)
-			return
-		}
-	}
-	err = s.pool.QueryRow(r.Context(), `UPDATE inline_databases SET page_id=$1,state_json=$2,revision=revision+1,updated_at=now() WHERE id=$3 AND revision=$4 RETURNING page_id,state_json,revision,updated_at`, pageID, input.State, databaseID, current.Revision).Scan(&current.PageID, &current.State, &current.Revision, &current.UpdatedAt)
+	err = tx.QueryRow(r.Context(), `UPDATE inline_databases SET page_id=$1,state_json=$2,revision=revision+1,updated_at=now() WHERE id=$3 AND revision=$4 RETURNING page_id,state_json,revision,updated_at`, pageID, input.State, databaseID, current.Revision).Scan(&current.PageID, &current.State, &current.Revision, &current.UpdatedAt)
 	if errorsIsNoRows(err) {
 		var revision int64
-		if scanErr := s.pool.QueryRow(r.Context(), `SELECT revision FROM inline_databases WHERE id=$1`, databaseID).Scan(&revision); scanErr != nil {
+		if scanErr := tx.QueryRow(r.Context(), `SELECT revision FROM inline_databases WHERE id=$1`, databaseID).Scan(&revision); scanErr != nil {
 			handleError(w, scanErr)
 			return
 		}
@@ -801,6 +878,10 @@ func (s *Server) putInlineDatabase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -816,13 +897,22 @@ func (s *Server) deleteInlineDatabase(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	current, err := s.databaseForAccess(r, user.ID, databaseID, "edit")
+	tx, current, exists, err := s.beginDatabaseWrite(r, user.ID, databaseID, optionalString{})
 	if err != nil {
 		handleError(w, err)
 		return
 	}
-	_, err = s.pool.Exec(r.Context(), `DELETE FROM inline_databases WHERE id=$1`, current.ID)
+	defer tx.Rollback(r.Context())
+	if !exists {
+		handleError(w, pgx.ErrNoRows)
+		return
+	}
+	_, err = tx.Exec(r.Context(), `DELETE FROM inline_databases WHERE id=$1`, current.ID)
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}

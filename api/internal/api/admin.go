@@ -93,7 +93,11 @@ func (s *Server) decideRegistrationHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if input.Status == "rejected" {
-		_, _ = s.pool.Exec(r.Context(), `DELETE FROM sessions WHERE user_id=$1`, userID)
+		s.realtime.revokeUser(userID)
+		if _, err = s.pool.Exec(r.Context(), `DELETE FROM sessions WHERE user_id=$1`, userID); err != nil {
+			handleError(w, err)
+			return
+		}
 	}
 	writeData(w, 200, map[string]any{"id": userID, "status": input.Status, "decidedAt": decidedAt})
 }

@@ -17,6 +17,12 @@ import (
 
 type authContextKey struct{}
 
+const maxPasswordBytes = 72 // bcrypt's maximum input length, including UTF-8 bytes.
+
+func validPassword(value string) bool {
+	return len(value) >= 8 && len(value) <= maxPasswordBytes
+}
+
 type authUser struct {
 	ID          uuid.UUID  `json:"id"`
 	Name        string     `json:"name"`
@@ -102,7 +108,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 	input.Name = strings.TrimSpace(input.Name)
 	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
-	if !nonEmpty(input.Name, 80) || !validEmail(input.Email) || len(input.Password) < 8 || len(input.Password) > 128 {
+	if !nonEmpty(input.Name, 80) || !validEmail(input.Email) || !validPassword(input.Password) {
 		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "이름, 이메일 또는 비밀번호 형식이 올바르지 않습니다.", nil)
 		return
 	}
@@ -174,11 +180,24 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
+	if !validPassword(input.Password) {
+		writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "이메일 또는 비밀번호가 올바르지 않습니다.", nil)
+		return
+	}
 	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
 	var user authUser
-	err := s.pool.QueryRow(r.Context(), `
+	// Keep credential verification and session creation behind the same user
+	// lock as password/status changes. A delayed login must not issue a session
+	// after a password change has already deleted the user's previous sessions.
+	err = tx.QueryRow(r.Context(), `
 		SELECT id,name,email,avatar_color,avatar_icon,role,status,password_hash,requested_at,decided_at
-		FROM users WHERE lower(email)=lower($1)
+		FROM users WHERE lower(email)=lower($1) FOR SHARE
 	`, input.Email).Scan(
 		&user.ID, &user.Name, &user.Email, &user.AvatarColor, &user.AvatarIcon,
 		&user.Role, &user.Status, &user.Password, &user.RequestedAt, &user.DecidedAt,
@@ -196,8 +215,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, code, message, nil)
 		return
 	}
-	token, expiresAt, err := s.newSession(r.Context(), user.ID)
+	token, expiresAt, err := s.newSessionWith(r.Context(), tx, user.ID)
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -206,12 +229,13 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
-	if token := bearerToken(r); token != "" {
-		hash := sha256.Sum256([]byte(token))
-		_, _ = s.pool.Exec(r.Context(), `DELETE FROM sessions WHERE token_hash=$1`, hash[:])
-	} else if cookie, err := r.Cookie("nodi_session"); err == nil {
-		hash := sha256.Sum256([]byte(cookie.Value))
-		_, _ = s.pool.Exec(r.Context(), `DELETE FROM sessions WHERE token_hash=$1`, hash[:])
+	if token := sessionToken(r); token != "" {
+		hash := tokenHash(token)
+		if _, err := s.pool.Exec(r.Context(), `DELETE FROM sessions WHERE token_hash=$1`, hash); err != nil {
+			handleError(w, err)
+			return
+		}
+		s.realtime.revokeSession(hash)
 	}
 	http.SetCookie(w, &http.Cookie{Name: "nodi_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	w.WriteHeader(http.StatusNoContent)
@@ -270,7 +294,11 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	if len(input.NextPassword) < 8 || len(input.NextPassword) > 128 || bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.CurrentPassword)) != nil {
+	if !validPassword(input.NextPassword) {
+		writeError(w, 400, "INVALID_PASSWORD", "새 비밀번호는 UTF-8 기준 8~72바이트여야 합니다.", nil)
+		return
+	}
+	if !validPassword(input.CurrentPassword) || bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.CurrentPassword)) != nil {
 		writeError(w, 400, "CURRENT_PASSWORD_MISMATCH", "현재 비밀번호가 올바르지 않거나 새 비밀번호 형식이 잘못되었습니다.", nil)
 		return
 	}
@@ -285,6 +313,17 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	// requireAuth read the password before this transaction. Recheck under the
+	// user lock so two requests using the old password cannot both replace it.
+	var currentHash string
+	if err = tx.QueryRow(r.Context(), `SELECT password_hash FROM users WHERE id=$1 FOR UPDATE`, user.ID).Scan(&currentHash); err != nil {
+		handleError(w, err)
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(currentHash), []byte(input.CurrentPassword)) != nil {
+		writeError(w, 400, "CURRENT_PASSWORD_MISMATCH", "현재 비밀번호가 올바르지 않습니다.", nil)
+		return
+	}
 	if _, err = tx.Exec(r.Context(), `UPDATE users SET password_hash=$1,updated_at=now() WHERE id=$2`, string(hash), user.ID); err == nil {
 		_, err = tx.Exec(r.Context(), `DELETE FROM sessions WHERE user_id=$1`, user.ID)
 	}
@@ -296,11 +335,16 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
+	s.realtime.revokeUser(user.ID)
 	http.SetCookie(w, &http.Cookie{Name: "nodi_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) newSession(ctx context.Context, userID uuid.UUID) (string, time.Time, error) {
+	return s.newSessionWith(ctx, s.pool, userID)
+}
+
+func (s *Server) newSessionWith(ctx context.Context, query rowQuerier, userID uuid.UUID) (string, time.Time, error) {
 	bytes := make([]byte, 32)
 	if _, err := rand.Read(bytes); err != nil {
 		return "", time.Time{}, err
@@ -308,7 +352,7 @@ func (s *Server) newSession(ctx context.Context, userID uuid.UUID) (string, time
 	token := base64.RawURLEncoding.EncodeToString(bytes)
 	hash := sha256.Sum256([]byte(token))
 	expires := time.Now().UTC().Add(s.config.SessionTTL)
-	_, err := s.pool.Exec(ctx, `INSERT INTO sessions(token_hash,user_id,expires_at) VALUES($1,$2,$3)`, hash[:], userID, expires)
+	err := query.QueryRow(ctx, `INSERT INTO sessions(token_hash,user_id,expires_at) VALUES($1,$2,$3) RETURNING expires_at`, hash[:], userID, expires).Scan(&expires)
 	return token, expires, err
 }
 
