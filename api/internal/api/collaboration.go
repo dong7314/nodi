@@ -99,7 +99,7 @@ func (s *Server) listAllComments(w http.ResponseWriter, r *http.Request) {
 		SELECT ct.id,ct.page_id,ct.block_id,ct.block_preview,ct.resolved_at,ct.resolved_by,ct.created_at,ct.updated_at
 		FROM comment_threads ct
 		JOIN pages p ON p.id=ct.page_id
-		LEFT JOIN page_shares ps ON ps.page_id=p.id AND ps.user_id=$1
+		LEFT JOIN LATERAL effective_page_shares(p.id) ps ON ps.user_id=$1
 		WHERE (p.owner_id=$1 OR ps.user_id=$1) AND NOT p.archived AND ($2 OR ct.resolved_at IS NULL)
 		ORDER BY ct.updated_at DESC LIMIT $3
 	`, user.ID, includeResolved, limit)
@@ -473,11 +473,14 @@ func (s *Server) listPageShares(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type member struct {
-		User       authUser  `json:"user"`
-		Permission string    `json:"permission"`
-		SharedAt   time.Time `json:"sharedAt"`
+		User                authUser  `json:"user"`
+		Permission          string    `json:"permission"`
+		SharedAt            time.Time `json:"sharedAt"`
+		InheritedFromPageID *string   `json:"inheritedFromPageId,omitempty"`
+		InheritedFromTitle  *string   `json:"inheritedFromTitle,omitempty"`
+		DirectPermission    *string   `json:"directPermission,omitempty"`
 	}
-	rows, err := s.pool.Query(r.Context(), `SELECT u.id,u.name,u.email,u.avatar_color,u.avatar_icon,u.role,u.status,'' AS password_hash,u.requested_at,u.decided_at,ps.permission,ps.shared_at FROM page_shares ps JOIN users u ON u.id=ps.user_id WHERE ps.page_id=$1 ORDER BY ps.shared_at LIMIT 200`, pageID)
+	rows, err := s.pool.Query(r.Context(), `SELECT u.id,u.name,u.email,u.avatar_color,u.avatar_icon,u.role,u.status,'' AS password_hash,u.requested_at,u.decided_at,ps.permission,ps.shared_at,CASE WHEN ps.source_page_id<>$1 THEN ps.source_page_id END,CASE WHEN ps.source_page_id<>$1 THEN source.title END,ps.direct_permission FROM effective_page_shares($1) ps JOIN users u ON u.id=ps.user_id JOIN pages source ON source.id=ps.source_page_id ORDER BY ps.shared_at LIMIT 200`, pageID)
 	if err != nil {
 		handleError(w, err)
 		return
@@ -486,7 +489,7 @@ func (s *Server) listPageShares(w http.ResponseWriter, r *http.Request) {
 	members := []member{}
 	for rows.Next() {
 		var value member
-		if err := rows.Scan(&value.User.ID, &value.User.Name, &value.User.Email, &value.User.AvatarColor, &value.User.AvatarIcon, &value.User.Role, &value.User.Status, &value.User.Password, &value.User.RequestedAt, &value.User.DecidedAt, &value.Permission, &value.SharedAt); err != nil {
+		if err := rows.Scan(&value.User.ID, &value.User.Name, &value.User.Email, &value.User.AvatarColor, &value.User.AvatarIcon, &value.User.Role, &value.User.Status, &value.User.Password, &value.User.RequestedAt, &value.User.DecidedAt, &value.Permission, &value.SharedAt, &value.InheritedFromPageID, &value.InheritedFromTitle, &value.DirectPermission); err != nil {
 			handleError(w, err)
 			return
 		}
@@ -498,9 +501,12 @@ func (s *Server) listPageShares(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listAllPageShares(w http.ResponseWriter, r *http.Request) {
 	user, _ := userFromContext(r.Context())
 	type member struct {
-		User       authUser  `json:"user"`
-		Permission string    `json:"permission"`
-		SharedAt   time.Time `json:"sharedAt"`
+		User                authUser  `json:"user"`
+		Permission          string    `json:"permission"`
+		SharedAt            time.Time `json:"sharedAt"`
+		InheritedFromPageID *string   `json:"inheritedFromPageId,omitempty"`
+		InheritedFromTitle  *string   `json:"inheritedFromTitle,omitempty"`
+		DirectPermission    *string   `json:"directPermission,omitempty"`
 	}
 	type record struct {
 		PageID     string    `json:"pageId"`
@@ -514,7 +520,7 @@ func (s *Server) listAllPageShares(w http.ResponseWriter, r *http.Request) {
 		       CASE WHEN p.owner_id=$1 THEN 'owner' ELSE current_share.permission END,p.updated_at
 		FROM pages p
 		JOIN users o ON o.id=p.owner_id
-		LEFT JOIN page_shares current_share ON current_share.page_id=p.id AND current_share.user_id=$1
+		LEFT JOIN LATERAL effective_page_shares(p.id) current_share ON current_share.user_id=$1
 		WHERE (p.owner_id=$1 OR current_share.user_id=$1) AND NOT p.archived
 		ORDER BY p.order_index,p.id
 	`, user.ID)
@@ -544,9 +550,9 @@ func (s *Server) listAllPageShares(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(pageIDs) > 0 {
 		memberRows, queryErr := s.pool.Query(r.Context(), `
-			SELECT ps.page_id,u.id,u.name,u.email,u.avatar_color,u.avatar_icon,u.role,u.status,'' AS password_hash,u.requested_at,u.decided_at,ps.permission,ps.shared_at
-			FROM page_shares ps JOIN users u ON u.id=ps.user_id
-			WHERE ps.page_id=ANY($1) ORDER BY ps.shared_at
+			SELECT p.id,u.id,u.name,u.email,u.avatar_color,u.avatar_icon,u.role,u.status,'' AS password_hash,u.requested_at,u.decided_at,ps.permission,ps.shared_at,CASE WHEN ps.source_page_id<>p.id THEN ps.source_page_id END,CASE WHEN ps.source_page_id<>p.id THEN source.title END,ps.direct_permission
+            FROM pages p CROSS JOIN LATERAL effective_page_shares(p.id) ps JOIN users u ON u.id=ps.user_id JOIN pages source ON source.id=ps.source_page_id
+            WHERE p.id=ANY($1) ORDER BY ps.shared_at
 		`, pageIDs)
 		if queryErr != nil {
 			handleError(w, queryErr)
@@ -556,7 +562,7 @@ func (s *Server) listAllPageShares(w http.ResponseWriter, r *http.Request) {
 		for memberRows.Next() {
 			var pageID string
 			var value member
-			if err = memberRows.Scan(&pageID, &value.User.ID, &value.User.Name, &value.User.Email, &value.User.AvatarColor, &value.User.AvatarIcon, &value.User.Role, &value.User.Status, &value.User.Password, &value.User.RequestedAt, &value.User.DecidedAt, &value.Permission, &value.SharedAt); err != nil {
+			if err = memberRows.Scan(&pageID, &value.User.ID, &value.User.Name, &value.User.Email, &value.User.AvatarColor, &value.User.AvatarIcon, &value.User.Role, &value.User.Status, &value.User.Password, &value.User.RequestedAt, &value.User.DecidedAt, &value.Permission, &value.SharedAt, &value.InheritedFromPageID, &value.InheritedFromTitle, &value.DirectPermission); err != nil {
 				handleError(w, err)
 				return
 			}
@@ -625,6 +631,10 @@ func (s *Server) setPageShare(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
+	if err = lockPageACL(r.Context(), tx, pageID, true); err != nil {
+		handleError(w, err)
+		return
+	}
 	if err = lockPageForWrite(r.Context(), tx, pageID); err != nil {
 		handleError(w, err)
 		return
@@ -655,12 +665,7 @@ func (s *Server) setPageShare(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	s.realtime.sendTo(pageID, targetID, pageRealtimeEvent{
-		Type:       "permission.updated",
-		Permission: input.Permission,
-		ActorID:    user.ID.String(),
-		Message:    "공유 페이지 권한이 변경되었습니다.",
-	})
+	s.refreshPageTreePermissions(r, pageID, &targetID)
 	writeData(w, 200, map[string]any{"userId": targetID, "permission": input.Permission, "sharedAt": sharedAt})
 }
 
@@ -686,6 +691,10 @@ func (s *Server) deletePageShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if err = lockPageACL(r.Context(), tx, pageID, true); err != nil {
+		handleError(w, err)
+		return
+	}
 	if err = lockPageForWrite(r.Context(), tx, pageID); err != nil {
 		handleError(w, err)
 		return
@@ -703,7 +712,7 @@ func (s *Server) deletePageShare(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	s.realtime.revoke(pageID, targetID)
+	s.refreshPageTreePermissions(r, pageID, &targetID)
 	w.WriteHeader(204)
 }
 
@@ -849,6 +858,10 @@ func (s *Server) putInlineDatabase(w http.ResponseWriter, r *http.Request) {
 			handleError(w, err)
 			return
 		}
+		if err = s.syncAttachmentReferences(r.Context(), tx, user.ID, attachmentReferenceTarget{databaseID: &current.ID}, current.State, nil); err != nil {
+			handleError(w, err)
+			return
+		}
 		if err = tx.Commit(r.Context()); err != nil {
 			handleError(w, err)
 			return
@@ -863,6 +876,7 @@ func (s *Server) putInlineDatabase(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 409, "REVISION_CONFLICT", "데이터베이스가 다른 위치에서 변경되었습니다.", map[string]any{"currentRevision": current.Revision})
 		return
 	}
+	previousState := current.State
 	pageID := current.PageID
 	if input.PageID.Set {
 		pageID = input.PageID.Value
@@ -878,6 +892,10 @@ func (s *Server) putInlineDatabase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = s.syncAttachmentReferences(r.Context(), tx, user.ID, attachmentReferenceTarget{databaseID: &current.ID}, current.State, previousState); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -907,8 +925,17 @@ func (s *Server) deleteInlineDatabase(w http.ResponseWriter, r *http.Request) {
 		handleError(w, pgx.ErrNoRows)
 		return
 	}
+	objects, err := referenceAttachmentObjects(r.Context(), tx, attachmentReferenceTarget{databaseID: &databaseID})
+	if err != nil {
+		handleError(w, err)
+		return
+	}
 	_, err = tx.Exec(r.Context(), `DELETE FROM inline_databases WHERE id=$1`, current.ID)
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = queueUnreferencedAttachments(r.Context(), tx, objects); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -916,6 +943,7 @@ func (s *Server) deleteInlineDatabase(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
+	s.retryDeletedAttachmentObjects(r.Context())
 	if current.PageID != nil {
 		s.realtime.broadcast(*current.PageID, pageRealtimeEvent{Type: "database.deleted", DatabaseID: current.ID, ActorID: user.ID.String()})
 	}

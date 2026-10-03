@@ -26,7 +26,7 @@ func createPageNotifications(ctx context.Context, tx pgx.Tx, actor authUser, pag
 		FROM (
 			SELECT owner_id AS user_id FROM pages WHERE id=$1
 			UNION
-			SELECT user_id FROM page_shares WHERE page_id=$1
+			SELECT user_id FROM effective_page_shares($1)
 		) recipients
 		WHERE recipients.user_id<>$2
 	`, pageID, actor.ID, kind, threadID, title, notificationExcerpt(description, 300))

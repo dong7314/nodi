@@ -77,6 +77,9 @@ func (s *Server) sendRealtimeEvent(r *http.Request, client *pageRealtimeClient, 
 		// must never carry the old page body or other private event fields.
 		event = pageRealtimeEvent{Type: event.Type, Message: event.Message}
 	default:
+		if err = lockPageACL(ctx, tx, client.pageID, false); err != nil {
+			return err
+		}
 		var id string
 		if err = tx.QueryRow(ctx, `SELECT id FROM pages WHERE id=$1 FOR SHARE`, client.pageID).Scan(&id); err != nil {
 			return err
@@ -84,8 +87,12 @@ func (s *Server) sendRealtimeEvent(r *http.Request, client *pageRealtimeClient, 
 		// Sharing changes lock the same page. Read the ACL after waiting, and
 		// retain the lock through the network write so revocation cannot finish
 		// before a frame authorized by the old ACL has been sent.
-		if _, err = authorizePageWith(r.WithContext(ctx), tx, client.user.ID, client.pageID, "view"); err != nil {
-			return err
+		access, accessErr := authorizePageWith(r.WithContext(ctx), tx, client.user.ID, client.pageID, "view")
+		if accessErr != nil {
+			return accessErr
+		}
+		if event.Type == "permission.updated" {
+			event.Permission = access.Permission
 		}
 		if event.Type == "page.snapshot" {
 			value, readErr := scanPageForAccess(tx.QueryRow(ctx, pageSelect+` WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived))`, client.user.ID, client.pageID), "view")
@@ -462,6 +469,9 @@ func (s *Server) applyRealtimeBlocks(r *http.Request, user authUser, pageID stri
 		return current, nil
 	}
 	if err = tx.QueryRow(ctx, `UPDATE pages SET blocks_json=$1,revision=revision+1,updated_at=now() WHERE id=$2 RETURNING revision,updated_at`, merged, pageID).Scan(&current.Revision, &current.UpdatedAt); err != nil {
+		return page{}, err
+	}
+	if err = s.syncAttachmentReferences(ctx, tx, user.ID, attachmentReferenceTarget{pageID: &pageID}, merged, current.Blocks); err != nil {
 		return page{}, err
 	}
 	current.Blocks = merged

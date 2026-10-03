@@ -86,7 +86,7 @@ const pageSelect = `
 	       CASE WHEN p.owner_id=$1 THEN 'owner' ELSE coalesce(ps.permission,'view') END AS permission,
 	       pf.favorited_at
 	FROM pages p
-	LEFT JOIN page_shares ps ON ps.page_id=p.id AND ps.user_id=$1
+	LEFT JOIN LATERAL effective_page_shares(p.id) ps ON ps.user_id=$1
 	LEFT JOIN page_favorites pf ON pf.page_id=p.id AND pf.user_id=$1
 `
 
@@ -98,7 +98,7 @@ const pageListSelect = `
 	       CASE WHEN p.owner_id=$1 THEN 'owner' ELSE coalesce(ps.permission,'view') END AS permission,
 	       pf.favorited_at
 	FROM pages p
-	LEFT JOIN page_shares ps ON ps.page_id=p.id AND ps.user_id=$1
+	LEFT JOIN LATERAL effective_page_shares(p.id) ps ON ps.user_id=$1
 	LEFT JOIN page_favorites pf ON pf.page_id=p.id AND pf.user_id=$1
 `
 
@@ -197,31 +197,77 @@ func (s *Server) createPage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "INVALID_ID", "페이지 ID가 올바르지 않습니다.", nil)
 		return
 	}
-	if err := s.validatePageLocation(r, s.pool, user.ID, "", input.ParentID, input.FolderID); err != nil {
-		handleError(w, err)
-		return
-	}
 	order := time.Now().UnixMilli()
 	if input.Order != nil {
 		order = *input.Order
 	}
-	tx, err := s.pool.Begin(r.Context())
+	ownerID := user.ID
+	if input.ParentID != nil {
+		parent, err := s.authorizePage(r, user.ID, *input.ParentID, "edit")
+		if err != nil {
+			handleError(w, err)
+			return
+		}
+		ownerID = parent.OwnerID
+	}
+	tx, err := s.beginWorkspaceWrite(r.Context(), ownerID)
 	if err != nil {
 		handleError(w, err)
 		return
 	}
 	defer tx.Rollback(r.Context())
+	permission := "owner"
+	if input.ParentID != nil {
+		parent, err := pageForUpdate(r.Context(), tx, user.ID, *input.ParentID, "edit")
+		if err != nil {
+			handleError(w, err)
+			return
+		}
+		if parent.Archived {
+			handleError(w, pgx.ErrNoRows)
+			return
+		}
+		if pageSettingsLocked(parent.Settings) {
+			writeError(w, http.StatusLocked, "PAGE_LOCKED", "잠긴 페이지에는 하위 페이지를 만들 수 없습니다.", nil)
+			return
+		}
+		permission = parent.Permission
+		if permission != "owner" {
+			input.FolderID = parent.FolderID
+			settings := decodePageSettings(input.Settings)
+			if input.Archived {
+				writeError(w, http.StatusForbidden, "PAGE_OWNER_REQUIRED", "페이지 구조는 소유자만 변경할 수 있습니다.", nil)
+				return
+			}
+			for _, key := range []string{pagePublicAccessSetting, pageLockSetting} {
+				if value := settings[key]; value != nil && value != false {
+					writeError(w, http.StatusForbidden, "PAGE_OWNER_SETTINGS_REQUIRED", "공개 여부와 페이지 잠금은 소유자만 변경할 수 있습니다.", nil)
+					return
+				}
+				settings[key] = false
+			}
+			input.Settings, _ = json.Marshal(settings)
+		}
+	}
+	if err := s.validatePageLocation(r, tx, ownerID, "", input.ParentID, input.FolderID); err != nil {
+		handleError(w, err)
+		return
+	}
 	var value page
 	err = tx.QueryRow(r.Context(), `
 		INSERT INTO pages(id,owner_id,parent_id,folder_id,order_index,title,settings_json,blocks_json,archived)
 		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		RETURNING id,owner_id,parent_id,folder_id,order_index,title,settings_json,blocks_json,archived,revision,created_at,updated_at
-	`, input.ID, user.ID, input.ParentID, input.FolderID, order, input.Title, input.Settings, input.Blocks, input.Archived).Scan(&value.ID, &value.OwnerID, &value.ParentID, &value.FolderID, &value.Order, &value.Title, &value.Settings, &value.Blocks, &value.Archived, &value.Revision, &value.CreatedAt, &value.UpdatedAt)
+	`, input.ID, ownerID, input.ParentID, input.FolderID, order, input.Title, input.Settings, input.Blocks, input.Archived).Scan(&value.ID, &value.OwnerID, &value.ParentID, &value.FolderID, &value.Order, &value.Title, &value.Settings, &value.Blocks, &value.Archived, &value.Revision, &value.CreatedAt, &value.UpdatedAt)
 	if err != nil {
 		handleError(w, err)
 		return
 	}
-	value.Permission = "owner"
+	if err = s.syncAttachmentReferences(r.Context(), tx, user.ID, attachmentReferenceTarget{pageID: &value.ID}, value.Blocks, nil); err != nil {
+		handleError(w, err)
+		return
+	}
+	value.Permission = permission
 	if input.Favorited {
 		var at time.Time
 		err = tx.QueryRow(r.Context(), `INSERT INTO page_favorites(page_id,user_id) VALUES($1,$2) RETURNING favorited_at`, value.ID, user.ID).Scan(&at)
@@ -274,7 +320,19 @@ func (s *Server) updatePage(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	tx, err := s.pool.Begin(r.Context())
+	structural := input.ParentID.Set || input.FolderID.Set || input.Order != nil || input.Archived != nil
+	var tx pgx.Tx
+	if structural {
+		// All hierarchy edits share the owner lock before locking a page.
+		// Separate page locks alone cannot prevent concurrent A -> B / B -> A.
+		if _, err = s.authorizePage(r, user.ID, pageID, "owner"); err != nil {
+			handleError(w, err)
+			return
+		}
+		tx, err = s.beginWorkspaceWrite(r.Context(), user.ID)
+	} else {
+		tx, err = s.pool.Begin(r.Context())
+	}
 	if err != nil {
 		handleError(w, err)
 		return
@@ -296,7 +354,6 @@ func (s *Server) updatePage(w http.ResponseWriter, r *http.Request) {
 	if input.FolderID.Set {
 		folderID = input.FolderID.Value
 	}
-	structural := input.ParentID.Set || input.FolderID.Set || input.Order != nil || input.Archived != nil
 	if structural && current.Permission != "owner" {
 		writeError(w, 403, "PAGE_OWNER_REQUIRED", "페이지 구조는 소유자만 변경할 수 있습니다.", nil)
 		return
@@ -351,12 +408,21 @@ func (s *Server) updatePage(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
+	if input.Blocks != nil {
+		if err = s.syncAttachmentReferences(r.Context(), tx, user.ID, attachmentReferenceTarget{pageID: &pageID}, blocks, current.Blocks); err != nil {
+			handleError(w, err)
+			return
+		}
+	}
 	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}
 	current.ParentID, current.FolderID, current.Order, current.Title, current.Settings, current.Blocks, current.Archived = parentID, folderID, order, title, settings, blocks, archived
 	s.realtime.broadcast(pageID, pageRealtimeEvent{Type: "page.updated", Page: &current, ActorID: user.ID.String()})
+	if structural {
+		s.refreshPageTreePermissions(r, pageID, nil)
+	}
 	writeData(w, 200, current)
 }
 
@@ -400,6 +466,10 @@ func (s *Server) updatePageBlocks(w http.ResponseWriter, r *http.Request) {
 	}
 	err = tx.QueryRow(r.Context(), `UPDATE pages SET blocks_json=$1,revision=revision+1,updated_at=now() WHERE id=$2 RETURNING revision,updated_at`, input.Blocks, pageID).Scan(&current.Revision, &current.UpdatedAt)
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = s.syncAttachmentReferences(r.Context(), tx, user.ID, attachmentReferenceTarget{pageID: &pageID}, input.Blocks, current.Blocks); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -461,26 +531,67 @@ func (s *Server) deletePage(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
+	var detachedChildren []string
+	tx, beginErr := s.beginWorkspaceWrite(r.Context(), user.ID)
+	if beginErr != nil {
+		handleError(w, beginErr)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	current, err = pageForUpdate(r.Context(), tx, user.ID, pageID, "owner")
+	if err != nil {
+		handleError(w, err)
+		return
+	}
 	if r.URL.Query().Get("hard") == "true" {
-		if err = s.deletePageAttachments(r.Context(), current.ID); err != nil {
+		// Hierarchy/resource/user locks precede attachment locks. Files are only
+		// removed after the page transaction commits and no copies remain.
+		rows, queryErr := tx.Query(r.Context(), `SELECT id FROM pages WHERE parent_id=$1`, pageID)
+		if queryErr != nil {
+			handleError(w, queryErr)
+			return
+		}
+		for rows.Next() {
+			var id string
+			if err = rows.Scan(&id); err != nil {
+				break
+			}
+			detachedChildren = append(detachedChildren, id)
+		}
+		rows.Close()
+		if err == nil {
+			err = rows.Err()
+		}
+		if err != nil {
 			handleError(w, err)
 			return
 		}
-		// Database moves acquire their source/destination owners before pages.
-		// Serialize the cascade (including child parent_id updates) with them.
-		tx, beginErr := s.beginWorkspaceWrite(r.Context(), user.ID)
-		if beginErr != nil {
-			handleError(w, beginErr)
+		var lockedID string
+		if err = tx.QueryRow(r.Context(), `SELECT id FROM pages WHERE id=$1 AND owner_id=$2 FOR UPDATE`, current.ID, user.ID).Scan(&lockedID); err != nil {
+			handleError(w, err)
 			return
 		}
-		defer tx.Rollback(r.Context())
+		objects, attachmentErr := pageAttachmentObjects(r.Context(), tx, current.ID)
+		if attachmentErr != nil {
+			handleError(w, attachmentErr)
+			return
+		}
 		_, err = tx.Exec(r.Context(), `DELETE FROM pages WHERE id=$1`, current.ID)
+		if err == nil {
+			err = queueUnreferencedAttachments(r.Context(), tx, objects)
+		}
 		if err == nil {
 			err = tx.Commit(r.Context())
 		}
+		if err == nil {
+			s.retryDeletedAttachmentObjects(r.Context())
+		}
 	} else {
-		err = s.pool.QueryRow(r.Context(), `UPDATE pages SET archived=true,revision=revision+1,updated_at=now() WHERE id=$1 RETURNING revision,updated_at`, current.ID).Scan(&current.Revision, &current.UpdatedAt)
+		err = tx.QueryRow(r.Context(), `UPDATE pages SET archived=true,revision=revision+1,updated_at=now() WHERE id=$1 RETURNING revision,updated_at`, current.ID).Scan(&current.Revision, &current.UpdatedAt)
 		current.Archived = true
+		if err == nil {
+			err = tx.Commit(r.Context())
+		}
 	}
 	if err != nil {
 		handleError(w, err)
@@ -491,6 +602,10 @@ func (s *Server) deletePage(w http.ResponseWriter, r *http.Request) {
 		eventType = "page.deleted"
 	}
 	s.realtime.broadcast(pageID, pageRealtimeEvent{Type: eventType, Page: &current, ActorID: user.ID.String()})
+	s.refreshPageTreePermissions(r, pageID, nil)
+	for _, child := range detachedChildren {
+		s.refreshPageTreePermissions(r, child, nil)
+	}
 	w.WriteHeader(204)
 }
 
@@ -651,6 +766,9 @@ type pageAccess struct {
 // permits foreign-key checks by comments, notifications and child pages.
 // Callers that need user/session locks must acquire those before this lock.
 func lockPageForWrite(ctx context.Context, tx pgx.Tx, pageID string) error {
+	if err := lockPageACL(ctx, tx, pageID, false); err != nil {
+		return err
+	}
 	var id string
 	return tx.QueryRow(ctx, `SELECT id FROM pages WHERE id=$1 FOR NO KEY UPDATE`, pageID).Scan(&id)
 }
@@ -676,7 +794,7 @@ func authorizePageWith(r *http.Request, query rowQuerier, userID uuid.UUID, page
 	err := query.QueryRow(r.Context(), `
 		SELECT p.owner_id,CASE WHEN p.owner_id=$1 THEN 'owner' ELSE ps.permission END,p.updated_at
 		FROM pages p
-		LEFT JOIN page_shares ps ON ps.page_id=p.id AND ps.user_id=$1
+		LEFT JOIN LATERAL effective_page_shares(p.id) ps ON ps.user_id=$1
 		WHERE p.id=$2 AND (p.owner_id=$1 OR (ps.user_id=$1 AND NOT p.archived))
 	`, userID, pageID).Scan(&access.OwnerID, &access.Permission, &access.UpdatedAt)
 	if err != nil {
@@ -697,7 +815,7 @@ func (s *Server) validatePageLocation(r *http.Request, query rowQuerier, ownerID
 			return &apiError{400, "PAGE_CYCLE", "순환하는 페이지 구조는 만들 수 없습니다.", nil}
 		}
 		var valid bool
-		err := query.QueryRow(r.Context(), `WITH RECURSIVE tree AS(SELECT id,owner_id,parent_id FROM pages WHERE id=$1 UNION ALL SELECT p.id,p.owner_id,p.parent_id FROM pages p JOIN tree t ON p.id=t.parent_id) SELECT count(*)>0 AND bool_and(owner_id=$2) AND NOT bool_or(id=$3) FROM tree`, *parentID, ownerID, pageID).Scan(&valid)
+		err := query.QueryRow(r.Context(), `WITH RECURSIVE tree AS(SELECT id,owner_id,parent_id,ARRAY[id]::text[] AS path,false AS cycle FROM pages WHERE id=$1 UNION ALL SELECT p.id,p.owner_id,p.parent_id,t.path||p.id,p.id=ANY(t.path) FROM pages p JOIN tree t ON p.id=t.parent_id WHERE NOT t.cycle) SELECT count(*)>0 AND bool_and(owner_id=$2) AND NOT bool_or(id=$3 OR cycle) FROM tree`, *parentID, ownerID, pageID).Scan(&valid)
 		if err != nil {
 			return err
 		}

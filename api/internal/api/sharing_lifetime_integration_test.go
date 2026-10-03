@@ -198,6 +198,9 @@ func TestIntegrationRealtimeTerminalEventsContainNoPageData(t *testing.T) {
 			defer srv.Close()
 			conn := openIntegrationSocket(t, srv.URL, "shared", token)
 			defer conn.Close()
+			// Finish initial presence before testing the terminal payload. If the
+			// archive wins that authorization race, closing the socket is valid.
+			readIntegrationEvent(t, conn, "presence.updated")
 			path, kind := "/pages/shared", "page.archived"
 			if mode == "delete" {
 				path, kind = path+"?hard=true", "page.deleted"

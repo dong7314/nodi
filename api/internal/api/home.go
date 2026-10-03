@@ -106,12 +106,30 @@ func (s *Server) updateHomePage(w http.ResponseWriter, r *http.Request) {
 		}
 		blocks = input.Blocks
 	}
-	value, err := scanHomePage(s.pool.QueryRow(r.Context(), `UPDATE home_pages SET title=$1,settings_json=$2,blocks_json=$3,revision=revision+1,updated_at=now() WHERE user_id=$4 AND revision=$5 RETURNING user_id,title,settings_json,blocks_json,revision,created_at,updated_at`, title, settings, blocks, user.ID, current.Revision))
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if _, err = tx.Exec(r.Context(), `SELECT id FROM users WHERE id=$1 FOR KEY SHARE`, user.ID); err != nil {
+		handleError(w, err)
+		return
+	}
+	value, err := scanHomePage(tx.QueryRow(r.Context(), `UPDATE home_pages SET title=$1,settings_json=$2,blocks_json=$3,revision=revision+1,updated_at=now() WHERE user_id=$4 AND revision=$5 RETURNING user_id,title,settings_json,blocks_json,revision,created_at,updated_at`, title, settings, blocks, user.ID, current.Revision))
 	if err == pgx.ErrNoRows {
 		writeError(w, http.StatusConflict, "REVISION_CONFLICT", "홈 메모가 다른 위치에서 변경되었습니다.", nil)
 		return
 	}
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = s.syncAttachmentReferences(r.Context(), tx, user.ID, attachmentReferenceTarget{homeOwnerID: &user.ID}, blocks, current.Blocks); err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}

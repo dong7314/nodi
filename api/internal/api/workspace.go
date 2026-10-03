@@ -207,16 +207,39 @@ func (s *Server) uploadAttachmentContent(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "ATTACHMENT_SIZE_MISMATCH", "발급 요청과 실제 파일 크기가 다릅니다.", map[string]any{"expected": value.Size, "received": written})
 		return
 	}
+	// Upload into a private temporary file first. Only the request holding the
+	// completion row lock may publish it; a duplicate never touches that file.
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	var uploadedAt *time.Time
+	if err = tx.QueryRow(r.Context(), `SELECT uploaded_at FROM attachments WHERE id=$1 FOR UPDATE`, id).Scan(&uploadedAt); err != nil {
+		handleError(w, err)
+		return
+	}
+	if uploadedAt != nil {
+		writeError(w, http.StatusConflict, "ALREADY_UPLOADED", "이미 업로드가 완료된 첨부파일입니다.", nil)
+		return
+	}
 	if err = os.Rename(temporaryPath, path); err != nil {
 		handleError(w, err)
 		return
 	}
-	result, err := s.pool.Exec(r.Context(), `UPDATE attachments SET uploaded_at=now() WHERE id=$1 AND uploaded_at IS NULL`, id)
+	result, err := tx.Exec(r.Context(), `UPDATE attachments SET uploaded_at=now() WHERE id=$1 AND uploaded_at IS NULL`, id)
 	if err != nil || result.RowsAffected() != 1 {
 		_ = os.Remove(path)
 		if err == nil {
 			err = fmt.Errorf("attachment upload state conflict")
 		}
+		handleError(w, err)
+		return
+	}
+	// A commit transport error may have committed successfully. Leave the
+	// published object intact; a retry checks the authoritative row state.
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -246,7 +269,15 @@ func (s *Server) completeAttachment(w http.ResponseWriter, r *http.Request) {
 	var uploadedAt *time.Time
 	var fileName, contentType, kind string
 	var size int64
-	err = s.pool.QueryRow(r.Context(), `SELECT object_key,storage_backend,uploaded_at,file_name,content_type,kind,size_bytes FROM attachments WHERE id=$1 AND owner_id=$2`, id, user.ID).Scan(&objectKey, &storageBackend, &uploadedAt, &fileName, &contentType, &kind, &size)
+	// Keep cleanup/deletion from removing an upload between the object check
+	// and its completion update. If cleanup won first, the row no longer exists.
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	err = tx.QueryRow(r.Context(), `SELECT object_key,storage_backend,uploaded_at,file_name,content_type,kind,size_bytes FROM attachments WHERE id=$1 AND owner_id=$2 FOR UPDATE`, id, user.ID).Scan(&objectKey, &storageBackend, &uploadedAt, &fileName, &contentType, &kind, &size)
 	if err != nil {
 		handleError(w, err)
 		return
@@ -261,7 +292,7 @@ func (s *Server) completeAttachment(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "UPLOAD_NOT_COMPLETE", "MinIO 업로드가 아직 완료되지 않았거나 파일 크기가 일치하지 않습니다.", nil)
 			return
 		}
-		if _, err = s.pool.Exec(r.Context(), `UPDATE attachments SET uploaded_at=now() WHERE id=$1 AND uploaded_at IS NULL`, id); err != nil {
+		if _, err = tx.Exec(r.Context(), `UPDATE attachments SET uploaded_at=now() WHERE id=$1 AND uploaded_at IS NULL`, id); err != nil {
 			handleError(w, err)
 			return
 		}
@@ -269,6 +300,10 @@ func (s *Server) completeAttachment(w http.ResponseWriter, r *http.Request) {
 	}
 	if uploadedAt == nil {
 		writeError(w, http.StatusConflict, "UPLOAD_NOT_COMPLETE", "업로드가 아직 완료되지 않았습니다.", nil)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		handleError(w, err)
 		return
 	}
 	// The raw asset token is only returned at presign time. The client already keeps
@@ -294,16 +329,20 @@ func (s *Server) downloadAttachmentContent(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusNotFound, "ATTACHMENT_NOT_FOUND", "첨부파일을 찾을 수 없습니다.", nil)
 		return
 	}
-	if value.PageID == nil {
-		user, authenticated := s.authenticatedUser(r)
-		if !authenticated || user.ID != value.OwnerID {
-			writeError(w, http.StatusNotFound, "ATTACHMENT_NOT_FOUND", "첨부파일을 찾을 수 없습니다.", nil)
-			return
-		}
-	} else if !s.canReadPageAttachment(r, *value.PageID) {
+	viewerID := uuid.Nil
+	if user, authenticated := s.authenticatedUser(r); authenticated {
+		viewerID = user.ID
+	}
+	var allowed bool
+	if err = s.pool.QueryRow(r.Context(), `SELECT attachment_readable($1,$2)`, id, viewerID).Scan(&allowed); err != nil {
+		handleError(w, err)
+		return
+	}
+	if !allowed {
 		writeError(w, http.StatusNotFound, "ATTACHMENT_NOT_FOUND", "첨부파일을 찾을 수 없습니다.", nil)
 		return
 	}
+
 	disposition := "attachment"
 	if value.Kind == "image" {
 		disposition = "inline"
@@ -377,20 +416,39 @@ func (s *Server) deleteAttachment(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	var objectKey, storageBackend string
-	err = s.pool.QueryRow(r.Context(), `SELECT object_key,storage_backend FROM attachments WHERE id=$1 AND owner_id=$2`, id, user.ID).Scan(&objectKey, &storageBackend)
+	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
 		handleError(w, err)
 		return
 	}
-	if err = s.removeAttachmentObject(r.Context(), objectKey, storageBackend); err != nil {
+	defer tx.Rollback(r.Context())
+	var key, backend string
+	if err = tx.QueryRow(r.Context(), `SELECT object_key,storage_backend FROM attachments WHERE id=$1 AND owner_id=$2 FOR UPDATE`, id, user.ID).Scan(&key, &backend); err != nil {
 		handleError(w, err)
 		return
 	}
-	if _, err = s.pool.Exec(r.Context(), `DELETE FROM attachments WHERE id=$1 AND owner_id=$2`, id, user.ID); err != nil {
+	var inUse bool
+	if err = tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM attachment_references WHERE attachment_id=$1)`, id).Scan(&inUse); err != nil {
 		handleError(w, err)
 		return
 	}
+	if inUse {
+		writeError(w, http.StatusConflict, "ATTACHMENT_IN_USE", "다른 문서에서 사용 중인 첨부파일은 삭제할 수 없습니다.", nil)
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `INSERT INTO attachment_object_deletions(attachment_id,object_key,storage_backend) VALUES($1,$2,$3)`, id, key, backend); err != nil {
+		handleError(w, err)
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `DELETE FROM attachments WHERE id=$1`, id); err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		handleError(w, err)
+		return
+	}
+	s.retryDeletedAttachmentObjects(r.Context())
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -423,70 +481,50 @@ func (s *Server) cleanupStaleAttachmentsIfDue(ctx context.Context) {
 }
 
 func (s *Server) cleanupStaleAttachments(ctx context.Context, before time.Time, limit int) error {
+	s.retryDeletedAttachmentObjects(ctx)
 	if limit <= 0 {
 		return nil
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id,object_key,storage_backend
-		FROM attachments
-		WHERE uploaded_at IS NULL AND created_at < $1
-		ORDER BY created_at
-		LIMIT $2`, before, limit)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	type staleAttachment struct {
-		id      uuid.UUID
-		key     string
-		backend string
+	defer tx.Rollback(ctx)
+	// The upload completion transaction takes the same row lock before publishing
+	// its file. Skip active uploads and recheck the pending state under the lock.
+	rows, err := tx.Query(ctx, `SELECT id,object_key,storage_backend FROM attachments
+ WHERE uploaded_at IS NULL AND created_at < $1
+ ORDER BY created_at,id LIMIT $2 FOR UPDATE SKIP LOCKED`, before, limit)
+	if err != nil {
+		return err
 	}
-	stale := make([]staleAttachment, 0, limit)
+	objects := []attachmentObject{}
 	for rows.Next() {
-		var value staleAttachment
+		var value attachmentObject
 		if err = rows.Scan(&value.id, &value.key, &value.backend); err != nil {
-			return err
-		}
-		stale = append(stale, value)
-	}
-	if err = rows.Err(); err != nil {
-		return err
-	}
-	for _, value := range stale {
-		if err = s.removeAttachmentObject(ctx, value.key, value.backend); err != nil {
-			return err
-		}
-		if _, err = s.pool.Exec(ctx, `DELETE FROM attachments WHERE id=$1 AND uploaded_at IS NULL`, value.id); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Server) deletePageAttachments(ctx context.Context, pageID string) error {
-	rows, err := s.pool.Query(ctx, `SELECT object_key,storage_backend FROM attachments WHERE page_id=$1`, pageID)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	type storedObject struct{ key, backend string }
-	objects := make([]storedObject, 0, 4)
-	for rows.Next() {
-		var value storedObject
-		if err = rows.Scan(&value.key, &value.backend); err != nil {
+			rows.Close()
 			return err
 		}
 		objects = append(objects, value)
 	}
-	if err = rows.Err(); err != nil {
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
 		return err
 	}
 	for _, object := range objects {
-		if err = s.removeAttachmentObject(ctx, object.key, object.backend); err != nil {
+		if _, err = tx.Exec(ctx, `DELETE FROM attachments WHERE id=$1`, object.id); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO attachment_object_deletions(attachment_id,object_key,storage_backend) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, object.id, object.key, object.backend); err != nil {
 			return err
 		}
 	}
-	_, err = s.pool.Exec(ctx, `DELETE FROM attachments WHERE page_id=$1`, pageID)
-	return err
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.retryDeletedAttachmentObjects(ctx)
+	return nil
 }
 
 func (s *Server) attachmentPath(objectKey string) (string, error) {
@@ -631,6 +669,10 @@ func (s *Server) createPreset(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
+	if err = s.syncAttachmentReferences(r.Context(), tx, user.ID, attachmentReferenceTarget{presetOwnerID: &user.ID, presetID: &value.ID}, value.Blocks, nil); err != nil {
+		handleError(w, err)
+		return
+	}
 	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
@@ -654,9 +696,28 @@ func (s *Server) updatePreset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "프리셋 값이 올바르지 않습니다.", nil)
 		return
 	}
-	value, err := scanPreset(s.pool.QueryRow(r.Context(), `UPDATE starter_presets SET name=$1,icon=$2,page_title=$3,blocks_json=$4,source_file_name=$5,order_index=$6,updated_at=now()
+	tx, err := s.beginWorkspaceWrite(r.Context(), user.ID)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	var previous json.RawMessage
+	if err = tx.QueryRow(r.Context(), `SELECT blocks_json FROM starter_presets WHERE owner_id=$1 AND id=$2 FOR UPDATE`, user.ID, id).Scan(&previous); err != nil {
+		handleError(w, err)
+		return
+	}
+	value, err := scanPreset(tx.QueryRow(r.Context(), `UPDATE starter_presets SET name=$1,icon=$2,page_title=$3,blocks_json=$4,source_file_name=$5,order_index=$6,updated_at=now()
 		WHERE id=$7 AND owner_id=$8 RETURNING id,name,icon,page_title,blocks_json,source_file_name,order_index,created_at,updated_at`, strings.TrimSpace(input.Name), input.Icon, strings.TrimSpace(input.PageTitle), input.Blocks, input.SourceFileName, input.OrderIndex, id, user.ID))
 	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = s.syncAttachmentReferences(r.Context(), tx, user.ID, attachmentReferenceTarget{presetOwnerID: &user.ID, presetID: &id}, value.Blocks, previous); err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
 		handleError(w, err)
 		return
 	}
@@ -670,15 +731,35 @@ func (s *Server) deletePreset(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	result, err := s.pool.Exec(r.Context(), `DELETE FROM starter_presets WHERE id=$1 AND owner_id=$2`, id, user.ID)
+	tx, err := s.beginWorkspaceWrite(r.Context(), user.ID)
 	if err != nil {
 		handleError(w, err)
 		return
 	}
-	if result.RowsAffected() == 0 {
-		handleError(w, pgx.ErrNoRows)
+	defer tx.Rollback(r.Context())
+	var existing string
+	if err = tx.QueryRow(r.Context(), `SELECT id FROM starter_presets WHERE id=$1 AND owner_id=$2 FOR UPDATE`, id, user.ID).Scan(&existing); err != nil {
+		handleError(w, err)
 		return
 	}
+	objects, err := referenceAttachmentObjects(r.Context(), tx, attachmentReferenceTarget{presetOwnerID: &user.ID, presetID: &id})
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `DELETE FROM starter_presets WHERE id=$1 AND owner_id=$2`, id, user.ID); err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = queueUnreferencedAttachments(r.Context(), tx, objects); err != nil {
+		handleError(w, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		handleError(w, err)
+		return
+	}
+	s.retryDeletedAttachmentObjects(r.Context())
 	w.WriteHeader(http.StatusNoContent)
 }
 
