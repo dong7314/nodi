@@ -1,16 +1,20 @@
 import type { BlockNoteEditor, PartialBlock } from "@blocknote/core";
 import { HistoryExtension } from "@blocknote/core/extensions";
+import { replaceRemoteEditorDocument } from "./editor-remote";
 
 /** Load a persisted document without making navigation an undoable edit. */
 export function replacePageDocument(
   editor: BlockNoteEditor<any, any, any>,
   blocks: PartialBlock[],
+  preserveView = false,
 ) {
-  editor.transact((transaction) => {
+  const next = blocks.length ? blocks : [{ type: "paragraph" as const, content: "" }];
+  if (preserveView) replaceRemoteEditorDocument(editor, next);
+  else editor.transact((transaction) => {
     transaction.setMeta("addToHistory", false);
     editor.replaceBlocks(
       editor.document,
-      blocks.length ? blocks : [{ type: "paragraph", content: "" }],
+      next,
     );
   });
 

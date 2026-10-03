@@ -53,7 +53,10 @@ import { Select } from "./components/ui/select";
 import { ConfirmDialog } from "./components/ui/confirm-dialog";
 import { ChildPageBlock } from "./ChildPageBlock";
 import { replacePageDocument } from "./editor-document";
+import { applyRemoteEditorChange } from "./editor-remote";
 import { collectDatabaseSnapshots, copyDatabase, copyDatabaseReferences } from "./database-copy";
+import { flushPendingDatabaseSnapshots } from "./database-cache";
+import { backupWorkspaceCache } from "./workspace-cache";
 import {
   persistStoredBlockComments,
   readStoredBlockComments,
@@ -693,7 +696,7 @@ function writeEditorBlocksToClipboard(
   activeEditor: BlockNoteEditor<any, any, any>,
   blocks: PartialBlock[],
 ) {
-  const payload = JSON.stringify({ version: 1, blocks, databases: collectDatabaseSnapshots(blocks, true) });
+  const payload = JSON.stringify({ version: 1, blocks, databases: collectDatabaseSnapshots(blocks, true, activeEditor.prosemirrorView.dom) });
   const externalHtml = activeEditor.blocksToHTMLLossy(blocks);
   const blockNoteHtml = activeEditor.blocksToFullHTML(blocks);
   clipboardData.clearData();
@@ -1463,6 +1466,8 @@ function getInitialPages(): StoredPages {
           const page = restorePageDraft(cached);
           const normalizedPage: StoredPage = {
             ...page,
+            // The personal home is stored separately from the pages tree.
+            parentId: page.parentId === ROOT_PAGE_ID ? null : page.parentId,
             title: page.id === ROOT_PAGE_ID && shouldMigrateHomeTitle ? homePageTitle : page.title,
             settings: {
               ...defaultPageSettings,
@@ -1477,6 +1482,7 @@ function getInitialPages(): StoredPages {
           };
           if (
             page.folderId === undefined
+            || page.parentId === ROOT_PAGE_ID
             || page.order === undefined
             || page.favoritedAt === undefined
             || page.settings.publicAccess === undefined
@@ -1653,6 +1659,9 @@ function storedShareFromServer(share: ServerShare): PageShareRecord {
       userId: member.user.id,
       permission: member.permission,
       sharedAt: member.sharedAt,
+      inheritedFromPageId: member.inheritedFromPageId,
+      inheritedFromTitle: member.inheritedFromTitle,
+      directPermission: member.directPermission,
     })),
     updatedAt: share.updatedAt,
   };
@@ -1833,6 +1842,8 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
   const [title, setTitle] = useState(initialPage.title);
   const [authUser, setAuthUser] = useState<LocalAuthUser | null>(initialAuthUser);
   const [authDialogMode, setAuthDialogMode] = useState<AuthDialogMode | null>(null);
+  const [authenticating, setAuthenticating] = useState(false);
+  const authenticatingRef = useRef(false);
   const [userName, setUserName] = useState(() => initialAuthUser?.name ?? "게스트");
   const [registrationDirectoryRevision, setRegistrationDirectoryRevision] = useState(0);
   const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection>("pages");
@@ -1977,10 +1988,11 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
   const primaryShortcutLabel = useMemo(getPrimaryShortcutLabel, []);
 
   const loadEditorPage = (pageId: string, blocks: PartialBlock[], focusTitle = false) => {
+    const preserveView = editorPageIdRef.current === pageId && !focusTitle;
     const version = ++editorLoadVersionRef.current;
     loadingPageRef.current = true;
     editorPageIdRef.current = pageId;
-    replacePageDocument(editor, blocks);
+    replacePageDocument(editor, blocks, preserveView);
     window.requestAnimationFrame(() => {
       // An older navigation must not finish a newer document's load.
       if (version !== editorLoadVersionRef.current) return;
@@ -2188,8 +2200,22 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
       [saved.id]: { ...local, ownerId: saved.ownerId, permission: saved.permission, revision: saved.revision },
     };
     pagesRef.current = nextPages;
-    persistStoredPages(nextPages);
     setPages(nextPages);
+    cacheServerPages(nextPages);
+  };
+
+  // Receiving a server version must finish updating memory and the editor even
+  // when the optional disk cache is full. Keep this separate from local edits,
+  // which advance the local write order through commitPages.
+  const cacheServerPages = (nextPages: StoredPages) => {
+    try {
+      persistStoredPages(nextPages);
+      return true;
+    } catch {
+      setLocalSaveState("error");
+      setNotice("로컬 저장 공간이 부족하거나 사용할 수 없어요. 현재 화면의 내용은 유지돼요.");
+      return false;
+    }
   };
 
   const setPageConflict = (pageId: string, conflict: PageConflict | null) => {
@@ -2288,7 +2314,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
       && !page.settings.lockPage
       && !publicPageId
       && workspaceCacheIsCurrent()
-      && !loggingOutRef.current && !workspaceCacheError,
+      && !loggingOutRef.current && !authenticatingRef.current && !workspaceCacheError,
     );
   };
 
@@ -2491,13 +2517,28 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
         }
         const serverPages = { ...nextPages };
         const conflicts: Record<string, PageConflict> = {};
+        const persistedPages = readStoredPages();
         for (const [id, remote] of Object.entries(serverPages)) {
           const draft = readPageDraft(id);
           const initial = bootstrapPages[id];
           const cached = pagesRef.current[id];
           if (!cached || (!initial && !draft)) continue;
           const metadata = editorMetadataRef.current;
-          const local = metadata.pageId === id ? { ...cached, title: metadata.title, settings: metadata.settings, archived: metadata.archived } : cached;
+          const orderedCached = pageWithLocalOrder(cached);
+          let local = metadata.pageId === id ? { ...orderedCached, title: metadata.title, settings: metadata.settings, archived: metadata.archived } : orderedCached;
+          // Another tab may have saved a newer draft while this list request
+          // was pending. Read its contents as well as its merge base before
+          // replacing either the journal or the aggregate cache.
+          const recovered = restorePageDraft(persistedPages?.[id] ?? orderedCached);
+          if (initial && (!recovered.ownerId || recovered.ownerId === remote.ownerId)
+            && (recovered.localWriteOrder ?? 0) > (initial.localWriteOrder ?? 0)) {
+            const localIsNewer = (local.localWriteOrder ?? 0) > (recovered.localWriteOrder ?? 0);
+            const newer = localIsNewer ? local : recovered;
+            const older = localIsNewer ? recovered : local;
+            // Local snapshots use write order for overlapping fields, while
+            // independent edits made in either tab are retained.
+            local = { ...mergePageDraft(initial, newer, older).page, localWriteOrder: newer.localWriteOrder };
+          }
           const base = draft?.base ?? initial;
           const merged = mergePageDraft(base, local, remote);
           nextPages[id] = merged.page;
@@ -2505,7 +2546,11 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
           rememberPageDraft(merged.page, merged.conflicts.length ? base : remote);
         }
         for (const local of Object.values(pagesRef.current)) {
-          if (!bootstrapPages[local.id] && !nextPages[local.id]) nextPages[local.id] = local;
+          // Reload may happen before a new page's first debounced POST. A
+          // missing unacknowledged creation is still a draft, not a deletion.
+          const pendingCreation = local.id !== ROOT_PAGE_ID && local.revision === undefined
+            && (local.ownerId === authUser.id || local.permission === "edit");
+          if ((!bootstrapPages[local.id] || pendingCreation) && !nextPages[local.id]) nextPages[local.id] = local;
         }
         pageConflictsRef.current = conflicts;
         setPageConflicts(conflicts);
@@ -2601,7 +2646,9 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
 
   const refreshInbox = useCallback((options: { force?: boolean; reportError?: boolean } = {}) => {
     if (!authUser || publicPageId) return Promise.resolve();
-    if (inboxRefreshPromiseRef.current) return inboxRefreshPromiseRef.current;
+    // A share mutation needs a request started after that mutation. An older
+    // in-flight poll must neither stand in for it nor overwrite its response.
+    if (inboxRefreshPromiseRef.current && !options.force) return inboxRefreshPromiseRef.current;
     if (!options.force && Date.now() - inboxLastRefreshAtRef.current < 5_000) return Promise.resolve();
 
     const request = Promise.all([
@@ -2609,6 +2656,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
       workspaceApi.listAllShares(),
     ])
       .then(([serverNotifications, serverShares]) => {
+        if (inboxRefreshPromiseRef.current !== request || !workspaceCacheIsCurrent()) return;
         const nextPageShares = Object.fromEntries(serverShares.map((share) => [
           share.pageId,
           storedShareFromServer(share),
@@ -2620,7 +2668,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
         inboxLastRefreshAtRef.current = Date.now();
       })
       .catch((error: unknown) => {
-        if (options.reportError) {
+        if (options.reportError && inboxRefreshPromiseRef.current === request && workspaceCacheIsCurrent()) {
           setNotice(error instanceof Error ? error.message : "받은 편지함을 불러오지 못했어요");
         }
       })
@@ -2926,6 +2974,36 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
     }
   };
 
+  const prepareAuthentication = () => {
+    if (!workspaceCacheIsCurrent()) throw new Error("인증 상태가 변경되었어요. 다시 시도해 주세요.");
+    const pageId = currentPageIdRef.current;
+    const cached = pagesRef.current[pageId];
+    const draft = currentPageDraft(pageId);
+    if (cached && draft && !loadingPageRef.current && editorPageIdRef.current === pageId) {
+      const blocks = editor.document as unknown as PartialBlock[];
+      if (!sameServerValue(cached.blocks, blocks) || cached.title !== draft.title
+        || !arePageSettingsEqual(cached.settings, draft.settings) || cached.archived !== draft.archived) {
+        updatePage(pageId, { blocks, title: draft.title, settings: draft.settings, archived: draft.archived });
+      }
+    }
+    try {
+      // Flush every in-memory page, including edits that previously exceeded
+      // storage capacity. Account activation only imports persisted pages.
+      flushPendingDatabaseSnapshots();
+      persistStoredPages(pagesRef.current);
+    } catch {
+      throw new Error("작성 중인 메모를 보관할 저장 공간이 부족해요. 내용은 화면에 유지했습니다. 공간을 확보한 뒤 다시 로그인해 주세요.");
+    }
+    authenticatingRef.current = true;
+    presetApplyVersionRef.current += 1;
+    setAuthenticating(true);
+  };
+
+  const finishAuthentication = () => {
+    authenticatingRef.current = false;
+    setAuthenticating(false);
+  };
+
   const logout = async () => {
     if (loggingOutRef.current) return;
     loggingOutRef.current = true;
@@ -2936,6 +3014,9 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
       // A previous quota failure may have left newer edits only in memory.
       // Never park an older disk snapshot and discard those edits on reload.
       persistStoredPages(pagesRef.current);
+      // Back up before making editors read-only: that transition can reload
+      // server table state while an offline draft only exists in memory.
+      backupWorkspaceCache();
       setLoggingOut(true);
       await serverMutationQueueRef.current;
       persistStoredPages(pagesRef.current);
@@ -3145,15 +3226,15 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
           [pageId]: latestPage,
         };
         pagesRef.current = nextPages;
-        persistStoredPages(nextPages);
         setPages(nextPages);
+        const cached = cacheServerPages(nextPages);
 
         loadingPageRef.current = true;
         setTitle(latestPage.title);
         setPageSettings(latestPage.settings);
         setIsArchived(latestPage.archived);
         loadEditorPage(pageId, latestPage.blocks);
-        setNotice("다른 위치의 최신 변경 내용을 불러왔어요");
+        if (cached) setNotice("다른 위치의 최신 변경 내용을 불러왔어요");
       } catch {
         // Background revalidation should not interrupt the editor. Explicit
         // saves still surface their server error through the mutation queue.
@@ -3263,7 +3344,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
         [pageId]: nextPage,
       };
       pagesRef.current = nextPages;
-      persistStoredPages(nextPages);
+      cacheServerPages(nextPages);
       setPages(nextPages);
 
       setTitle(localNextPage.title);
@@ -3358,8 +3439,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
           loadingPageRef.current = true;
           loadVersion = ++editorLoadVersionRef.current;
           try {
-            editor.transact((transaction) => {
-              transaction.setMeta("addToHistory", false);
+            applyRemoteEditorChange(editor, () => {
               if (removable.length) editor.removeBlocks(removable);
               updates.forEach((id) => editor.updateBlock(id, nextById.get(id) as never));
             });
@@ -3374,7 +3454,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
         const nextPages = { ...pagesRef.current, [pageId]: mergedLocalPage };
         serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [pageId]: nextPage };
         pagesRef.current = nextPages;
-        persistStoredPages(nextPages);
+        cacheServerPages(nextPages);
         setPages(nextPages);
         setTitle(mergedLocalPage.title);
         setPageSettings(mergedLocalPage.settings);
@@ -3398,7 +3478,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
       const nextPages = { ...pagesRef.current, [pageId]: localPage };
       serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [pageId]: nextPage };
       pagesRef.current = nextPages;
-      persistStoredPages(nextPages);
+      cacheServerPages(nextPages);
       setPages(nextPages);
       setTitle(localPage.title);
       setPageSettings(localPage.settings);
@@ -3414,7 +3494,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
         delete nextSnapshot[pageId];
         pagesRef.current = nextPages;
         serverPagesSnapshotRef.current = nextSnapshot;
-        persistStoredPages(nextPages);
+        cacheServerPages(nextPages);
         setPages(nextPages);
       }
       const homePage = pagesRef.current[ROOT_PAGE_ID];
@@ -3494,9 +3574,9 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
           pagesRef.current = nextPages;
           serverPagesSnapshotRef.current = {
             ...serverPagesSnapshotRef.current,
-            [pageId]: nextPage,
+            [pageId]: { ...(serverPagesSnapshotRef.current[pageId] ?? current), permission: message.permission },
           };
-          persistStoredPages(nextPages);
+          cacheServerPages(nextPages);
           setPages(nextPages);
           setNotice(message.permission === "edit" ? "이 페이지를 편집할 수 있어요" : "이 페이지가 보기 전용으로 변경되었습니다.");
           return;
@@ -3553,18 +3633,34 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
         workspaceApi.listAllShares(),
         workspaceApi.listAllComments(),
       ]);
+      if (!workspaceCacheIsCurrent()) return;
       const currentPages = pagesRef.current;
       const nextPages: StoredPages = {};
       const nextSnapshot: StoredPages = { ...serverPagesSnapshotRef.current };
+      const nextConflicts = { ...pageConflictsRef.current };
       if (currentPages[ROOT_PAGE_ID]) nextPages[ROOT_PAGE_ID] = currentPages[ROOT_PAGE_ID];
       serverPages.forEach((page) => {
-        const local = currentPages[page.id];
+        const local = currentPageDraft(page.id);
         const snapshot = serverPagesSnapshotRef.current[page.id];
-        const dirty = local && (!snapshot || !sameServerValue(getPageEditableSnapshot(local), getPageEditableSnapshot(snapshot)));
         const newerSnapshot = (snapshot?.revision ?? 0) > page.revision;
-        const nextPage = storedPageFromServer(page);
-        nextPages[page.id] = local && (dirty || newerSnapshot) ? local : nextPage;
-        if (!newerSnapshot) nextSnapshot[page.id] = nextPage;
+        if (newerSnapshot) {
+          nextPages[page.id] = local ?? snapshot;
+          return;
+        }
+        const remote = storedPageFromServer(page);
+        const base = nextConflicts[page.id]?.base ?? snapshot;
+        if (local && !base) {
+          // A local creation may still be in flight; its acknowledged version
+          // will establish the baseline without discarding those edits.
+          nextPages[page.id] = local;
+          return;
+        }
+        const merged = local && base ? mergePageDraft(base, local, remote) : { page: remote, conflicts: [] };
+        nextPages[page.id] = merged.page;
+        nextSnapshot[page.id] = remote;
+        if (merged.conflicts.length && base) nextConflicts[page.id] = { base, remote };
+        else delete nextConflicts[page.id];
+        rememberPageDraft(merged.page, merged.conflicts.length && base ? base : remote);
       });
       Object.values(currentPages).forEach((page) => {
         if (nextPages[page.id]) return;
@@ -3574,6 +3670,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
           nextPages[page.id] = page;
         } else {
           delete nextSnapshot[page.id];
+          delete nextConflicts[page.id];
         }
       });
       const nextPageShares = Object.fromEntries(serverShares.map((share) => [
@@ -3586,14 +3683,23 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
       ])) as StoredBlockComments;
 
       serverPagesSnapshotRef.current = nextSnapshot;
+      pageConflictsRef.current = nextConflicts;
+      setPageConflicts(nextConflicts);
       pagesRef.current = nextPages;
-      persistStoredPages(nextPages);
-      persistStoredPageShares(nextPageShares);
-      persistStoredBlockComments(nextBlockComments);
       setPages(nextPages);
       setPageShares(nextPageShares);
       setBlockComments(nextBlockComments);
-      setLocalSaveState("saved");
+      const displayed = nextPages[currentPageIdRef.current];
+      if (displayed) {
+        setTitle(displayed.title);
+        setPageSettings(displayed.settings);
+        setIsArchived(displayed.archived);
+        if (!sameServerValue(editor.document, displayed.blocks)) loadEditorPage(displayed.id, displayed.blocks);
+      }
+      const cached = cacheServerPages(nextPages);
+      setLocalSaveState(cached && !Object.keys(nextConflicts).length ? "saved" : "error");
+      persistStoredPageShares(nextPageShares);
+      persistStoredBlockComments(nextBlockComments);
     } catch (error) {
       setLocalSaveState("error");
       setNotice(error instanceof Error ? error.message : "공유 페이지 목록을 불러오지 못했어요");
@@ -3753,6 +3859,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
           ...current,
           [pageId]: storedShareFromServer(refreshed),
         }));
+        await refreshInbox({ force: true });
         setLocalSaveState("saved");
         const sharedUser = refreshed.members.find((member) => member.user.id === userId)?.user ?? targetUser;
         setNotice(`${sharedUser ? `${sharedUser.name}님에게 ` : ""}“${targetPage.title || "제목 없음"}” 페이지를 공유했어요`);
@@ -3773,6 +3880,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
           ...current,
           [pageId]: storedShareFromServer(refreshed),
         }));
+        await refreshInbox({ force: true });
         setLocalSaveState("saved");
       } catch (error) {
         setLocalSaveState("error");
@@ -3794,8 +3902,11 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
           else next[pageId] = storedShareFromServer(refreshed);
           return next;
         });
+        await refreshInbox({ force: true });
         setLocalSaveState("saved");
-        if (targetUser) setNotice(`${targetUser.name}님의 페이지 접근 권한을 제거했어요`);
+        if (targetUser) setNotice(refreshed.members.some(member => member.user.id === userId)
+          ? `${targetUser.name}님의 직접 공유를 해제했어요. 상위 페이지의 공유 권한은 유지됩니다.`
+          : `${targetUser.name}님의 페이지 접근 권한을 제거했어요`);
       } catch (error) {
         setLocalSaveState("error");
         setNotice(error instanceof Error ? error.message : "공유 권한을 제거하지 못했어요");
@@ -3805,7 +3916,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
 
   const createPage = (source: "slash" | "sidebar" = "slash", requestedFolderId?: string | null) => {
     const createsChildPageBlock = source === "slash";
-    if (createsChildPageBlock && pageSettings.lockPage) {
+    if (createsChildPageBlock && (pageSettings.lockPage || pagesRef.current[currentPageIdRef.current]?.permission === "view")) {
       setNotice("페이지 잠금을 해제한 뒤 하위 페이지를 만들 수 있어요");
       return;
     }
@@ -3821,8 +3932,9 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
     }
 
     const now = new Date().toISOString();
-    const parentId = createsChildPageBlock ? currentPageIdRef.current : null;
-    const parent = parentId ? pagesRef.current[parentId] : null;
+    const sourcePageId = createsChildPageBlock ? currentPageIdRef.current : null;
+    const parentId = sourcePageId === ROOT_PAGE_ID ? null : sourcePageId;
+    const parent = sourcePageId ? pagesRef.current[sourcePageId] : null;
     const folderId = requestedFolderId !== undefined
       ? requestedFolderId
       : createsChildPageBlock
@@ -3831,6 +3943,8 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
     const nextOrder = getNextSidebarOrder(pagesRef.current, foldersRef.current, folderId);
     const nextPage: StoredPage = {
       id: pageId,
+      ownerId: parent?.ownerId ?? authUser?.id,
+      permission: parent?.permission ?? "owner",
       parentId,
       folderId,
       order: nextOrder,
@@ -3843,8 +3957,8 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
       updatedAt: now,
     };
     const nextPages = { ...pagesRef.current };
-    if (createsChildPageBlock && parentId && parent) {
-      nextPages[parentId] = {
+    if (createsChildPageBlock && sourcePageId && parent) {
+      nextPages[sourcePageId] = {
         ...parent,
         blocks: editor.document as unknown as PartialBlock[],
         updatedAt: now,
@@ -3854,6 +3968,15 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
       ...nextPages,
       [pageId]: nextPage,
     });
+    const parentShare = parentId ? pageSharesRef.current[parentId] : undefined;
+    if (parentShare) commitPageShares(current => ({ ...current, [pageId]: {
+      ...parentShare, pageId, updatedAt: now,
+      members: parentShare.members.map(member => ({ ...member,
+        inheritedFromPageId: member.inheritedFromPageId ?? parentId!,
+        inheritedFromTitle: member.inheritedFromTitle ?? parent?.title,
+        directPermission: undefined,
+      })),
+    } }));
     setRightPanel(null);
     setSidebarCreateMenuOpen(false);
     if (source === "sidebar") {
@@ -3866,15 +3989,41 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
   };
 
   useEffect(() => {
+    let disposed = false;
+    const controller = new AbortController();
+    let requestVersion = 0;
     const handlePreviewPage = (event: Event) => {
       const pageId = (event as CustomEvent<{ pageId?: string }>).detail?.pageId;
-      if (!pageId || !pagesRef.current[pageId]) return;
-      setRightPanel(null);
-      setDrawerPageId(pageId);
+      if (!pageId) return;
+      const version = ++requestVersion;
+      if (pagesRef.current[pageId]) {
+        setRightPanel(null);
+        setDrawerPageId(pageId);
+        return;
+      }
+      if (!authUser || publicPageId) return;
+      void (async () => {
+        try {
+          const serverPage = storedPageFromServer(await workspaceApi.getPage(pageId, controller.signal));
+          if (disposed || version !== requestVersion || !workspaceCacheIsCurrent()) return;
+          if (!pagesRef.current[pageId]) {
+            serverPagesSnapshotRef.current = { ...serverPagesSnapshotRef.current, [pageId]: serverPage };
+            const next = { ...pagesRef.current, [pageId]: serverPage };
+            pagesRef.current = next;
+            setPages(next);
+            cacheServerPages(next);
+          }
+          setRightPanel(null);
+          setDrawerPageId(pageId);
+          void refreshInbox({ force: true });
+        } catch (error) {
+          if (!disposed && version === requestVersion && !controller.signal.aborted) setNotice(error instanceof Error ? error.message : "하위 페이지를 불러오지 못했어요");
+        }
+      })();
     };
     window.addEventListener(OPEN_PAGE_EVENT, handlePreviewPage);
-    return () => window.removeEventListener(OPEN_PAGE_EVENT, handlePreviewPage);
-  });
+    return () => { disposed = true; controller.abort(); window.removeEventListener(OPEN_PAGE_EVENT, handlePreviewPage); };
+  }, [authUser?.id, publicPageId, currentPageId]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -6459,7 +6608,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
   };
 
   const currentPage = pages[currentPageId] ?? rootPage;
-  const canEditCurrentPage = currentPage.permission !== "view" && !pageSettings.lockPage && !publicPageId && !loggingOut && !workspaceCacheError;
+  const canEditCurrentPage = currentPage.permission !== "view" && !pageSettings.lockPage && !publicPageId && !loggingOut && !authenticating && !workspaceCacheError;
 
   useLayoutEffect(() => {
     // BlockNoteView normally mirrors the `editable` prop into the editor, but
@@ -7076,7 +7225,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
   if (workspaceCacheError) return <WorkspaceCacheFailure message={workspaceCacheError} />;
 
   return (
-    <div className="app-shell" data-theme={appTheme}>
+    <div className="app-shell" data-theme={appTheme} inert={authenticating || undefined}>
       <aside
         className={`sidebar ${sidebarOpen ? "is-open" : ""}`}
         aria-label="워크스페이스 메뉴"
@@ -7885,7 +8034,7 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
               <BlockNoteView
                 editor={editor}
                 onChange={() => {
-                  if (!canEditCurrentPage || loadingPageRef.current
+                  if (!canEditCurrentPage || authenticatingRef.current || loadingPageRef.current
                     || currentPageId !== currentPageIdRef.current || currentPageId !== editorPageIdRef.current) return;
                   dismissStarterDockForCurrentPage();
                   const nextBlocks = editor.document as unknown as PartialBlock[];
@@ -8245,6 +8394,8 @@ function Workspace({ initialAuthUser }: { initialAuthUser: LocalAuthUser | null 
       {authDialogMode && (
         <AuthDialog
           initialMode={authDialogMode}
+          onPrepareAuthentication={prepareAuthentication}
+          onAuthenticationFinished={finishAuthentication}
           onAuthenticated={() => window.location.reload()}
           onClose={() => setAuthDialogMode(null)}
         />
@@ -8960,7 +9111,7 @@ function PagePreviewDrawer({
     if (sameServerValue(previewDocumentRef.current, page.blocks)) return;
     previewDocumentRef.current = page.blocks;
     previewLoadingRef.current = true;
-    replacePageDocument(previewEditor, page.blocks);
+    replacePageDocument(previewEditor, page.blocks, true);
     const frame = window.requestAnimationFrame(() => { previewLoadingRef.current = false; });
     return () => {
       window.cancelAnimationFrame(frame);

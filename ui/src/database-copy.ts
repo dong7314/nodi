@@ -14,13 +14,13 @@ export function copyDatabase(sourceId: string, snapshot?: DatabaseState) {
   return id;
 }
 
-export function collectDatabaseSnapshots(blocks: PartialBlock[], requireAll = false): Record<string, DatabaseState> {
+export function collectDatabaseSnapshots(blocks: PartialBlock[], requireAll = false, sourceRoot?: Element): Record<string, DatabaseState> {
   const snapshots: Record<string, DatabaseState> = {};
   const visit = (values: PartialBlock[]) => values.forEach((value) => {
     const block = value as ResourceBlock;
     if (block.type === "database") {
       const id = block.props?.databaseId || `database-${block.id}`;
-      const state = readDatabaseSnapshot(id);
+      const state = readDatabaseSnapshot(id, sourceRoot);
       if (state) snapshots[id] = state;
       else if (requireAll) throw new Error(DATABASE_NOT_READY_MESSAGE);
     }

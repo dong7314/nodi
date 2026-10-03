@@ -10,6 +10,7 @@ import { enqueueDatabaseSync, useDatabaseSync } from "./use-database-sync";
 import { conflictLabel, type ConflictChoices, type DatabaseConflict } from "./database-merge";
 import { NodiApiError } from "./api-client";
 import { workspaceApi } from "./server-api";
+import { readPendingDatabaseSnapshot } from "./database-cache";
 
 export const INLINE_DATABASE_REALTIME_EVENT = "nodi:inline-database-realtime";
 export const DATABASE_COLUMN_RESIZE_START_EVENT = "nodi:database-column-resize-start";
@@ -167,6 +168,8 @@ function migrateLegacyDatabase(value: { records?: LegacyRecord[]; trash?: Legacy
 }
 
 function loadDatabase(databaseId: string): DatabaseState {
+  const pending = readPendingDatabaseSnapshot(databaseId);
+  if (pending) return pending;
   try {
     const stored = window.localStorage.getItem(databaseStorageKey(databaseId))
       ?? (databaseId === LEGACY_DATABASE_ID ? window.localStorage.getItem(LEGACY_DATABASE_STORAGE_KEY) : null);
@@ -276,6 +279,7 @@ function recordsForView(records: DatabaseRecord[], properties: DatabaseProperty[
 }
 
 export function InlineDatabase({ databaseId, locked: editorLocked, onNotice, onRemove }: { databaseId: string; locked: boolean; onNotice: (message: string) => void; onRemove: () => void }) {
+  const elementRef = useRef<HTMLElement>(null);
   const serverSync = useContext(InlineDatabaseSyncContext);
   const [database, setDatabase] = useState<DatabaseState>(() => serverSync.initialStates?.[databaseId] ?? loadDatabase(databaseId));
   const [pendingDeletion, setPendingDeletion] = useState<DatabaseRecord | null>(null);
@@ -292,6 +296,7 @@ export function InlineDatabase({ databaseId, locked: editorLocked, onNotice, onR
     pageId: serverSync.pageId,
     readOnly: editorLocked || Boolean(serverSync.readOnly),
     realtimeEvent: INLINE_DATABASE_REALTIME_EVENT,
+    elementRef,
   });
   const flushDatabase = sync.flush;
   const locked = editorLocked || Boolean(serverSync.readOnly) || sync.loading || Boolean(sync.conflict);
@@ -460,6 +465,7 @@ export function InlineDatabase({ databaseId, locked: editorLocked, onNotice, onR
   const visibleRecords = activeView ? recordsForView(database.records, database.properties, activeView, activeSearchQuery) : database.records;
 
   return <DatabasePopoverContext.Provider value={{ openPopoverId, setOpenPopoverId }}><section
+    ref={elementRef}
     className="inline-database database-block"
     aria-label={`${database.name} 데이터베이스`}
     contentEditable={false}

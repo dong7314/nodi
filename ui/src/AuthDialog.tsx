@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   CheckCircle2,
@@ -21,12 +21,16 @@ export type AuthDialogMode = "login" | "signup";
 
 type AuthDialogProps = {
   initialMode: AuthDialogMode;
+  onPrepareAuthentication: () => void;
+  onAuthenticationFinished: () => void;
   onAuthenticated: (user: LocalAuthUser) => void;
   onClose: () => void;
 };
 
 export function AuthDialog({
   initialMode,
+  onPrepareAuthentication,
+  onAuthenticationFinished,
   onAuthenticated,
   onClose,
 }: AuthDialogProps) {
@@ -38,6 +42,11 @@ export function AuthDialog({
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [isClosing, setIsClosing] = useState(false);
+  const submittingRef = useRef(false);
+  const closingRef = useRef(false);
+  const mountedRef = useRef(true);
+  const closeTimerRef = useRef<number | null>(null);
+  const successTimerRef = useRef<number | null>(null);
   const [feedback, setFeedback] = useState<{
     kind: "error" | "success";
     message: string;
@@ -59,12 +68,14 @@ export function AuthDialog({
   ), [email, mode, name, password, passwordConfirmation]);
 
   const closeWithAnimation = useCallback(() => {
-    if (isClosing) return;
+    if (closingRef.current || submittingRef.current) return;
+    closingRef.current = true;
     setIsClosing(true);
-    window.setTimeout(onClose, 150);
-  }, [isClosing, onClose]);
+    closeTimerRef.current = window.setTimeout(onClose, 150);
+  }, [onClose]);
 
   const switchMode = (nextMode: AuthDialogMode) => {
+    if (submittingRef.current || closingRef.current) return;
     setMode(nextMode);
     setFeedback(null);
     setPassword("");
@@ -72,30 +83,56 @@ export function AuthDialog({
   };
 
   const submit = async () => {
-    if (!formValid || submitting) return;
+    if (!formValid || submittingRef.current || closingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
     setFeedback(null);
-
-    const result = mode === "login"
-      ? await loginLocalAccount(email, password)
-      : await registerLocalAccount({ name, email, password });
-
-    setSubmitting(false);
-    if (!result.ok) {
-      setFeedback({ kind: "error", message: result.message });
-      return;
-    }
-    if (result.user) {
+    let awaitingReload = false;
+    try {
+      const prepare = () => {
+        if (!mountedRef.current) throw new Error("인증 창이 닫혔어요. 다시 시도해 주세요.");
+        onPrepareAuthentication();
+      };
+      // Check before sending credentials and again before replacing the guest
+      // cache: an attachment may have completed while the request was pending.
+      prepare();
+      const result = mode === "login"
+        ? await loginLocalAccount(email, password, prepare)
+        : await registerLocalAccount({ name, email, password }, prepare);
+      if (!mountedRef.current) return;
+      if (!result.ok) {
+        setFeedback({ kind: "error", message: result.message });
+        return;
+      }
+      if (result.user) {
+        awaitingReload = true;
+        setFeedback({ kind: "success", message: result.message });
+        successTimerRef.current = window.setTimeout(() => onAuthenticated(result.user!), 240);
+        return;
+      }
       setFeedback({ kind: "success", message: result.message });
-      window.setTimeout(() => onAuthenticated(result.user!), 240);
-      return;
+      setMode("login");
+      setPassword("");
+      setPasswordConfirmation("");
+    } catch (error) {
+      setFeedback({ kind: "error", message: error instanceof Error ? error.message : "로그인을 준비하지 못했어요. 다시 시도해 주세요." });
+    } finally {
+      if (!awaitingReload) {
+        submittingRef.current = false;
+        setSubmitting(false);
+        onAuthenticationFinished();
+      }
     }
-
-    setFeedback({ kind: "success", message: result.message });
-    setMode("login");
-    setPassword("");
-    setPasswordConfirmation("");
   };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
+      if (successTimerRef.current !== null) window.clearTimeout(successTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -111,6 +148,7 @@ export function AuthDialog({
         type="button"
         className="auth-backdrop"
         aria-label="인증 창 바깥 영역 닫기"
+        disabled={submitting}
         onClick={closeWithAnimation}
       />
       <section
@@ -119,7 +157,7 @@ export function AuthDialog({
         aria-modal="true"
         aria-labelledby="auth-dialog-title"
       >
-        <button type="button" className="auth-close" aria-label="인증 창 닫기" onClick={closeWithAnimation}>
+        <button type="button" className="auth-close" aria-label="인증 창 닫기" disabled={submitting} onClick={closeWithAnimation}>
           <X size={17} />
         </button>
 
@@ -134,6 +172,7 @@ export function AuthDialog({
           <button
             type="button"
             role="tab"
+            disabled={submitting}
             aria-selected={mode === "login"}
             className={mode === "login" ? "is-active" : ""}
             onClick={() => switchMode("login")}
@@ -143,6 +182,7 @@ export function AuthDialog({
           <button
             type="button"
             role="tab"
+            disabled={submitting}
             aria-selected={mode === "signup"}
             className={mode === "signup" ? "is-active" : ""}
             onClick={() => switchMode("signup")}
@@ -164,6 +204,7 @@ export function AuthDialog({
               <input
                 autoFocus
                 value={name}
+                disabled={submitting}
                 autoComplete="name"
                 maxLength={40}
                 placeholder="Nodi에서 사용할 이름"
@@ -177,6 +218,7 @@ export function AuthDialog({
               autoFocus={mode === "login"}
               type="email"
               value={email}
+              disabled={submitting}
               autoComplete="email"
               placeholder="name@example.com"
               onChange={(event) => setEmail(event.target.value)}
@@ -188,6 +230,7 @@ export function AuthDialog({
               <input
                 type={showPassword ? "text" : "password"}
                 value={password}
+                disabled={submitting}
                 autoComplete={mode === "login" ? "current-password" : "new-password"}
                 placeholder="8자 이상"
                 onChange={(event) => setPassword(event.target.value)}
@@ -208,6 +251,7 @@ export function AuthDialog({
               <input
                 type={showPassword ? "text" : "password"}
                 value={passwordConfirmation}
+                disabled={submitting}
                 autoComplete="new-password"
                 placeholder="비밀번호를 다시 입력"
                 onChange={(event) => setPasswordConfirmation(event.target.value)}

@@ -309,6 +309,10 @@ const otherUser = { ...member, id: "00000000-0000-4000-8000-000000000002", name:
 test("a user found outside the initial directory can be invited and managed", async ({ page }) => {
   const server = await mockWorkspace(page);
   let shared = false;
+  await page.route("**/api/shares", (route) => route.fulfill({ json: { data: shared ? [{
+    pageId: "page-1", owner: member, updatedAt: "2026-10-02T00:00:00Z",
+    members: [{ user: otherUser, permission: "edit", sharedAt: "2026-10-02T00:00:00Z" }],
+  }] : [] } }));
   await page.route("**/api/auth/users?*", (route) => route.fulfill({ json: {
     data: new URL(route.request().url()).searchParams.get("q") ? [otherUser] : [],
   } }));

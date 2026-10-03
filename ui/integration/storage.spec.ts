@@ -204,3 +204,218 @@ test("the file picker uploads through the existing file panel", async ({ page, c
   await expect(page.locator(".bn-editor").first()).toContainText("선택한 파일.txt");
   expect(errors).toEqual([]);
 });
+
+test("a copied image survives source deletion and is removed after its last page is deleted", async ({ page, context }) => {
+  const source = await seed(context, [{ id: "source-intro", type: "paragraph", content: "이미지 원본" }]);
+  const destination = await seed(context, [{ id: "destination-intro", type: "paragraph", content: "이미지 복사본" }]);
+  await prepare(page);
+  const errors: string[] = [];
+  page.on("pageerror", error => errors.push(error.message));
+  await page.goto(`/?page=${source}`);
+  await expect(page.locator(".bn-editor").first()).toContainText("이미지 원본");
+  const bytes = [...Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==", "base64")];
+  const presign = page.waitForResponse(response => response.url().endsWith("/attachments/presign"));
+  await pasteFile(page, "복사할 이미지.png", "image/png", bytes);
+  const { assetUrl } = await (await presign).json();
+  await expect.poll(async () => JSON.stringify((await (await admin.get(`${api}/pages/${source}`)).json()).data.blocks)).toContain(assetUrl);
+  const editor = page.locator(".bn-editor[contenteditable=true]").first();
+  await editor.focus();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("ControlOrMeta+c");
+  await page.locator(`[data-sidebar-page-id="${destination}"]`).first().click();
+  await expect(editor).toContainText("이미지 복사본");
+  await editor.focus();
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.press("ControlOrMeta+v");
+  await expect.poll(async () => JSON.stringify((await (await admin.get(`${api}/pages/${destination}`)).json()).data.blocks)).toContain(assetUrl);
+
+  expect((await admin.delete(`${api}/pages/${source}?hard=true`)).status()).toBe(204);
+  const download = await context.request.get(assetUrl);
+  expect(download.ok()).toBe(true);
+  expect([...await download.body()]).toEqual(bytes);
+  const anonymous = await request.newContext();
+  try { expect((await anonymous.get(assetUrl)).ok()).toBe(false); }
+  finally { await anonymous.dispose(); }
+  await page.reload();
+  const image = editor.locator('img[src*="/attachments/"]');
+  await expect(image).toHaveCount(1);
+  await expect.poll(() => image.evaluate(element => (element as HTMLImageElement).naturalWidth)).toBe(1);
+  expect((await admin.delete(`${api}/pages/${destination}?hard=true`)).status()).toBe(204);
+  expect((await context.request.get(assetUrl)).status()).toBe(404);
+  expect(errors).toEqual([]);
+});
+
+test("two shared-page editors retain their own caret and viewport during table and structural edits", async ({ page, context, browser }) => {
+  const paragraph = (id: string, text: string) => ({ id, type: "paragraph", content: text });
+  const nativeTable = (id: string, text: string) => ({ id, type: "table", content: { type: "tableContent", rows: [{ cells: [[{ type: "text", text, styles: {} }]] }] } });
+  const blocks: unknown[] = Array.from({ length: 90 }, (_, i) => paragraph(`line-${i}`, `LINE ${i} original content`));
+  blocks[4] = nativeTable("line-4", "REMOTE TABLE");
+  blocks[60] = nativeTable("line-60", "LOCAL TABLE");
+  const id = await seed(context, blocks);
+  const otherContext = await browser.newContext();
+  try {
+    const email = `scroll-member-${randomUUID()}@example.invalid`;
+    expect((await otherContext.request.post(`${api}/auth/register`, { data: { name: "공동 편집자", email, password } })).status()).toBe(202);
+    const directory = (await (await admin.get(`${api}/auth/registration-requests`)).json()).data;
+    const member = directory.find((item: { email: string }) => item.email === email);
+    expect(member).toBeTruthy();
+    expect((await admin.patch(`${api}/auth/registration-requests/${member.id}`, { data: { status: "approved" } })).ok()).toBe(true);
+    expect((await otherContext.request.post(`${api}/auth/login`, { data: { email, password } })).ok()).toBe(true);
+    expect((await admin.put(`${api}/pages/${id}/shares/${member.id}`, { data: { permission: "edit" } })).ok()).toBe(true);
+    const other = await otherContext.newPage();
+    await prepare(page); await prepare(other);
+    const errors: string[] = [];
+    page.on("pageerror", error => errors.push(error.message));
+    other.on("pageerror", error => errors.push(error.message));
+    const roomReady = (target: Page) => target.waitForEvent("websocket", {
+      predicate: socket => socket.url().includes(`/pages/${id}/realtime`),
+    }).then(socket => socket.waitForEvent("framereceived", {
+      predicate: frame => JSON.parse(String(frame.payload)).type === "page.snapshot",
+    }));
+    const bothReady = Promise.all([roomReady(page), roomReady(other)]);
+    await page.goto(`/?page=${id}`); await other.goto(`http://127.0.0.1:4184/?page=${id}`);
+    await bothReady;
+    await Promise.all([page, other].map(target => target.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))));
+    const local = page.locator('.bn-editor [data-id="line-60"] td p').first();
+    const remote = other.locator('.bn-editor [data-id="line-4"] td p').first();
+    await expect(local).toHaveText("LOCAL TABLE");
+    await expect(remote).toHaveText("REMOTE TABLE");
+    await local.click();
+    await expect.poll(() => page.evaluate(() => window.getSelection()?.anchorNode?.parentElement?.closest("[data-id]")?.getAttribute("data-id"))).toBe("line-60");
+    await page.keyboard.insertText(" LOCAL INPUT");
+    await expect(page.getByText("저장됨", { exact: true })).toBeVisible();
+    await expect(other.locator('.bn-editor [data-id="line-60"] td p').first()).toContainText("LOCAL INPUT");
+    await local.evaluate(element => element.scrollIntoView({ block: "center" }));
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const position = () => page.evaluate(() => {
+      const selection = window.getSelection()!;
+      const block = selection.anchorNode?.parentElement?.closest("[data-id]");
+      return { id: block?.getAttribute("data-id"), top: block?.getBoundingClientRect().top };
+    });
+    const before = await position();
+    expect(before.id).toBe("line-60");
+    await remote.click();
+    await other.keyboard.insertText(" PEER TABLE EDIT");
+    await expect(page.locator('.bn-editor [data-id="line-4"] td p').first()).toContainText("PEER TABLE EDIT");
+    expect((await position()).id).toBe("line-60");
+    expect(Math.abs((await position()).top! - before.top!)).toBeLessThan(3);
+    await page.keyboard.insertText(" AFTER TABLE");
+    await expect(local).toContainText("LOCAL INPUT AFTER TABLE");
+    await expect(page.getByText("저장됨", { exact: true })).toBeVisible();
+    await expect(other.locator('.bn-editor [data-id="line-60"] td p').first()).toContainText("AFTER TABLE");
+
+    await other.locator('.bn-editor [data-id="line-5"] .bn-inline-content').first().click();
+    await other.keyboard.press("Enter");
+    await other.keyboard.insertText("PEER NEW PARAGRAPH");
+    await expect(page.locator(".bn-editor").first()).toContainText("PEER NEW PARAGRAPH");
+    expect((await position()).id).toBe("line-60");
+    expect(Math.abs((await position()).top! - before.top!)).toBeLessThan(3);
+    await page.keyboard.insertText(" AFTER STRUCTURE");
+    await expect(local).toContainText("LOCAL INPUT AFTER TABLE AFTER STRUCTURE");
+    await expect.poll(async () => JSON.stringify((await (await admin.get(`${api}/pages/${id}`)).json()).data.blocks))
+      .toContain("LOCAL INPUT AFTER TABLE AFTER STRUCTURE");
+    await expect(other.locator('.bn-editor [data-id="line-60"] td p').first()).toContainText("AFTER STRUCTURE");
+    expect(errors).toEqual([]);
+  } finally { await otherContext.close(); }
+});
+
+for (const creatorRole of ["owner", "member"] as const) {
+  test(`a ${creatorRole} creates a child with /page and every parent member inherits access`, async ({ page, context, browser }) => {
+    const root = await seed(context, [{ id: "intro", type: "paragraph", content: "상위 공유 문서" }]);
+    const otherContext = await browser.newContext();
+    try {
+      const email = `child-member-${randomUUID()}@example.invalid`;
+      expect((await otherContext.request.post(`${api}/auth/register`, { data: { name: "하위 페이지 동료", email, password } })).status()).toBe(202);
+      const directory = (await (await admin.get(`${api}/auth/registration-requests`)).json()).data;
+      const member = directory.find((item: { email: string }) => item.email === email);
+      expect((await admin.patch(`${api}/auth/registration-requests/${member.id}`, { data: { status: "approved" } })).ok()).toBe(true);
+      expect((await otherContext.request.post(`${api}/auth/login`, { data: { email, password } })).ok()).toBe(true);
+      expect((await admin.put(`${api}/pages/${root}/shares/${member.id}`, { data: { permission: "edit" } })).ok()).toBe(true);
+      const other = await otherContext.newPage();
+      await prepare(page); await prepare(other);
+      const errors: string[] = [];
+      page.on("pageerror", error => errors.push(error.message)); other.on("pageerror", error => errors.push(error.message));
+      await page.goto(`/?page=${root}`); await other.goto(`http://127.0.0.1:4184/?page=${root}`);
+      for (const target of [page, other]) await expect(target.locator(".bn-editor").first()).toContainText("상위 공유 문서");
+      const creator = creatorRole === "owner" ? page : other;
+      const receiver = creatorRole === "owner" ? other : page;
+      const editor = creator.locator(".bn-editor[contenteditable=true]").first();
+      await editor.click();
+      await creator.keyboard.press("ControlOrMeta+End");
+      await creator.keyboard.press("Enter");
+      await creator.keyboard.type("/page");
+      const creation = creator.waitForResponse(response => response.url() === `${api}/pages` && response.request().method() === "POST");
+      await creator.getByRole("option").filter({ hasText: "현재 위치에 하위 페이지를 만들고 엽니다." }).click();
+      const createdResponse = await creation;
+      expect(createdResponse.status()).toBe(201);
+      const { data: child } = await createdResponse.json();
+      expect(child.parentId).toBe(root);
+      expect(child.permission).toBe(creatorRole === "owner" ? "owner" : "edit");
+      const title = `자동 공유 하위 문서 ${creatorRole}`;
+      await creator.getByRole("textbox", { name: "미리보기 페이지 제목" }).fill(title);
+      const preview = creator.locator('[role="dialog"] .bn-editor[contenteditable=true]');
+      await preview.click(); await creator.keyboard.insertText("INHERITED CHILD CONTENT");
+      await expect.poll(async () => (await (await admin.get(`${api}/pages/${child.id}`)).json()).data.title).toBe(title);
+      await expect.poll(async () => JSON.stringify((await (await admin.get(`${api}/pages/${child.id}`)).json()).data.blocks)).toContain("INHERITED CHILD CONTENT");
+      const presign = creator.waitForResponse(response => response.url().endsWith("/attachments/presign"));
+      await pasteFile(creator, "상속된 첨부.txt", "text/plain", [...Buffer.from("inherited attachment")], '[role="dialog"] .bn-editor[contenteditable=true]');
+      const { assetUrl } = await (await presign).json();
+      await expect.poll(async () => JSON.stringify((await (await admin.get(`${api}/pages/${child.id}`)).json()).data.blocks)).toContain(assetUrl);
+      expect(await (await receiver.context().request.get(assetUrl)).text()).toBe("inherited attachment");
+      await expect(receiver.locator(".child-page-block").first()).toBeVisible();
+      await receiver.locator(".child-page-block").first().click();
+      await expect(receiver.getByRole("textbox", { name: "미리보기 페이지 제목" })).toHaveValue(title);
+      await expect(receiver.locator('[role="dialog"] .bn-editor')).toContainText("INHERITED CHILD CONTENT");
+      await expect(receiver.locator('[role="dialog"] .bn-editor')).toContainText("상속된 첨부.txt");
+      const childGrants = (await (await admin.get(`${api}/pages/${child.id}/shares`)).json()).data.members;
+      expect(childGrants).toHaveLength(1);
+      expect(childGrants[0].inheritedFromPageId).toBe(root);
+      expect(childGrants[0].directPermission).toBeUndefined();
+
+      // The invited user's open child page must downgrade and revoke with its parent.
+      await other.getByRole("button", { name: "전체 페이지로 열기" }).click();
+      await expect(other).toHaveURL(new RegExp(`page=${child.id}`));
+      await expect(other.locator(".bn-editor[contenteditable=true]").first()).toContainText("INHERITED CHILD CONTENT");
+      expect((await admin.put(`${api}/pages/${root}/shares/${member.id}`, { data: { permission: "view" } })).ok()).toBe(true);
+      await expect(other.locator(".bn-editor[contenteditable=false]").first()).toContainText("INHERITED CHILD CONTENT");
+      expect((await otherContext.request.get(assetUrl)).ok()).toBe(true);
+      expect((await otherContext.request.post(`${api}/pages`, { data: { id: `denied-${randomUUID()}`, parentId: child.id } })).status()).toBe(403);
+      expect((await admin.delete(`${api}/pages/${root}/shares/${member.id}`)).status()).toBe(204);
+      await expect(other).not.toHaveURL(new RegExp(`page=${child.id}`));
+      expect((await otherContext.request.get(`${api}/pages/${child.id}`)).status()).toBe(404);
+      expect((await otherContext.request.get(assetUrl)).status()).toBe(404);
+      expect(errors).toEqual([]);
+    } finally { await otherContext.close(); }
+  });
+}
+
+test("a page created with /page from home persists and opens again after reload", async ({ page, context }) => {
+  await context.addCookies(adminState.cookies);
+  const intro = `홈 페이지 생성 검사 ${randomUUID()}`;
+  // Each browser uses the same server account. Do not click a child-page link
+  // left in its home by a previous run when placing the initial caret.
+  expect((await admin.put(`${api}/home`, { data: {
+    blocks: [{ id: "home-intro", type: "paragraph", content: intro }],
+  } })).ok()).toBe(true);
+  await prepare(page);
+  await page.goto("/");
+  const editor = page.locator(".bn-editor[contenteditable=true]").first();
+  await expect(editor).toContainText(intro);
+  await editor.locator('[data-id="home-intro"] .bn-inline-content').click();
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.press("Enter");
+  await page.keyboard.type("/page");
+  const creation = page.waitForResponse(response => response.url() === `${api}/pages` && response.request().method() === "POST");
+  await page.getByRole("option").filter({ hasText: "현재 위치에 하위 페이지를 만들고 엽니다." }).click();
+  const response = await creation;
+  expect(response.status()).toBe(201);
+  const { data: child } = await response.json();
+  expect(child.parentId).toBeNull();
+  const title = `홈에서 생성한 문서 ${child.id}`;
+  await page.getByRole("textbox", { name: "미리보기 페이지 제목" }).fill(title);
+  await expect.poll(async () => (await (await admin.get(`${api}/pages/${child.id}`)).json()).data.title).toBe(title);
+  await expect.poll(async () => JSON.stringify((await (await admin.get(`${api}/home`)).json()).data.blocks)).toContain(child.id);
+  await page.reload();
+  await page.locator(".child-page-block").filter({ hasText: title }).click();
+  await expect(page.getByRole("textbox", { name: "미리보기 페이지 제목" })).toHaveValue(title);
+});

@@ -17,6 +17,9 @@ export type NodiUser = {
 };
 
 export type PageShareMember = {
+  inheritedFromPageId?: string;
+  inheritedFromTitle?: string;
+  directPermission?: SharePermission;
   userId: string;
   permission: SharePermission;
   sharedAt: string;

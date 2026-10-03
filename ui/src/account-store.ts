@@ -186,11 +186,12 @@ export function readApprovedLocalUsers(): LocalAuthUser[] {
     .map(toAuthUser);
 }
 
-export async function loginLocalAccount(email: string, password: string): Promise<LocalLoginResult> {
+export async function loginLocalAccount(email: string, password: string, beforeSessionCommit?: () => void): Promise<LocalLoginResult> {
   const requestState = beginAuthTransition();
   try {
     const { user } = await authApi.login(normalizeEmail(email), password);
     if (!isCurrentAuthState(requestState)) return staleAuthResult();
+    beforeSessionCommit?.();
     return { ok: true, message: "로그인했습니다.", user: cacheServerSession(user, true) };
   } catch (error) {
     return { ok: false, message: apiMessage(error, "이메일 또는 비밀번호가 일치하지 않습니다.") };
@@ -205,7 +206,7 @@ export async function registerLocalAccount({
   name: string;
   email: string;
   password: string;
-}): Promise<LocalRegistrationResult> {
+}, beforeSessionCommit?: () => void): Promise<LocalRegistrationResult> {
   const normalizedName = name.trim();
   const normalizedEmail = normalizeEmail(email);
   if (normalizedName.length < 2) {
@@ -225,6 +226,7 @@ export async function registerLocalAccount({
   try {
     const result = await authApi.register(normalizedName, normalizedEmail, password);
     if (!isCurrentAuthState(requestState)) return staleAuthResult();
+    if (result.user) beforeSessionCommit?.();
     const user = result.user ? cacheServerSession(result.user, true) : undefined;
     if (!result.user) window.localStorage.setItem(LOCAL_AUTH_LAST_EMAIL_STORAGE_KEY, normalizedEmail);
     return {

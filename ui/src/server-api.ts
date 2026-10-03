@@ -51,6 +51,9 @@ export type ServerHome = {
 };
 
 export type ServerShareMember = {
+  inheritedFromPageId?: string;
+  inheritedFromTitle?: string;
+  directPermission?: SharePermission;
   user: LocalAuthUser;
   permission: SharePermission;
   sharedAt: string;

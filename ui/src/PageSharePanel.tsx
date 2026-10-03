@@ -160,7 +160,7 @@ export function PageSharePanel({
           <div className="member-share-heading">
             <span>
               <strong id="member-share-title">Nodi 회원과 공유</strong>
-              <small>가입된 사용자만 초대할 수 있어요.</small>
+              <small>초대한 회원은 하위 페이지에도 같은 권한으로 접근할 수 있어요.</small>
             </span>
             {members.length > 0 && <em>{members.length}명</em>}
           </div>
@@ -242,9 +242,11 @@ export function PageSharePanel({
                     <span>
                       <strong>{user.name}</strong>
                       <small>{user.email}</small>
+                      {member.inheritedFromPageId && <small>“{member.inheritedFromTitle || "상위 페이지"}”에서 상속{member.permission === "edit" ? " · 상위 페이지에서 관리" : ""}</small>}
                     </span>
                     <Select
                       value={member.permission}
+                      disabled={Boolean(member.inheritedFromPageId) && member.permission === "edit"}
                       onValueChange={(value) => onPermissionChange(member.userId, value as SharePermission)}
                       options={permissionOptions}
                       ariaLabel={`${user.name} 공유 권한`}
@@ -259,6 +261,7 @@ export function PageSharePanel({
                       className="shared-member-remove"
                       type="button"
                       aria-label={`${user.name} 공유 해제`}
+                      disabled={Boolean(member.inheritedFromPageId) && !member.directPermission}
                       onClick={() => onRemoveMember(member.userId)}
                     >
                       <X size={14} />

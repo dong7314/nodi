@@ -1,3 +1,5 @@
+import { flushPendingDatabaseSnapshots } from "./database-cache";
+
 // Active keys stay compatible with the existing stores. Account transitions
 // preserve the old workspace until the backup succeeds, and roll back a failed
 // restore instead of exposing a partially restored account as a guest.
@@ -31,7 +33,10 @@ function activeCache(): Cache {
 export function backupWorkspaceCache() {
   const owner = workspaceOwner();
   if (owner === "guest") return;
-  try { localStorage.setItem(cacheKey(owner), JSON.stringify(activeCache())); }
+  try {
+    flushPendingDatabaseSnapshots();
+    localStorage.setItem(cacheKey(owner), JSON.stringify(activeCache()));
+  }
   catch { throw failure(); }
 }
 
@@ -46,6 +51,8 @@ export function activateWorkspaceCache(userId: string | null, commit?: Transitio
   const storage = window.localStorage;
   const previous = workspaceOwner();
   const next = userId ?? "guest";
+  try { flushPendingDatabaseSnapshots(); }
+  catch { throw failure(); }
   const active = activeCache();
   const trackedKeys = new Set([
     ...Object.keys(active), ownerKey, ...(commit?.keys ?? []),

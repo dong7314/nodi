@@ -1,10 +1,10 @@
 import { jsonEqual as same } from "./json-equal";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { NodiApiError } from "./api-client";
 import { workspaceApi, type ServerInlineDatabase } from "./server-api";
 import { mergeDatabase, type ConflictChoices, type DatabaseConflict } from "./database-merge";
 import type { DatabaseState } from "./InlineDatabase";
-import { cacheDatabaseSnapshot, readDatabaseDraft } from "./database-cache";
+import { cacheDatabaseDraft, cacheDatabaseSnapshot, captureDatabaseWorkspace, readDatabaseDraft, readDatabaseSnapshot, registerLiveDatabaseSnapshot } from "./database-cache";
 
 // A returning editor must wait for saves from the editor that just unmounted.
 const queues = new Map<string, Promise<unknown>>();
@@ -15,17 +15,17 @@ export function enqueueDatabaseSync<T>(id: string, task: () => Promise<T>): Prom
   return result;
 }
 
-const draftKey = (id: string) => `nodi:database-draft:${id}`;
 type Draft = { state: DatabaseState; base?: DatabaseState; revision?: number };
 type Conflict = { base?: DatabaseState; local: DatabaseState; remote: ServerInlineDatabase<DatabaseState>; items: DatabaseConflict[] };
 type Session = { schedule: (state: DatabaseState) => void; flush: () => void; retry: () => void; resolve: (choices: ConflictChoices) => void };
 
 export function useDatabaseSync({
-  databaseId, database, onLoad, onNotice, enabled, pageId, readOnly, realtimeEvent,
+  databaseId, database, onLoad, onNotice, enabled, pageId, readOnly, realtimeEvent, elementRef,
 }: {
   databaseId: string; database: DatabaseState; onLoad: (state: DatabaseState) => void;
   onNotice: (message: string) => void; enabled: boolean; pageId: string | null;
   readOnly: boolean; realtimeEvent: string;
+  elementRef: RefObject<HTMLElement | null>;
 }) {
   const [loading, setLoading] = useState(enabled);
   const [error, setError] = useState(false);
@@ -33,6 +33,15 @@ export function useDatabaseSync({
   const latest = useRef({ database, onLoad, onNotice, readOnly });
   latest.current = { database, onLoad, onNotice, readOnly };
   const sessionRef = useRef<Session | null>(null);
+  const snapshotRef = useRef<DatabaseState | null>(null);
+  const workspaceCurrent = useRef(captureDatabaseWorkspace());
+
+  useLayoutEffect(() => {
+    snapshotRef.current = enabled ? readDatabaseSnapshot(databaseId) : latest.current.database;
+    const element = elementRef.current;
+    if (!element) return;
+    return registerLiveDatabaseSnapshot(databaseId, element, () => snapshotRef.current);
+  }, [databaseId, elementRef, enabled]);
 
   useEffect(() => {
     if (!enabled) { setLoading(false); setError(false); setConflict(null); return; }
@@ -44,21 +53,25 @@ export function useDatabaseSync({
     let pendingRemote: ServerInlineDatabase<DatabaseState> | null = null;
     let timer: number | undefined;
     const cache = (state: DatabaseState) => {
+      if (!workspaceCurrent.current()) return;
+      if (active) snapshotRef.current = state;
       try { cacheDatabaseSnapshot(databaseId, state); }
       catch { if (active) latest.current.onNotice("표의 임시 저장 공간이 부족하거나 사용할 수 없어요"); }
     };
     const show = (state: DatabaseState) => {
+      if (!workspaceCurrent.current()) return;
       desired = state;
       cache(state);
       if (active) latest.current.onLoad(state);
     };
     const remember = () => {
+      if (!workspaceCurrent.current()) return;
       try {
-        if (same(desired, baseline)) localStorage.removeItem(draftKey(databaseId));
-        else localStorage.setItem(draftKey(databaseId), JSON.stringify({ state: desired, base: baseline, revision }));
+        cacheDatabaseDraft(databaseId, same(desired, baseline) ? null : { state: desired, base: baseline, revision });
       } catch { if (active) latest.current.onNotice("표의 임시 저장 공간이 부족하거나 사용할 수 없어요"); }
     };
     const report = (cause: unknown) => {
+      if (!workspaceCurrent.current()) return;
       remember();
       if (active) {
         setError(true);
@@ -88,22 +101,31 @@ export function useDatabaseSync({
     const flush = () => {
       if (timer !== undefined) window.clearTimeout(timer);
       timer = undefined;
-      if (!ready || writing || collision || latest.current.readOnly) return;
+      if (!workspaceCurrent.current() || !ready || writing || collision) return;
       const remote = pendingRemote;
       pendingRemote = null;
-      if (remote && remote.revision > (revision ?? 0) && !reconcile(remote)) return;
-      if (same(desired, baseline)) return;
+      if (remote && remote.revision > (revision ?? 0)) {
+        if (latest.current.readOnly) {
+          // Viewing newer data is allowed even when writes are not. Preserve
+          // any editable draft stored before this permission change.
+          baseline = remote.state;
+          revision = remote.revision;
+          show(remote.state);
+        } else if (!reconcile(remote)) return;
+      }
+      if (latest.current.readOnly || same(desired, baseline)) return;
       writing = true;
       let failed = false;
       void enqueueDatabaseSync(databaseId, async () => {
         // Retry a bounded number of concurrent revisions; continuous contention
         // leaves a durable draft and an explicit retry instead of a busy loop.
         for (let attempt = 0; attempt < 3; attempt++) {
-          if (latest.current.readOnly) return;
+          if (!workspaceCurrent.current() || latest.current.readOnly) return;
           const sent = desired;
           if (same(sent, baseline)) return;
           try {
             const saved = await workspaceApi.putDatabase(databaseId, { pageId, state: sent, revision });
+            if (!workspaceCurrent.current()) return;
             baseline = saved.state;
             revision = saved.revision;
             if (active) setError(false);
@@ -113,8 +135,10 @@ export function useDatabaseSync({
             window.dispatchEvent(new CustomEvent(realtimeEvent, { detail: saved }));
             return;
           } catch (cause) {
+            if (!workspaceCurrent.current()) return;
             if (!(cause instanceof NodiApiError) || cause.status !== 409) throw cause;
             const remote = await workspaceApi.getDatabase<DatabaseState>(databaseId);
+            if (!workspaceCurrent.current()) return;
             if (!reconcile(remote)) return;
           }
         }
@@ -129,7 +153,7 @@ export function useDatabaseSync({
       if (initializing) return;
       initializing = true;
       void enqueueDatabaseSync(databaseId, async () => {
-        if (!active) return;
+        if (!active || !workspaceCurrent.current()) return;
         const draft: Draft | null = readDatabaseDraft(databaseId);
         // A durable local draft is real data even while its server is offline.
         // Show/cache it before fetching; never cache the initial placeholder.
@@ -138,10 +162,10 @@ export function useDatabaseSync({
         try {
           value = await workspaceApi.getDatabase<DatabaseState>(databaseId);
         } catch (cause) {
-          if (!(cause instanceof NodiApiError) || cause.status !== 404 || latest.current.readOnly || !active) throw cause;
+          if (!(cause instanceof NodiApiError) || cause.status !== 404 || latest.current.readOnly || !active || !workspaceCurrent.current()) throw cause;
           value = await workspaceApi.putDatabase(databaseId, { pageId, state: draft?.state ?? desired });
         }
-        if (!active) return;
+        if (!active || !workspaceCurrent.current()) return;
         ready = true;
         setError(false);
         if (draft?.state && !same(draft.state, value.state) && !latest.current.readOnly) {
@@ -157,14 +181,14 @@ export function useDatabaseSync({
           if (!latest.current.readOnly) remember();
         }
         setLoading(false);
-      }).catch((cause) => { if (active) { setError(true); latest.current.onNotice(cause instanceof Error ? cause.message : "표를 불러오지 못했어요"); } })
+      }).catch((cause) => { if (active && workspaceCurrent.current()) { setError(true); latest.current.onNotice(cause instanceof Error ? cause.message : "표를 불러오지 못했어요"); } })
         .finally(() => { initializing = false; if (active) flush(); });
     };
     const session: Session = {
       flush,
       retry: () => ready ? flush() : initialize(),
       schedule: (state) => {
-        if (!ready) return;
+        if (!ready || !workspaceCurrent.current()) return;
         cache(state);
         if (latest.current.readOnly || collision || same(state, desired)) return;
         desired = state;
@@ -173,7 +197,7 @@ export function useDatabaseSync({
         timer = window.setTimeout(flush, 500);
       },
       resolve: (choices) => {
-        if (!collision || latest.current.readOnly || collision.items.some((item) => !choices[item.key])) return;
+        if (!workspaceCurrent.current() || !collision || latest.current.readOnly || collision.items.some((item) => !choices[item.key])) return;
         const state = collision.base
           ? mergeDatabase(collision.base, collision.local, collision.remote.state, choices).state
           : choices["[]"] === "remote" ? collision.remote.state : collision.local;
@@ -192,7 +216,7 @@ export function useDatabaseSync({
     initialize();
     const receive = (event: Event) => {
       const value = (event as CustomEvent<ServerInlineDatabase<DatabaseState>>).detail;
-      if (value?.id !== databaseId || value.revision <= (revision ?? 0)) return;
+      if (!workspaceCurrent.current() || value?.id !== databaseId || value.revision <= (revision ?? 0)) return;
       // An event can overtake an HTTP acknowledgement or the initial GET.
       // Retain it so the end of that request can apply the newer revision.
       if (!ready || writing || collision || !same(desired, baseline)) {
@@ -216,9 +240,11 @@ export function useDatabaseSync({
     };
   }, [databaseId, enabled, pageId, readOnly, realtimeEvent]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    if (!workspaceCurrent.current()) return;
     if (enabled) sessionRef.current?.schedule(database);
     else {
+      snapshotRef.current = database;
       try { cacheDatabaseSnapshot(databaseId, database); }
       catch { latest.current.onNotice("표의 임시 저장 공간이 부족하거나 사용할 수 없어요"); }
     }
